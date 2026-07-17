@@ -35,7 +35,10 @@ cargo clippy -- -D warnings
   viewer plugin (ratatui). Its `herdr-plugin.toml` header documents hard-won **Windows
   findings** — read it before touching manifests.
 - `%APPDATA%\herdr\plugins\github\herdr-spreader-f248c87aa2e2\` — minimal manifest + layout tool.
-- herdr source: https://github.com/ogulcancelik/herdr
+- herdr source: https://github.com/ogulcancelik/herdr — **if you run into issues integrating a
+  plugin** (manifest not loading, pane spawn failures, action/IPC behavior that doesn't match the
+  docs), read the open-source herdr code there to see what the host actually does, rather than
+  guessing from error messages.
 
 ### Windows caveats (verified by herdr-file-viewer against herdr 0.7.1)
 
