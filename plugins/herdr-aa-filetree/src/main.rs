@@ -11,7 +11,7 @@ mod tree;
 
 use std::io::Read;
 
-use crossterm::event::{self, Event};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
 
 fn main() -> std::io::Result<()> {
     let mode = std::env::args().nth(1);
@@ -38,7 +38,10 @@ fn main() -> std::io::Result<()> {
 
     let root = std::env::current_dir()?;
     let mut terminal = ratatui::init();
+    // Mouse capture for the collapse button; best-effort on both ends.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let result = run(&mut terminal, app::App::new(root));
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -52,11 +55,14 @@ fn read_stdin() -> std::io::Result<String> {
 fn run(terminal: &mut ratatui::DefaultTerminal, mut app: app::App) -> std::io::Result<()> {
     loop {
         terminal.draw(|frame| app.draw(frame))?;
-        if let Event::Key(key) = event::read()?
-            && !app.on_key(key)
-        {
-            return Ok(());
+        match event::read()? {
+            Event::Key(key) => {
+                if !app.on_key(key) {
+                    return Ok(());
+                }
+            }
+            Event::Mouse(mouse) => app.on_mouse(mouse),
+            _ => {} // resize, focus, … simply fall through to a redraw
         }
-        // Any other event (resize, focus, …) simply falls through to a redraw.
     }
 }

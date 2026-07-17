@@ -19,10 +19,24 @@ TUI pane docked on the left edge of the tab, beside the spaces/agents sidebar.
 
 ## Usage
 
-Invoke the `open-explorer` action (`open-explorer-windows` on Windows) — it
-toggles: opens the explorer docked on the left of the current tab, focuses it if
-it is already open, closes it if it is already focused. The tree roots at the
-focused pane's working directory at the moment you open it.
+**Sidebar mode (automatic):** `[[events]]` hooks on `tab.focused` /
+`workspace.focused` quietly ensure every tab you visit has a left-docked
+Explorer — open, unfocused, rooted at that tab's working directory. Because a
+tab gets its explorer at first focus (while it still has a single full-height
+pane), the explorer becomes a full-height left column that later splits nest
+to the right of. Concurrent focus events are serialized through an atomic
+mkdir lock, so a burst of events can't open duplicates (verified live: without
+it, one tab switch spawned four).
+
+**Manual toggle:** the `open-explorer` action (`open-explorer-windows` on
+Windows) toggles: open left-docked → focus if open → close if focused.
+
+**Collapse:** click the `«` button (or press `b`) to shrink the explorer to a
+sliver with EXPLORER written sideways — click it (or press any key) to expand
+back. The TUI resizes its own pane through the herdr CLI; `pane resize
+--amount` is a split-ratio delta, so the exact amount is computed from the
+live `pane layout`. herdr's 0.1 minimum split ratio decides how thin the
+sliver can actually get.
 
 | Key | Action |
 | --- | --- |
@@ -34,6 +48,7 @@ focused pane's working directory at the moment you open it.
 | `r` | refresh from disk |
 | `.` | show/hide dotfiles (`.git` is always hidden) |
 | `i` | switch icon theme (emoji ↔ material) |
+| `b` / click `«` | collapse to the sliver (any key or click expands) |
 | `q`/`Esc` | quit |
 
 ## Icon themes
@@ -45,14 +60,21 @@ focused pane's working directory at the moment you open it.
 
 Set `HERDR_AA_FILETREE_ICONS=material` to start in material mode.
 
-## Why a pane inside the tab, not a real sidebar?
+## Why per-tab panes, not one real sidebar?
 
 herdr's plugin API (0.7.1) offers exactly five pane placements — `overlay`,
-`popup`, `split`, `tab`, `zoomed` — all scoped to a tab's layout. Plugins cannot
-add workspace-level chrome like the built-in spaces/agents sidebar, so the
-explorer docks into the left slot of the current tab instead: the launcher
-splits the tab's leftmost pane and `pane swap`s the new pane into the left slot
+`popup`, `split`, `tab`, `zoomed` — all scoped to a tab's layout (verified in
+herdr's source: `compute_view_internal` splits the screen into the built-in
+sidebar plus the tab surface, and panes are tab-owned throughout). Plugins
+cannot add workspace-level chrome, so sidebar mode approximates it: every tab
+gets its own left-docked explorer via the focus hooks. The launcher splits the
+tab's leftmost pane and `pane swap`s the new pane into the left slot
 (`pane split` itself only goes right/down).
+
+One caveat: a tab whose left column was already split vertically *before* the
+explorer arrives only gets a partial-height dock — herdr has no way to insert
+a pane at the layout root. Tabs hooked at creation always get the full-height
+column.
 
 ## Development
 

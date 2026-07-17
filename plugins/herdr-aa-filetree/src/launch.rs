@@ -52,6 +52,15 @@ struct LayoutResult {
 struct Layout {
     #[serde(default)]
     panes: Vec<LayoutPane>,
+    #[serde(default)]
+    splits: Vec<LayoutSplit>,
+}
+
+#[derive(Deserialize)]
+struct LayoutSplit {
+    direction: Option<String>,
+    ratio: Option<f64>,
+    rect: Option<Rect>,
 }
 
 #[derive(Deserialize)]
@@ -147,6 +156,64 @@ pub fn open_plan(layout_json: &str) -> String {
     };
     let ratio = (TARGET_COLS / rect.width as f64).clamp(0.15, 0.5);
     format!("{id}\t{ratio:.2}")
+}
+
+/// One `herdr pane resize` invocation: which way to move our right edge and by
+/// how much. `amount` is a RATIO delta — herdr adds it to the nearest split's
+/// ratio (`layout.rs::resize_focused`: `current_ratio ± delta`), it is NOT
+/// columns.
+pub struct ResizeStep {
+    pub direction: &'static str,
+    pub amount: f64,
+}
+
+/// Compute the resize step that brings `pane_id` from `term_cols_now` to
+/// `term_cols_target` terminal columns, from a `pane layout` JSON.
+///
+/// The explorer is a left column, so its right edge is the divider of some
+/// horizontal split: we pick the innermost `right` split whose divider sits at
+/// the pane's right edge and convert the column delta into that split's ratio
+/// space. `None` when the pane or such a split can't be found, or the pane is
+/// already at the target.
+pub fn resize_plan(
+    layout_json: &str,
+    pane_id: &str,
+    term_cols_now: u16,
+    term_cols_target: u16,
+) -> Option<ResizeStep> {
+    let msg = serde_json::from_str::<LayoutMsg>(strip_bom(layout_json)).ok()?;
+    let layout = &msg.result.layout;
+    let pane_rect = layout
+        .panes
+        .iter()
+        .find(|p| p.pane_id.as_deref() == Some(pane_id))?
+        .rect
+        .as_ref()?;
+    // The pane rect can be a couple of columns wider than the terminal inside
+    // it (pane chrome); express the target in rect space.
+    let chrome = pane_rect.width - i64::from(term_cols_now);
+    let target_rect_w = i64::from(term_cols_target) + chrome.max(0);
+
+    let divider_x = pane_rect.x + pane_rect.width;
+    let split = layout
+        .splits
+        .iter()
+        .filter(|s| s.direction.as_deref() == Some("right"))
+        .filter_map(|s| Some((s.rect.as_ref()?, s.ratio?)))
+        .filter(|(rect, ratio)| {
+            let split_divider = rect.x + (f64::from(rect.width as i32) * ratio).round() as i64;
+            rect.x <= pane_rect.x && (split_divider - divider_x).abs() <= 2 && rect.width > 0
+        })
+        .min_by_key(|(rect, _)| rect.width)?;
+
+    let delta = (target_rect_w - pane_rect.width) as f64 / split.0.width as f64;
+    if delta.abs() < 0.005 {
+        return None;
+    }
+    Some(ResizeStep {
+        direction: if delta > 0.0 { "right" } else { "left" },
+        amount: delta.abs(),
+    })
 }
 
 /// True when the id can be passed as a positional argument to the herdr CLI
@@ -252,6 +319,58 @@ mod tests {
         assert_eq!(open_plan(&wide), "w1:p1\t0.15");
         let narrow = layout(r#"{"pane_id":"w1:p1","rect":{"x":0,"y":0,"width":40,"height":50}}"#);
         assert_eq!(open_plan(&narrow), "w1:p1\t0.50");
+    }
+
+    fn layout_with_splits(panes: &str, splits: &str) -> String {
+        format!(
+            r#"{{"id":"cli:pane:layout","result":{{"layout":{{"panes":[{panes}],"splits":[{splits}]}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn resize_plan_converts_columns_to_split_ratio_delta() {
+        // Explorer: 32 rect cols (30 terminal cols) at the left of a 160-col split.
+        let json = layout_with_splits(
+            r#"{"pane_id":"w1:p2","rect":{"x":0,"y":0,"width":32,"height":50}},
+               {"pane_id":"w1:p1","rect":{"x":32,"y":0,"width":128,"height":50}}"#,
+            r#"{"direction":"right","ratio":0.2,"rect":{"x":0,"y":0,"width":160,"height":50}}"#,
+        );
+        // Collapse 30 → 4 terminal cols: rect 32 → 6, delta -26/160.
+        let step = resize_plan(&json, "w1:p2", 30, 4).unwrap();
+        assert_eq!(step.direction, "left");
+        assert!((step.amount - 26.0 / 160.0).abs() < 1e-9);
+        // Expand 30 → 40: rect 32 → 42, delta +10/160.
+        let step = resize_plan(&json, "w1:p2", 30, 40).unwrap();
+        assert_eq!(step.direction, "right");
+        assert!((step.amount - 10.0 / 160.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resize_plan_picks_innermost_matching_split() {
+        // Nested: root split (divider elsewhere) plus the inner split whose
+        // divider is at the explorer's right edge.
+        let json = layout_with_splits(
+            r#"{"pane_id":"e","rect":{"x":0,"y":0,"width":20,"height":50}}"#,
+            r#"{"direction":"right","ratio":0.5,"rect":{"x":0,"y":0,"width":200,"height":50}},
+               {"direction":"right","ratio":0.2,"rect":{"x":0,"y":0,"width":100,"height":50}}"#,
+        );
+        let step = resize_plan(&json, "e", 18, 40).unwrap();
+        // delta computed against the inner 100-col split: +22/100.
+        assert!((step.amount - 22.0 / 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resize_plan_returns_none_when_unresizable_or_at_target() {
+        assert!(resize_plan("not json", "e", 30, 4).is_none());
+        // No split with a divider at the pane's edge (e.g. the only pane).
+        let solo = layout_with_splits(r#"{"pane_id":"e","rect":{"x":0,"y":0,"width":100,"height":50}}"#, "");
+        assert!(resize_plan(&solo, "e", 98, 30).is_none());
+        // Already at the target.
+        let json = layout_with_splits(
+            r#"{"pane_id":"e","rect":{"x":0,"y":0,"width":32,"height":50}}"#,
+            r#"{"direction":"right","ratio":0.2,"rect":{"x":0,"y":0,"width":160,"height":50}}"#,
+        );
+        assert!(resize_plan(&json, "e", 30, 30).is_none());
     }
 
     #[test]
