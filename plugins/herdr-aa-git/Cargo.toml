@@ -1,0 +1,10 @@
+[package]
+name = "herdr-aa-git"
+version = "0.1.0"
+edition = "2024"
+description = "VS Code-style source control panel as a herdr TUI pane"
+license = "MIT"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"

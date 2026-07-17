@@ -1,0 +1,22 @@
+# herdr-spreader layout for the herdr-plugins monorepo.
+# Bootstraps the workspace (tabs + panes + commands) in one shot.
+#
+# Apply it (from anywhere):
+#   herdr plugin action invoke herdr-spreader.apply
+# or standalone against this file directly:
+#   & "$env:APPDATA\herdr\plugins\github\herdr-spreader-f248c87aa2e2\target\release\herdr-spreader.exe" apply --file .\herdr-layout.yaml
+workspaces:
+  - name: herdr-plugins
+    root: C:/Users/Alex/Projects/herdr
+    focus: true
+    tabs:
+      - label: Coordinator
+        panes:
+          - command: claude
+            focus: true
+      - label: shell
+        panes:
+          - command: powershell -NoLogo
+      - label: git
+        panes:
+          - command: lazygit

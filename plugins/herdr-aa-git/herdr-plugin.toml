@@ -1,0 +1,22 @@
+# Manifest for herdr-aa-git.
+#
+# NOTE (Windows): herdr cannot spawn a relative [[panes]] command on Windows — see
+# CLAUDE.md at the repo root and herdr-file-viewer's manifest for the launcher-script
+# pattern. The relative [[panes]] entry below serves linux/macos; Windows launch
+# support gets its own [[actions]] once the plugin does something.
+
+id = "herdr-aa-git"
+name = "herdr-aa-git"
+version = "0.1.0"
+description = "VS Code-style source control panel: status, diffs, and commit flow in a herdr split pane."
+min_herdr_version = "0.7.0"
+platforms = ["linux", "macos", "windows"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
+
+[[panes]]
+id = "git"
+title = "Source Control"
+placement = "split"
+command = ["./target/release/herdr-aa-git"]
