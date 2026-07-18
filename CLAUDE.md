@@ -122,6 +122,38 @@ plain-right-click passthrough is not supported). Same-tab `pane.move` is a delib
 (`SameTab`) — restructure within a tab by bouncing the pane through `--new-tab` and back
 (herdr auto-closes the emptied temp tab).
 
+Pane identity & titles:
+
+- `pane.report_metadata {pane_id, source, tokens:{name:value}}` attaches **metadata tokens**
+  that show up in `pane.list` — a durable pane identity that survives label changes. The
+  filetree TUI tags its pane this way so its detection works while the label is cleared.
+- Pane border titles come from `border_label`: metadata title → manual label (`pane rename`)
+  → detected-agent label. The raw terminal (OSC) title is NOT used — clear the label on a
+  non-agent pane and the border shows **no title at all**.
+- `layout.apply` does NOT edit a tab in place: it materializes the tree into a **new tab with
+  new panes** (and clamps ratios to the same 0.1–0.9 as everything else). Not a way around
+  the ratio floor, and it leaves a duplicate tab to clean up.
+
+herdr config: `%APPDATA%\herdr\config.toml`; `herdr server reload-config` applies edits to
+the running server ("status":"applied" + diagnostics in the reply).
+
+Terminal fonts for icon glyphs (Windows, verified live):
+
+- Nerd Font "**Mono**" builds squeeze icons into one cell (tiny); the **non-Mono** build
+  ("CaskaydiaCove Nerd Font") draws them up to double-width — use it when icons look too small.
+- Match the font by its **DirectWrite/typographic family name** (name-table ID 16, e.g.
+  "CaskaydiaCove Nerd Font Mono"), NOT the GDI name System.Drawing reports ("CaskaydiaCove
+  NFM") — VS Code/WT silently fall back to tofu with the wrong one. Newly installed fonts
+  need a VS Code window reload to be seen.
+- Sextants (U+1FB00 Symbols for Legacy Computing) and braille are covered by the Cascadia
+  family; arbitrary glyph rotation is impossible in terminals — herdr can forward Kitty
+  graphics to the host terminal, but Windows Terminal doesn't render that protocol.
+
+Building herdr itself from source (for local patches): needs Zig ≥ 0.15.2 on PATH or via
+`ZIG=<path>` (build.rs compiles the vendored `libghostty-vt`); the 0.15.2 zig build failed on
+this machine with the known Zig-0.15-Windows linking issue mentioned in libghostty's
+HACKING.md — budget time for that before promising a patched build.
+
 ## Herdr workspace
 
 `herdr-layout.yaml` at the repo root describes the workspace (Coordinator tab running claude,
