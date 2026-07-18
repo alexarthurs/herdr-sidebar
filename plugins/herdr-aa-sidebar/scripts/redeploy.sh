@@ -21,6 +21,6 @@ for ws in workspaces:
             print("closed", wid, pane["pane_id"], pane.get("label"))
 ' "$HERDR_BIN"
 
-pkill -f 'herdr-aa-(filetree|git)' 2>/dev/null
-"$HERDR_BIN" plugin action invoke herdr-aa-filetree.open-explorer >/dev/null 2>&1
+pkill -f 'herdr-aa-sidebar' 2>/dev/null
+"$HERDR_BIN" plugin action invoke herdr-aa-sidebar.open-sidebar >/dev/null 2>&1
 echo 'redeploy complete - other workspaces re-dock on next focus'

@@ -12,18 +12,13 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph};
 
-use herdr_aa_filetree::actions::{self, MenuAction, MenuEntry};
-use herdr_aa_filetree::icons::{IconTheme, icon};
-use herdr_aa_filetree::sidebar::{self, View};
-use herdr_aa_filetree::tree::{Row, Tree};
+use herdr_aa_sidebar::actions::{self, MenuAction, MenuEntry};
+use herdr_aa_sidebar::icons::{IconTheme, icon};
+use herdr_aa_sidebar::state::{self as sidebar, View};
+use herdr_aa_sidebar::ui::{activity_icons, gear_icon, sibling_panes_of, wrap_hints};
+use herdr_aa_sidebar::tree::{Row, Tree};
 
-/// Why the event loop ended; the supervisor in main.rs acts on it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Exit {
-    Quit,
-    /// The user picked the other view in the merged sidebar.
-    Switch,
-}
+use herdr_aa_sidebar::state::Exit;
 
 const MY_VIEW: View = View::Explorer;
 
@@ -52,7 +47,7 @@ impl PaneCtl {
     /// launchers — otherwise clear the other view's token.
     fn report_tokens(&self, my: View, merged: bool) {
         let mine = serde_json::json!({ my.plugin_id(): my.token() });
-        let _ = herdr_aa_filetree::ipc::call_text(
+        let _ = herdr_aa_sidebar::ipc::call_text(
             "pane.report_metadata",
             serde_json::json!({ "pane_id": self.pane_id, "source": my.plugin_id(), "tokens": mine }),
         );
@@ -64,7 +59,7 @@ impl PaneCtl {
         } else {
             serde_json::json!({ other.plugin_id(): serde_json::Value::Null })
         };
-        let _ = herdr_aa_filetree::ipc::call_text(
+        let _ = herdr_aa_sidebar::ipc::call_text(
             "pane.report_metadata",
             serde_json::json!({
                 "pane_id": self.pane_id,
@@ -82,25 +77,25 @@ impl PaneCtl {
         if let Some(label) = label {
             params["label"] = serde_json::Value::String(label.to_string());
         }
-        let _ = herdr_aa_filetree::ipc::call_text("pane.rename", params);
+        let _ = herdr_aa_sidebar::ipc::call_text("pane.rename", params);
     }
 
     /// Resize our pane to `target` terminal columns over the socket API.
     /// `pane.resize`'s amount is a split-RATIO delta, so the exact amount comes
-    /// from the live layout via [`herdr_aa_filetree::launch::resize_plan`].
+    /// from the live layout via [`herdr_aa_sidebar::launch::resize_plan`].
     fn resize_to(&self, current: u16, target: u16) {
-        let Ok(layout) = herdr_aa_filetree::ipc::call_text(
+        let Ok(layout) = herdr_aa_sidebar::ipc::call_text(
             "pane.layout",
             serde_json::json!({ "pane_id": self.pane_id }),
         ) else {
             return;
         };
         let Some(step) =
-            herdr_aa_filetree::launch::resize_plan(&layout, &self.pane_id, current, target)
+            herdr_aa_sidebar::launch::resize_plan(&layout, &self.pane_id, current, target)
         else {
             return;
         };
-        let _ = herdr_aa_filetree::ipc::call_text(
+        let _ = herdr_aa_sidebar::ipc::call_text(
             "pane.resize",
             serde_json::json!({
                 "pane_id": self.pane_id,
@@ -233,9 +228,8 @@ impl App {
         }
         let theme = IconTheme::from_env(std::env::var("HERDR_AA_FILETREE_ICONS").ok().as_deref());
         let pane_ctl = PaneCtl::from_env();
-        let other_exe = herdr_aa_filetree::ipc::call_text("plugin.list", serde_json::json!({}))
-            .ok()
-            .and_then(|json| sidebar::other_binary(&json, MY_VIEW.other()));
+        // The other view ships in this same binary — always available.
+        let other_exe = std::env::current_exe().ok();
         let sidebar_state = sidebar::load_state();
         let app = Self {
             tree,
@@ -272,7 +266,7 @@ impl App {
         if self.merged() {
             sidebar::SIDEBAR_LABEL
         } else {
-            herdr_aa_filetree::launch::PANE_LABEL
+            herdr_aa_sidebar::launch::PANE_LABEL
         }
     }
 
@@ -299,13 +293,13 @@ impl App {
             self.notice = Some("preview needs a herdr pane".into());
             return;
         };
-        let control = herdr_aa_filetree::viewer::control_path(&pane_id);
+        let control = herdr_aa_sidebar::viewer::control_path(&pane_id);
         if let Err(e) = std::fs::write(&control, path.display().to_string()) {
             self.notice = Some(format!("preview failed: {e}"));
             return;
         }
         // A running viewer in this tab follows the control file by itself.
-        if let Ok(json) = herdr_aa_filetree::ipc::call_text("pane.list", serde_json::json!({}))
+        if let Ok(json) = herdr_aa_sidebar::ipc::call_text("pane.list", serde_json::json!({}))
             && viewer_pane_in_tab(&json, &pane_id).is_some()
         {
             return;
@@ -317,7 +311,7 @@ impl App {
     /// and swap the fresh pane into its left slot (split only goes
     /// right/down), so the layout reads sidebar | preview | rest.
     fn spawn_viewer_pane(&mut self, pane_id: &str, control: &Path) {
-        let ipc = herdr_aa_filetree::ipc::call_text;
+        let ipc = herdr_aa_sidebar::ipc::call_text;
         let layout = ipc("pane.layout", serde_json::json!({ "pane_id": pane_id })).ok();
         let neighbor = layout.as_deref().and_then(|json| right_neighbor(json, pane_id));
         // No neighbor (the sidebar is alone in the tab): split ourselves and
@@ -337,7 +331,7 @@ impl App {
             }),
         );
         let Some(new_pane) =
-            response.ok().and_then(|r| herdr_aa_filetree::launch::split_pane_id(&r))
+            response.ok().and_then(|r| herdr_aa_sidebar::launch::split_pane_id(&r))
         else {
             self.notice = Some("preview pane failed to open".into());
             return;
@@ -429,20 +423,20 @@ impl App {
     /// Close the other panel's standalone pane in our tab, if one is open.
     fn close_other_standalone_pane(&self) {
         let Some(ctl) = &self.pane_ctl else { return };
-        let Ok(json) = herdr_aa_filetree::ipc::call_text("pane.list", serde_json::json!({}))
+        let Ok(json) = herdr_aa_sidebar::ipc::call_text("pane.list", serde_json::json!({}))
         else {
             return;
         };
         for id in sibling_panes_of(&json, &ctl.pane_id, MY_VIEW.other()) {
             let _ =
-                herdr_aa_filetree::ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }));
+                herdr_aa_sidebar::ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }));
         }
     }
 
     /// Open the other view in a fresh pane beside this one (detach).
     fn spawn_other_pane(&self) {
         let (Some(ctl), Some(exe)) = (&self.pane_ctl, &self.other_exe) else { return };
-        let response = herdr_aa_filetree::ipc::call_text(
+        let response = herdr_aa_sidebar::ipc::call_text(
             "pane.split",
             serde_json::json!({
                 "target_pane_id": ctl.pane_id,
@@ -453,19 +447,20 @@ impl App {
             }),
         );
         let Some(new_pane) =
-            response.ok().and_then(|r| herdr_aa_filetree::launch::split_pane_id(&r))
+            response.ok().and_then(|r| herdr_aa_sidebar::launch::split_pane_id(&r))
         else {
             return;
         };
+        let flag = MY_VIEW.other().view_flag();
         #[cfg(windows)]
-        let command = format!("& \"{}\"", exe.display());
+        let command = format!("& \"{}\" --view {flag}", exe.display());
         #[cfg(not(windows))]
-        let command = format!("exec \"{}\"", exe.display());
-        let _ = herdr_aa_filetree::ipc::call_text(
+        let command = format!("exec \"{}\" --view {flag}", exe.display());
+        let _ = herdr_aa_sidebar::ipc::call_text(
             "pane.send_input",
             serde_json::json!({ "pane_id": new_pane, "text": command, "keys": ["Enter"] }),
         );
-        let _ = herdr_aa_filetree::ipc::call_text(
+        let _ = herdr_aa_sidebar::ipc::call_text(
             "pane.rename",
             serde_json::json!({ "pane_id": new_pane, "label": MY_VIEW.other().label() }),
         );
@@ -1400,7 +1395,7 @@ fn viewer_pane_in_tab(pane_list_json: &str, my_pane_id: &str) -> Option<String> 
     panes
         .iter()
         .filter(|p| p.tab_id.as_deref() == Some(my_tab.as_str()))
-        .find(|p| p.tokens.contains_key(herdr_aa_filetree::viewer::METADATA_SOURCE))
+        .find(|p| p.tokens.contains_key(herdr_aa_sidebar::viewer::METADATA_SOURCE))
         .and_then(|p| p.pane_id.clone())
 }
 
@@ -1446,109 +1441,6 @@ fn right_neighbor(layout_json: &str, pane_id: &str) -> Option<String> {
         .filter_map(|p| Some((p.pane_id.clone()?, p.rect.as_ref()?)))
         .find(|(_, r)| r.x == my_right && r.y < my_bottom && r.y + r.height > my_top)
         .map(|(id, _)| id)
-}
-
-/// Theme-matched activity-bar icons: (explorer, source control).
-fn activity_icons(theme: IconTheme) -> (&'static str, &'static str) {
-    match theme {
-        IconTheme::Material => ("\u{f07b}", "\u{f126}"),
-        IconTheme::Emoji => ("📁", "🔀"),
-    }
-}
-
-/// Theme-matched ⚙ settings glyph.
-fn gear_icon(theme: IconTheme) -> &'static str {
-    match theme {
-        IconTheme::Material => "\u{f013}",
-        IconTheme::Emoji => "⚙",
-    }
-}
-
-/// Keycap chip colors for the footer hints — a subtle "keyboard key" look
-/// instead of a wall of dim text.
-const KEYCAP_BG: Color = Color::Rgb(0x32, 0x36, 0x3d);
-const KEYCAP_FG: Color = Color::Rgb(0xc9, 0xce, 0xd6);
-
-/// Rendered width of one `key label` hint: keycap padding + gap + label.
-fn hint_width(key: &str, label: &str) -> usize {
-    Span::raw(key).width() + 2 + 1 + Span::raw(label).width()
-}
-
-/// Pack hotkey hints into as many footer lines as they need at `width`
-/// (max 4), instead of clipping — each as a keycap chip plus a dim label.
-/// `reserve` columns stay free on the LAST line (for the « collapse button).
-/// Copy-mirrored with herdr-aa-git's app.rs.
-fn wrap_hints(
-    hints: &[(&'static str, &'static str)],
-    width: u16,
-    reserve: u16,
-) -> Vec<Line<'static>> {
-    let width = usize::from(width.max(8));
-    let reserve = usize::from(reserve);
-    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
-    let mut used: usize = 1;
-    for (key, label) in hints {
-        let w = hint_width(key, label);
-        let full = lines.len() >= 4;
-        let empty = lines.last().is_some_and(Vec::is_empty);
-        if !empty && used + 2 + w > width.saturating_sub(reserve) && !full {
-            lines.push(Vec::new());
-            used = 1;
-        }
-        let line = lines.last_mut().unwrap();
-        line.push(Span::raw(if line.is_empty() { " " } else { "  " }));
-        line.push(Span::styled(
-            format!(" {key} "),
-            Style::default().bg(KEYCAP_BG).fg(KEYCAP_FG),
-        ));
-        line.push(Span::styled(format!(" {label}"), Style::default().dim()));
-        used += if line.len() == 3 { w } else { 2 + w };
-    }
-    lines.into_iter().map(Line::from).collect()
-}
-
-/// Pane ids in the same tab as `my_pane_id` that belong to the `other` view
-/// (matched by its standalone label or its metadata token), from a `pane.list`
-/// response. Copy-mirrored with herdr-aa-git's app.rs.
-fn sibling_panes_of(pane_list_json: &str, my_pane_id: &str, other: View) -> Vec<String> {
-    #[derive(serde::Deserialize)]
-    struct Msg {
-        result: Res,
-    }
-    #[derive(serde::Deserialize)]
-    struct Res {
-        #[serde(default)]
-        panes: Vec<Pane>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Pane {
-        pane_id: Option<String>,
-        label: Option<String>,
-        tab_id: Option<String>,
-        #[serde(default)]
-        tokens: serde_json::Map<String, serde_json::Value>,
-    }
-    let Ok(msg) = serde_json::from_str::<Msg>(pane_list_json.trim_start_matches('\u{feff}'))
-    else {
-        return Vec::new();
-    };
-    let panes = &msg.result.panes;
-    let Some(my_tab) = panes
-        .iter()
-        .find(|p| p.pane_id.as_deref() == Some(my_pane_id))
-        .and_then(|p| p.tab_id.clone())
-    else {
-        return Vec::new();
-    };
-    panes
-        .iter()
-        .filter(|p| p.tab_id.as_deref() == Some(my_tab.as_str()))
-        .filter(|p| p.pane_id.as_deref() != Some(my_pane_id))
-        .filter(|p| {
-            p.label.as_deref() == Some(other.label()) || p.tokens.contains_key(other.plugin_id())
-        })
-        .filter_map(|p| p.pane_id.clone())
-        .collect()
 }
 
 /// Next selectable (non-separator) menu index in `direction`, staying put at

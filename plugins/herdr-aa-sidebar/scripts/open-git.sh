@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# open-git-panel.sh — unix launcher for the herdr-aa-git source control pane.
+# open-git-panel.sh — unix launcher for the herdr-aa-sidebar source control pane.
 #
 # Idempotent "launch-or-focus, toggle on repeat", scoped to the current tab:
 #   - no Source Control pane in the current tab      -> open one, DOCKED ON THE LEFT edge
@@ -14,19 +14,19 @@
 # whose launcher this mirrors).
 #
 # All ids/ratios come from the binary's unit-tested stdin modes
-# (--launch-decision / --focused-pane / --open-plan), never ad-hoc JSON parsing;
+# (--launch-decision git / --focused-pane / --open-plan), never ad-hoc JSON parsing;
 # the ids it emits are validated flag-safe before reaching an argv.
 set -uo pipefail
 
 herdr_bin="${HERDR_BIN_PATH:-herdr}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-bin="$script_dir/../target/release/herdr-aa-git"
+bin="$script_dir/../target/release/herdr-aa-sidebar"
 
 # Without the binary there is no decision logic; fall back to herdr's declarative
 # pane open (right split, not left-docked — degraded but functional).
 if [ ! -x "$bin" ]; then
   exec "$herdr_bin" plugin pane open \
-    --plugin herdr-aa-git \
+    --plugin herdr-aa-sidebar \
     --entrypoint git \
     --placement split \
     --direction right \
@@ -41,7 +41,7 @@ open_pane() {
   fid="${fp%%	*}"
   fcwd="${fp#*	}"
   if [ -z "$fid" ]; then
-    exec "$herdr_bin" plugin pane open --plugin herdr-aa-git \
+    exec "$herdr_bin" plugin pane open --plugin herdr-aa-sidebar \
       --entrypoint git --placement split --direction right --focus
   fi
 
@@ -69,7 +69,7 @@ open_pane() {
 
 decision="OPEN"
 if [ -n "$panes" ]; then
-  decision="$(printf '%s' "$panes" | "$bin" --launch-decision 2>/dev/null || echo OPEN)"
+  decision="$(printf '%s' "$panes" | "$bin" --launch-decision git 2>/dev/null || echo OPEN)"
 fi
 
 case "$decision" in

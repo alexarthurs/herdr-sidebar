@@ -16,7 +16,7 @@ pub const PANE_LABEL: &str = "Explorer";
 
 /// Source id for `pane.report_metadata`; its token marks a pane as the
 /// Explorer independently of the (cosmetic, clearable) label.
-pub const METADATA_SOURCE: &str = "herdr-aa-filetree";
+pub const METADATA_SOURCE: &str = "herdr-aa-sidebar-explorer";
 
 /// Preferred explorer width in columns; the ratio is derived from the target pane.
 const TARGET_COLS: f64 = 32.0;
@@ -130,6 +130,35 @@ pub fn launch_decision(pane_list_json: &str) -> String {
 }
 
 /// `<pane_id>\t<cwd>` of the focused pane, or empty on any failure. The cwd keeps
+/// Source-control identity for the separated Source Control pane.
+pub const SC_PANE_LABEL: &str = "Source Control";
+pub const SC_METADATA_SOURCE: &str = "herdr-aa-sidebar-git";
+
+/// Like [`launch_decision`], but for the separated Source Control pane (the
+/// unified Sidebar pane carries BOTH tokens, so it satisfies this too).
+pub fn launch_decision_git(pane_list_json: &str) -> String {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return "OPEN".to_string();
+    };
+    let panes = &msg.result.panes;
+    let Some(focused) = panes.iter().find(|p| p.focused) else {
+        return "OPEN".to_string();
+    };
+    let panel = panes.iter().find(|p| {
+        (p.tokens.contains_key(SC_METADATA_SOURCE) || p.label.as_deref() == Some(SC_PANE_LABEL))
+            && p.tab_id.as_deref() == focused.tab_id.as_deref()
+    });
+    let Some(id) = panel.and_then(|p| p.pane_id.as_deref()).filter(|id| is_flag_safe(id))
+    else {
+        return "OPEN".to_string();
+    };
+    if Some(id) == focused.pane_id.as_deref() {
+        format!("CLOSE {id}")
+    } else {
+        format!("FOCUS {id}")
+    }
+}
+
 /// its spaces (hence the tab separator) but loses any `\\?\` verbatim prefix.
 pub fn focused_pane(pane_list_json: &str) -> String {
     let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
@@ -386,7 +415,7 @@ mod tests {
     fn decision_recognizes_explorer_by_metadata_token_without_label() {
         // A collapsed explorer has its label cleared but keeps its token.
         let json = pane_list(&format!(
-            r#"{FOCUSED},{{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-aa-filetree":{{"value":"explorer"}}}}}}"#
+            r#"{FOCUSED},{{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-aa-sidebar-explorer":{{"value":"explorer"}}}}}}"#
         ));
         assert_eq!(launch_decision(&json), "FOCUS w1:p2");
     }

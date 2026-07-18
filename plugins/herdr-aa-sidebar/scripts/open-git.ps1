@@ -16,7 +16,7 @@
 # herdr cannot spawn a relative [[panes]] command on Windows (ERROR_PATH_NOT_FOUND),
 # so we spawn the binary BY ABSOLUTE PATH via `pane split` + `pane run`, and the
 # pane-id / target / ratio decisions come from the binary's tested stdin modes
-# (--launch-decision / --focused-pane / --open-plan), never from ad-hoc parsing.
+# (--launch-decision git / --focused-pane / --open-plan), never from ad-hoc parsing.
 
 $ErrorActionPreference = 'Continue'
 
@@ -33,10 +33,10 @@ function Strip-Verbatim([string]$p) {
     return $p
 }
 $PluginRoot = Strip-Verbatim (Split-Path -Parent $PSScriptRoot)
-$Bin = Join-Path $PluginRoot 'target\release\herdr-aa-git.exe'
+$Bin = Join-Path $PluginRoot 'target\release\herdr-aa-sidebar.exe'
 
 if (-not (Test-Path $Bin)) {
-    Write-Error "herdr-aa-git.exe not found at $Bin -- run 'cargo build --release' in the plugin directory first."
+    Write-Error "herdr-aa-sidebar.exe not found at $Bin -- run 'cargo build --release' in the plugin directory first."
     exit 1
 }
 
@@ -54,7 +54,7 @@ function Open-Pane {
         # No focused pane known: best-effort plain split beside the current pane.
         $out = (& $HerdrBin pane split --current --direction right --ratio 0.75 | Out-String)
         $np = Get-PaneId $out
-        if ($np) { & $HerdrBin pane run $np "& \`"$Bin\`"" }
+        if ($np) { & $HerdrBin pane run $np "& \`"$Bin\`" --view git" }
         exit 0
     }
     $FocusedId, $FocusedCwd = $fp -split "`t", 2
@@ -76,7 +76,7 @@ function Open-Pane {
     # Absolute path via the PowerShell CALL OPERATOR: a bare path splits on spaces
     # in the install path, and the `\"` escaping survives PS 5.1's native-arg
     # quote-stripping so herdr receives the quotes intact (herdr-file-viewer GH #58).
-    & $HerdrBin pane run $np "& \`"$Bin\`""
+    & $HerdrBin pane run $np "& \`"$Bin\`" --view git"
     & $HerdrBin pane rename $np 'Source Control' *> $null
     # herdr has no focus-by-id; a zoom on/off cycle focuses deterministically.
     & $HerdrBin pane zoom $np --on *> $null
@@ -84,7 +84,7 @@ function Open-Pane {
     exit 0
 }
 
-$Decision = ($PanesJson | & $Bin --launch-decision 2>$null)
+$Decision = ($PanesJson | & $Bin --launch-decision git 2>$null)
 if ($LASTEXITCODE -ne 0 -or -not $Decision) { $Decision = 'OPEN' }
 $Decision = $Decision.Trim()
 

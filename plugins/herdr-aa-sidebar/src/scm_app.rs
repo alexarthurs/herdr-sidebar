@@ -21,11 +21,13 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::git::{FileEntry, Git, Status};
-use crate::icons::{IconTheme, icon};
-use crate::launch;
-use crate::sidebar::{self, View};
-use crate::suggest;
+use herdr_aa_sidebar::git::{FileEntry, Git, Status};
+use herdr_aa_sidebar::icons::{IconTheme, icon};
+use herdr_aa_sidebar::state::{self as sidebar, View};
+use herdr_aa_sidebar::state::Exit;
+use herdr_aa_sidebar::ui::{activity_icons, branch_icon, gear_icon, hits, sibling_panes_of, sparkle_icon, truncate_to, within, wrap_hints};
+use herdr_aa_sidebar::actions::{copy_to_clipboard, reveal};
+use herdr_aa_sidebar::suggest;
 
 // VS Code's dark-theme git decoration colors.
 const BUTTON_BLUE: Color = Color::Rgb(0x00, 0x78, 0xd4);
@@ -53,14 +55,6 @@ fn letter_color(letter: char) -> Color {
         '!' => CONFLICT,
         _ => Color::Reset,
     }
-}
-
-/// Why the event loop ended; the supervisor in main.rs acts on it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Exit {
-    Quit,
-    /// The user picked the other view in the merged sidebar.
-    Switch,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -286,7 +280,7 @@ impl PaneCtl {
     }
 
     fn set_label(&self, label: &str) {
-        let _ = crate::ipc::call_text(
+        let _ = herdr_aa_sidebar::ipc::call_text(
             "pane.rename",
             serde_json::json!({ "pane_id": self.pane_id, "label": label }),
         );
@@ -297,7 +291,7 @@ impl PaneCtl {
     /// clear the other view's token.
     fn report_tokens(&self, my: View, merged: bool) {
         let mine = serde_json::json!({ my.plugin_id(): my.token() });
-        let _ = crate::ipc::call_text(
+        let _ = herdr_aa_sidebar::ipc::call_text(
             "pane.report_metadata",
             serde_json::json!({ "pane_id": self.pane_id, "source": my.plugin_id(), "tokens": mine }),
         );
@@ -309,7 +303,7 @@ impl PaneCtl {
         } else {
             serde_json::json!({ other.plugin_id(): serde_json::Value::Null })
         };
-        let _ = crate::ipc::call_text(
+        let _ = herdr_aa_sidebar::ipc::call_text(
             "pane.report_metadata",
             serde_json::json!({
                 "pane_id": self.pane_id,
@@ -371,9 +365,8 @@ impl App {
                 .ok()
                 .as_deref(),
         );
-        let other_exe = crate::ipc::call_text("plugin.list", serde_json::json!({}))
-            .ok()
-            .and_then(|json| sidebar::other_binary(&json, MY_VIEW.other()));
+        // The other view ships in this same binary — always available.
+        let other_exe = std::env::current_exe().ok();
         let sidebar_state = sidebar::load_state();
         let pane_ctl = PaneCtl::from_env();
         let mut app = Self {
@@ -427,7 +420,7 @@ impl App {
     /// Push our label + metadata tokens to herdr for the current mode.
     fn apply_identity(&self) {
         let Some(ctl) = &self.pane_ctl else { return };
-        let label = if self.merged() { sidebar::SIDEBAR_LABEL } else { launch::PANE_LABEL };
+        let label = if self.merged() { sidebar::SIDEBAR_LABEL } else { MY_VIEW.label() };
         ctl.set_label(label);
         ctl.report_tokens(MY_VIEW, self.merged());
     }
@@ -1168,18 +1161,18 @@ impl App {
     /// Close the other panel's standalone pane in our tab, if one is open.
     fn close_other_standalone_pane(&self) {
         let Some(ctl) = &self.pane_ctl else { return };
-        let Ok(json) = crate::ipc::call_text("pane.list", serde_json::json!({})) else {
+        let Ok(json) = herdr_aa_sidebar::ipc::call_text("pane.list", serde_json::json!({})) else {
             return;
         };
         for id in sibling_panes_of(&json, &ctl.pane_id, MY_VIEW.other()) {
-            let _ = crate::ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }));
+            let _ = herdr_aa_sidebar::ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }));
         }
     }
 
     /// Open the other view in a fresh pane beside this one (detach).
     fn spawn_other_pane(&self) {
         let (Some(ctl), Some(exe)) = (&self.pane_ctl, &self.other_exe) else { return };
-        let response = crate::ipc::call_text(
+        let response = herdr_aa_sidebar::ipc::call_text(
             "pane.split",
             serde_json::json!({
                 "target_pane_id": ctl.pane_id,
@@ -1189,18 +1182,19 @@ impl App {
                 "cwd": self.cwd.display().to_string(),
             }),
         );
-        let Some(new_pane) = response.ok().and_then(|r| launch::split_pane_id(&r)) else {
+        let Some(new_pane) = response.ok().and_then(|r| herdr_aa_sidebar::launch::split_pane_id(&r)) else {
             return;
         };
+        let flag = MY_VIEW.other().view_flag();
         #[cfg(windows)]
-        let command = format!("& \"{}\"", exe.display());
+        let command = format!("& \"{}\" --view {flag}", exe.display());
         #[cfg(not(windows))]
-        let command = format!("exec \"{}\"", exe.display());
-        let _ = crate::ipc::call_text(
+        let command = format!("exec \"{}\" --view {flag}", exe.display());
+        let _ = herdr_aa_sidebar::ipc::call_text(
             "pane.send_input",
             serde_json::json!({ "pane_id": new_pane, "text": command, "keys": ["Enter"] }),
         );
-        let _ = crate::ipc::call_text(
+        let _ = herdr_aa_sidebar::ipc::call_text(
             "pane.rename",
             serde_json::json!({ "pane_id": new_pane, "label": MY_VIEW.other().label() }),
         );
@@ -1833,126 +1827,6 @@ impl App {
     }
 }
 
-/// Theme-matched activity-bar icons: (explorer, source control).
-fn activity_icons(theme: IconTheme) -> (&'static str, &'static str) {
-    match theme {
-        IconTheme::Material => ("\u{f07b}", "\u{f126}"),
-        IconTheme::Emoji => ("📁", "🔀"),
-    }
-}
-
-/// Theme-matched ⚙ settings glyph.
-fn gear_icon(theme: IconTheme) -> &'static str {
-    match theme {
-        IconTheme::Material => "\u{f013}",
-        IconTheme::Emoji => "⚙",
-    }
-}
-
-/// Monochrome outline sparkles for the suggest button: MDI "creation"
-/// (the classic three-sparkle ✨ silhouette) with a text-presentation
-/// fallback for the emoji theme.
-fn sparkle_icon(theme: IconTheme) -> &'static str {
-    match theme {
-        IconTheme::Material => "\u{f0674}",
-        IconTheme::Emoji => "✧",
-    }
-}
-
-fn within(x: u16, (start, end): (u16, u16)) -> bool {
-    (start..end).contains(&x)
-}
-
-fn hits(rect: Rect, x: u16, y: u16) -> bool {
-    x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
-}
-
-/// Keycap chip colors for the footer hints — a subtle "keyboard key" look
-/// instead of a wall of dim text.
-const KEYCAP_BG: Color = Color::Rgb(0x32, 0x36, 0x3d);
-const KEYCAP_FG: Color = Color::Rgb(0xc9, 0xce, 0xd6);
-
-/// Rendered width of one `key label` hint: keycap padding + gap + label.
-fn hint_width(key: &str, label: &str) -> usize {
-    Span::raw(key).width() + 2 + 1 + Span::raw(label).width()
-}
-
-/// Pack hotkey hints into as many footer lines as they need at `width`
-/// (max 4), instead of clipping — each as a keycap chip plus a dim label.
-/// `reserve` columns stay free on the LAST line (for a corner button).
-fn wrap_hints(
-    hints: &[(&'static str, &'static str)],
-    width: u16,
-    reserve: u16,
-) -> Vec<Line<'static>> {
-    let width = usize::from(width.max(8));
-    let reserve = usize::from(reserve);
-    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
-    let mut used: usize = 1;
-    for (key, label) in hints {
-        let w = hint_width(key, label);
-        let full = lines.len() >= 4;
-        let empty = lines.last().is_some_and(Vec::is_empty);
-        if !empty && used + 2 + w > width.saturating_sub(reserve) && !full {
-            lines.push(Vec::new());
-            used = 1;
-        }
-        let line = lines.last_mut().unwrap();
-        line.push(Span::raw(if line.is_empty() { " " } else { "  " }));
-        line.push(Span::styled(
-            format!(" {key} "),
-            Style::default().bg(KEYCAP_BG).fg(KEYCAP_FG),
-        ));
-        line.push(Span::styled(format!(" {label}"), Style::default().dim()));
-        used += if line.len() == 3 { w } else { 2 + w };
-    }
-    lines.into_iter().map(Line::from).collect()
-}
-
-/// Pane ids in the same tab as `my_pane_id` that belong to the `other` view
-/// (matched by its standalone label or its metadata token), from a `pane.list`
-/// response. Copy-mirrored with herdr-aa-filetree's app.rs.
-fn sibling_panes_of(pane_list_json: &str, my_pane_id: &str, other: View) -> Vec<String> {
-    #[derive(serde::Deserialize)]
-    struct Msg {
-        result: Res,
-    }
-    #[derive(serde::Deserialize)]
-    struct Res {
-        #[serde(default)]
-        panes: Vec<Pane>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Pane {
-        pane_id: Option<String>,
-        label: Option<String>,
-        tab_id: Option<String>,
-        #[serde(default)]
-        tokens: serde_json::Map<String, serde_json::Value>,
-    }
-    let Ok(msg) = serde_json::from_str::<Msg>(pane_list_json.trim_start_matches('\u{feff}'))
-    else {
-        return Vec::new();
-    };
-    let panes = &msg.result.panes;
-    let Some(my_tab) = panes
-        .iter()
-        .find(|p| p.pane_id.as_deref() == Some(my_pane_id))
-        .and_then(|p| p.tab_id.clone())
-    else {
-        return Vec::new();
-    };
-    panes
-        .iter()
-        .filter(|p| p.tab_id.as_deref() == Some(my_tab.as_str()))
-        .filter(|p| p.pane_id.as_deref() != Some(my_pane_id))
-        .filter(|p| {
-            p.label.as_deref() == Some(other.label()) || p.tokens.contains_key(other.plugin_id())
-        })
-        .filter_map(|p| p.pane_id.clone())
-        .collect()
-}
-
 /// Next selectable (non-separator) menu index in `direction`, staying put at
 /// the ends.
 fn step_menu(entries: &[MenuEntry], from: usize, direction: isize) -> usize {
@@ -1965,14 +1839,6 @@ fn step_menu(entries: &[MenuEntry], from: usize, direction: isize) -> usize {
         if matches!(entries[index as usize], MenuEntry::Action(..)) {
             return index as usize;
         }
-    }
-}
-
-/// Theme-matched branch glyph for repo rows.
-fn branch_icon(theme: IconTheme) -> &'static str {
-    match theme {
-        IconTheme::Material => "\u{e725}",
-        IconTheme::Emoji => "⎇",
     }
 }
 
@@ -2162,113 +2028,9 @@ fn file_item(entry: &FileEntry, width: usize, theme: IconTheme) -> ListItem<'sta
     ListItem::new(Line::from(spans))
 }
 
-/// Cut `s` down to at most `max` display columns, ending in `…` when trimmed.
-/// Empty when even the ellipsis wouldn't fit.
-fn truncate_to(s: String, max: usize) -> String {
-    if Span::raw(s.as_str()).width() <= max {
-        return s;
-    }
-    if max < 2 {
-        return String::new();
-    }
-    let mut out = String::new();
-    for c in s.chars() {
-        let mut candidate = out.clone();
-        candidate.push(c);
-        if Span::raw(candidate.as_str()).width() + 1 > max {
-            break;
-        }
-        out = candidate;
-    }
-    out.push('…');
-    out
-}
-
-/// Copy text to the system clipboard by piping to the platform's clipboard
-/// tool (a console child of the TUI's own pty — no window is created).
-/// Copy-mirrored from herdr-aa-filetree's actions.rs.
-fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    #[cfg(windows)]
-    let candidates: &[&[&str]] = &[&["clip"]];
-    #[cfg(not(windows))]
-    let candidates: &[&[&str]] =
-        &[&["pbcopy"], &["wl-copy"], &["xclip", "-selection", "clipboard"]];
-
-    let mut last_err =
-        std::io::Error::new(std::io::ErrorKind::NotFound, "no clipboard tool found");
-    for argv in candidates {
-        let spawned = std::process::Command::new(argv[0])
-            .args(&argv[1..])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        match spawned {
-            Ok(mut child) => {
-                if let Some(stdin) = child.stdin.as_mut() {
-                    stdin.write_all(text.as_bytes())?;
-                }
-                child.wait()?;
-                return Ok(());
-            }
-            Err(err) => last_err = err,
-        }
-    }
-    Err(last_err)
-}
-
-/// Open the platform file manager with the path selected (best-effort).
-/// Copy-mirrored from herdr-aa-filetree's actions.rs.
-fn reveal(path: &std::path::Path) {
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("explorer")
-            .arg(format!("/select,{}", path.display()))
-            .spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if let Some(parent) = path.parent() {
-            let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hints_wrap_instead_of_clipping() {
-        let hints = [("⏎", "stage"), ("a", "all"), ("u", "none"), ("q", "quit")];
-        let wide = wrap_hints(&hints, 80, 0);
-        assert_eq!(wide.len(), 1);
-        let narrow = wrap_hints(&hints, 14, 0);
-        assert!(narrow.len() >= 2, "narrow pane stacks hints");
-        for line in &narrow {
-            assert!(line.width() <= 14, "no line exceeds the pane width");
-        }
-    }
-
-    #[test]
-    fn hints_never_exceed_four_lines() {
-        let hints = [
-            ("a", "aaa"),
-            ("b", "bbb"),
-            ("c", "ccc"),
-            ("d", "ddd"),
-            ("e", "eee"),
-            ("f", "fff"),
-            ("g", "ggg"),
-            ("h", "hhh"),
-        ];
-        assert!(wrap_hints(&hints, 10, 0).len() <= 4);
-    }
 
     #[test]
     fn menu_navigation_skips_separators_and_clamps() {
@@ -2291,12 +2053,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn truncation_keeps_width_budget() {
-        assert_eq!(truncate_to("short".into(), 10), "short");
-        let cut = truncate_to("averylongdirectoryname".into(), 8);
-        assert!(cut.ends_with('…'));
-        assert!(Span::raw(cut.as_str()).width() <= 8);
-        assert_eq!(truncate_to("abc".into(), 1), "");
-    }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# open-explorer.sh — unix launcher for the herdr-aa-filetree explorer pane.
+# open-explorer.sh — unix launcher for the herdr-aa-sidebar explorer pane.
 #
 # Idempotent "launch-or-focus, toggle on repeat", scoped to the current tab:
 #   - no Explorer pane in the current tab       -> open one, DOCKED ON THE LEFT edge
@@ -19,13 +19,13 @@ set -uo pipefail
 
 herdr_bin="${HERDR_BIN_PATH:-herdr}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-bin="$script_dir/../target/release/herdr-aa-filetree"
+bin="$script_dir/../target/release/herdr-aa-sidebar"
 
 # Without the binary there is no decision logic; fall back to herdr's declarative
 # pane open (right split, not left-docked — degraded but functional).
 if [ ! -x "$bin" ]; then
   exec "$herdr_bin" plugin pane open \
-    --plugin herdr-aa-filetree \
+    --plugin herdr-aa-sidebar \
     --entrypoint filetree \
     --placement split \
     --direction right \
@@ -40,7 +40,7 @@ open_pane() {
   fid="${fp%%	*}"
   fcwd="${fp#*	}"
   if [ -z "$fid" ]; then
-    exec "$herdr_bin" plugin pane open --plugin herdr-aa-filetree \
+    exec "$herdr_bin" plugin pane open --plugin herdr-aa-sidebar \
       --entrypoint filetree --placement split --direction right --focus
   fi
 
@@ -73,7 +73,7 @@ fi
 
 # Snooze markers keep the auto-ensure hook from reopening a sidebar the user
 # toggled closed; toggling open clears the tab's marker again.
-snooze_dir="${TMPDIR:-/tmp}/herdr-aa-filetree-snooze"
+snooze_dir="${TMPDIR:-/tmp}/herdr-aa-sidebar-snooze"
 tab="$(printf '%s' "$panes" | "$bin" --focused-tab 2>/dev/null || true)"
 
 case "$decision" in

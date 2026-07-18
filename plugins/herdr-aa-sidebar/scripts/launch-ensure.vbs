@@ -12,7 +12,7 @@
 
 Set fso = CreateObject("Scripting.FileSystemObject")
 root = fso.GetParentFolderName(fso.GetParentFolderName(WScript.ScriptFullName))
-exe = fso.BuildPath(root, "target\release\herdr-aa-filetree-ensure.exe")
+exe = fso.BuildPath(root, "target\release\herdr-aa-sidebar-ensure.exe")
 If Not fso.FileExists(exe) Then WScript.Quit 0
 
 args = ""

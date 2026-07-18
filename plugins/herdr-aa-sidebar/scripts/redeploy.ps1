@@ -8,7 +8,7 @@
 # (running the newest binaries) the moment each workspace is next focused.
 #
 # Invoke after rebuilding either plugin:
-#   herdr plugin action invoke herdr-aa-filetree.redeploy-windows
+#   herdr plugin action invoke herdr-aa-sidebar.redeploy-windows
 
 $ErrorActionPreference = 'Continue'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -43,5 +43,5 @@ Get-CimInstance Win32_Process -Filter "Name LIKE 'herdr-aa-%'" | ForEach-Object 
 }
 
 # Re-dock the focused workspace right away; the rest refresh on next focus.
-& $HerdrBin plugin action invoke herdr-aa-filetree.open-explorer-windows *> $null
+& $HerdrBin plugin action invoke herdr-aa-sidebar.open-sidebar-windows *> $null
 Write-Output 'redeploy complete - other workspaces re-dock on next focus'

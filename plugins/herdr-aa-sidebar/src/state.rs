@@ -1,33 +1,28 @@
-//! Merged-sidebar coordination, copy-mirrored between herdr-aa-filetree and
-//! herdr-aa-git (keep the two files identical — the module is deliberately
-//! pure: no ipc, no crate-specific imports).
+//! Unified-sidebar state: which layout the user chose (one combined Sidebar
+//! pane vs separate Explorer / Source Control panes) and which view was
+//! active last, persisted in a small JSON file so every pane and launcher
+//! agrees across restarts.
 //!
-//! When both plugins are installed, either panel can merge the two into one
-//! "Sidebar" pane with a VS Code-style activity bar: the two views share the
-//! single pane and switch by swapping which binary runs in it. The merge is a
-//! sticky user setting in a small JSON state file both plugins read:
-//!
-//! - `merged`: the user turned the merged sidebar on (survives restarts).
+//! - `merged`: the unified sidebar is on (survives restarts).
 //! - `active`: the view shown last, so a fresh sidebar opens where the user
 //!   left off.
 //!
-//! Process-swap protocol: the first binary launched in the pane is the HOST.
-//! Switching views spawns the other plugin's binary in the same terminal with
-//! `--sidebar-guest` and waits; the guest exits with [`EXIT_SWITCH`] to hand
-//! the pane back (host re-runs its own TUI) or a normal code to quit
-//! everything. The host↔guest pair never nests deeper than one level.
+//! Both views live in ONE binary; switching is an in-process re-render, and
+//! separated panes are the same binary pinned to a starting view with
+//! `--view`.
 
 use std::path::PathBuf;
 
-/// Guest exit code meaning "the user switched back to your view".
-pub const EXIT_SWITCH: i32 = 42;
-
-/// Spawn the guest with this flag; a guest exits [`EXIT_SWITCH`] on switch
-/// instead of spawning a nested host.
-pub const GUEST_FLAG: &str = "--sidebar-guest";
-
-/// Pane label (and metadata identity) of the merged pane.
+/// Pane label (and metadata identity) of the unified pane.
 pub const SIDEBAR_LABEL: &str = "Sidebar";
+
+/// Why a view's event loop ended; main.rs acts on it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Exit {
+    Quit,
+    /// The user picked the other view — main re-renders in process.
+    Switch,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
@@ -54,8 +49,24 @@ impl View {
     /// The plugin that renders this view.
     pub fn plugin_id(self) -> &'static str {
         match self {
-            View::Explorer => "herdr-aa-filetree",
-            View::SourceControl => "herdr-aa-git",
+            View::Explorer => "herdr-aa-sidebar-explorer",
+            View::SourceControl => "herdr-aa-sidebar-git",
+        }
+    }
+
+    /// The `--view` flag value that pins a separated pane to this view.
+    pub fn view_flag(self) -> &'static str {
+        match self {
+            View::Explorer => "explorer",
+            View::SourceControl => "git",
+        }
+    }
+
+    pub fn from_view_flag(flag: &str) -> Option<View> {
+        match flag {
+            "explorer" => Some(View::Explorer),
+            "git" => Some(View::SourceControl),
+            _ => None,
         }
     }
 
@@ -148,45 +159,6 @@ pub fn parse_state(json: &str) -> State {
     }
 }
 
-/// The other plugin's TUI binary, from a `plugin.list` response: its
-/// `plugin_root` (verbatim `\\?\` prefix stripped) joined with the
-/// conventional `target/release/<plugin_id>[.exe]`. `None` when the plugin is
-/// not registered or its binary is not on disk — the merge affordance hides.
-pub fn other_binary(plugin_list_json: &str, other: View) -> Option<PathBuf> {
-    #[derive(serde::Deserialize)]
-    struct Msg {
-        result: Res,
-    }
-    #[derive(serde::Deserialize)]
-    struct Res {
-        #[serde(default)]
-        plugins: Vec<Plugin>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Plugin {
-        plugin_id: Option<String>,
-        plugin_root: Option<String>,
-        #[serde(default)]
-        enabled: bool,
-    }
-    let msg: Msg =
-        serde_json::from_str(plugin_list_json.trim_start_matches('\u{feff}')).ok()?;
-    let plugin = msg
-        .result
-        .plugins
-        .iter()
-        .find(|p| p.plugin_id.as_deref() == Some(other.plugin_id()) && p.enabled)?;
-    let root = plugin.plugin_root.as_deref()?;
-    let root = root.strip_prefix(r"\\?\").unwrap_or(root);
-    let exe_name = if cfg!(windows) {
-        format!("{}.exe", other.plugin_id())
-    } else {
-        other.plugin_id().to_string()
-    };
-    let exe = PathBuf::from(root).join("target").join("release").join(exe_name);
-    exe.is_file().then_some(exe)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,21 +178,7 @@ mod tests {
         assert_eq!(View::Explorer.other(), View::SourceControl);
         assert_eq!(View::SourceControl.other(), View::Explorer);
         assert_eq!(View::Explorer.label(), "Explorer");
-        assert_eq!(View::SourceControl.plugin_id(), "herdr-aa-git");
+        assert_eq!(View::SourceControl.plugin_id(), "herdr-aa-sidebar-git");
     }
 
-    #[test]
-    fn other_binary_requires_registered_enabled_plugin() {
-        let json = r#"{"result":{"plugins":[
-            {"plugin_id":"herdr-aa-git","plugin_root":"\\\\?\\C:\\nowhere","enabled":true}
-        ]}}"#;
-        // Registered but binary missing on disk -> None.
-        assert_eq!(other_binary(json, View::SourceControl), None);
-        assert_eq!(other_binary(json, View::Explorer), None, "not registered");
-        assert_eq!(other_binary("not json", View::SourceControl), None);
-        let disabled = r#"{"result":{"plugins":[
-            {"plugin_id":"herdr-aa-git","plugin_root":"C:\\x","enabled":false}
-        ]}}"#;
-        assert_eq!(other_binary(disabled, View::SourceControl), None);
-    }
 }

@@ -8,5 +8,5 @@ fn main() {
     let toggle = std::env::args().any(|arg| arg == "--toggle");
     // Errors are deliberately silent: there is no console to print to, herdr
     // logs the exit, and the next focus event retries anyway.
-    let _ = herdr_aa_filetree::ensure::run(toggle);
+    let _ = herdr_aa_sidebar::ensure::run(toggle);
 }

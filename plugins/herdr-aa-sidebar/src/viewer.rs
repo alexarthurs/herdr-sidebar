@@ -24,7 +24,7 @@ use crate::ipc;
 
 /// Metadata source/token that marks the viewer pane, so the explorer can find
 /// and reuse it (distinct from the Explorer's own identity token).
-pub const METADATA_SOURCE: &str = "herdr-aa-filetree-preview";
+pub const METADATA_SOURCE: &str = "herdr-aa-sidebar-preview";
 
 /// How often the control file is re-checked while idle.
 const POLL: Duration = Duration::from_millis(250);
@@ -37,7 +37,7 @@ const MAX_LINES: usize = 5000;
 /// explorer pane (tab) so tabs don't steer each other's viewers.
 pub fn control_path(explorer_pane_id: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
-        "herdr-aa-filetree-preview-{}.ctl",
+        "herdr-aa-sidebar-preview-{}.ctl",
         explorer_pane_id.replace(':', "_")
     ))
 }

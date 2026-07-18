@@ -14,7 +14,7 @@ struct Lock(PathBuf);
 
 impl Lock {
     fn acquire() -> Option<Self> {
-        let dir = std::env::temp_dir().join("herdr-aa-filetree-ensure.lock");
+        let dir = std::env::temp_dir().join("herdr-aa-sidebar-ensure.lock");
         if std::fs::create_dir(&dir).is_ok() {
             return Some(Self(dir));
         }
@@ -46,7 +46,7 @@ mod snooze {
     use std::path::PathBuf;
 
     pub fn dir() -> PathBuf {
-        std::env::temp_dir().join("herdr-aa-filetree-snooze")
+        std::env::temp_dir().join("herdr-aa-sidebar-snooze")
     }
 
     fn marker(dir: &std::path::Path, tab: &str) -> PathBuf {
@@ -226,12 +226,12 @@ fn explorer_command() -> Option<String> {
     let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     #[cfg(windows)]
     {
-        let exe = dir.join("herdr-aa-filetree.exe");
+        let exe = dir.join("herdr-aa-sidebar.exe");
         Some(format!("& \"{}\"", exe.display()))
     }
     #[cfg(not(windows))]
     {
-        let exe = dir.join("herdr-aa-filetree");
+        let exe = dir.join("herdr-aa-sidebar");
         Some(format!("exec \"{}\"", exe.display()))
     }
 }
