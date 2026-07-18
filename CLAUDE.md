@@ -10,6 +10,10 @@ treats the subdirectory as the plugin root, and each plugin's `herdr-plugin.toml
 `./target/release/<bin>` — a shared workspace would hoist `target/` to the repo root and break
 that path. Keep every crate buildable standalone from its own directory.
 
+Consequence: the crates **cannot share code**, so common modules are copy-mirrored and must
+be kept in sync by hand — `icons.rs` (same emoji map in both) and the `launch.rs` pattern
+(stdin-mode launcher helpers). When you change one plugin's copy, check the sibling's.
+
 ## Build / test / lint
 
 Run from inside the plugin directory, not the repo root:
@@ -61,6 +65,16 @@ cargo clippy -- -D warnings
 - `pane send-keys` accepts only a limited key-name set: `Up`/`Down`/`Enter`/`Escape`/`Tab`
   and plain characters work, but `Home` is rejected with `invalid_key`. Give TUIs
   single-char fallbacks (`g`/`G` for Home/End) so they stay drivable via send-keys.
+
+### Terminal/TUI gotchas (both plugins)
+
+- Without keyboard-enhancement protocols (not enabled in herdr panes), **modifier+Enter is
+  indistinguishable from plain Enter** in most Windows terminals — a "Ctrl+Enter" binding
+  silently means "Enter". Design keymaps so unmodified keys suffice (herdr-aa-git's commit
+  box accepts plain Enter for this reason).
+- Emoji with variation-selector (VS16) sequences render at inconsistent widths across
+  terminal emulators and break column alignment — the shared icon map avoids them; keep it
+  that way when adding icons.
 
 ### Verifying a plugin TUI end-to-end
 
