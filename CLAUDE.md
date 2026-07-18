@@ -237,6 +237,15 @@ HACKING.md — budget time for that before promising a patched build.
   have VARIABLE HEIGHT — mouse hit-testing walks `Row::height()`, and j/k skip the widget
   rows (`Row::selectable()`). The ✧ suggest / S sync keys act on the ACTIVE repo — the one
   the selection is in (named in the panel header).
+- **GitLens-style drawers**: drawer lines carry parsed refs (`DrawerRef` — commit hash /
+  stash index / branch / remote / tag, see `parse_drawer_ref`). Click or ⏎ shows the ref
+  via colored `git show --stat --patch` in the SAME preview pane (`show/<root>/<spec>[/<path>]`
+  control requests; FILE HISTORY narrows to the followed file). Ctrl+right-click opens
+  per-type menus (checkout / merge / cherry-pick / revert / reset / stash apply-pop-drop /
+  fetch / delete / copy); destructive ones route through the generic `Overlay::ConfirmGit`
+  y/N prompt. Hovered file rows show a `+`/`−` glyph (click zone = last 5 columns) and the
+  section headers a section-wide one (last 6); a dim "ctrl+rclick for menus" hint sits on
+  the « footer line whenever the footer is otherwise empty.
 - **Sync Changes** (`S` or the ⇅ button, shown only when ahead/behind ≠ 0): `pull --rebase
   --autostash` then `push`, on a background thread polled from tick(). Ahead/behind parse
   from the porcelain `## branch...upstream [ahead N, behind M]` header.

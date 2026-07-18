@@ -219,6 +219,12 @@ impl Git {
     pub fn tags(&self) -> Result<Vec<String>, String> {
         lines(run_in(&self.root, &["tag", "--sort=-creatordate"])?)
     }
+
+    /// Run an arbitrary git command in this repo — the escape hatch the
+    /// drawer context menus use (checkout / merge / cherry-pick / …).
+    pub fn raw(&self, args: &[&str]) -> Result<String, String> {
+        run_in(&self.root, args)
+    }
 }
 
 fn lines(out: String) -> Result<Vec<String>, String> {

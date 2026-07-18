@@ -1158,7 +1158,22 @@ impl App {
                 _ => Vec::new(),
             }
         };
+        let footer_empty = footer_lines.is_empty();
         frame.render_widget(Paragraph::new(footer_lines), footer);
+        if footer_empty {
+            let hint_area = Rect::new(
+                last_line.x,
+                last_line.y,
+                last_line.width.saturating_sub(3),
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new(
+                    " ctrl+rclick for menus".dim().italic(),
+                ),
+                hint_area,
+            );
+        }
 
         match self.overlay {
             Some(Overlay::Menu { .. }) => self.draw_menu(frame),

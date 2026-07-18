@@ -57,6 +57,13 @@ enum Request {
         /// "staged" | "worktree" | "untracked" — which diff to run.
         kind: String,
     },
+    /// `git show <spec>` — a commit, stash, tag, or branch tip, optionally
+    /// narrowed to one file.
+    Show {
+        root: PathBuf,
+        spec: String,
+        path: Option<String>,
+    },
 }
 
 /// Control-file payload for a file preview.
@@ -67,6 +74,12 @@ pub fn file_request(path: &Path) -> String {
 /// Control-file payload for a git diff (`kind`: staged | worktree | untracked).
 pub fn diff_request(root: &Path, rel: &str, kind: &str) -> String {
     format!("diff\t{}\t{rel}\t{kind}", root.display())
+}
+
+/// Control-file payload for `git show <spec>` (commit hash, stash@{n}, tag…),
+/// optionally narrowed to one file.
+pub fn show_request(root: &Path, spec: &str, path: Option<&str>) -> String {
+    format!("show\t{}\t{spec}\t{}", root.display(), path.unwrap_or(""))
 }
 
 fn parse_request(raw: &str) -> Option<Request> {
@@ -81,6 +94,12 @@ fn parse_request(raw: &str) -> Option<Request> {
             let rel = parts.next()?.to_string();
             let kind = parts.next().unwrap_or("worktree").to_string();
             Some(Request::Diff { root, rel, kind })
+        }
+        Some("show") => {
+            let root = PathBuf::from(parts.next()?);
+            let spec = parts.next()?.to_string();
+            let path = parts.next().filter(|p| !p.is_empty()).map(str::to_string);
+            Some(Request::Show { root, spec, path })
         }
         Some("file") => Some(Request::File(PathBuf::from(parts.next()?))),
         // Legacy: a bare path.
@@ -101,6 +120,50 @@ fn load(request: &Request) -> Doc {
     match request {
         Request::File(path) => load_file(path),
         Request::Diff { root, rel, kind } => load_diff(root, rel, kind),
+        Request::Show { root, spec, path } => load_show(root, spec, path.as_deref()),
+    }
+}
+
+/// `git show` with stat + patch, colored — what a click on a commit, stash,
+/// tag, or branch line renders. Immutable content: no refresh loop needed.
+fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
+    let mut args: Vec<String> = vec![
+        "-c".into(),
+        "color.ui=always".into(),
+        "show".into(),
+        "--color=always".into(),
+        "--stat".into(),
+        "--patch".into(),
+        "--no-ext-diff".into(),
+        spec.to_string(),
+    ];
+    if let Some(p) = path {
+        args.push("--".into());
+        args.push(p.replace('/', std::path::MAIN_SEPARATOR_STR));
+    }
+    let output = std::process::Command::new("git").args(&args).current_dir(root).output();
+    let lines = match output {
+        Err(e) => vec![Line::raw(format!("(git failed: {e})"))],
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if text.trim().is_empty() {
+                let err = String::from_utf8_lossy(&out.stderr);
+                if err.trim().is_empty() {
+                    vec![Line::raw("(nothing to show)")]
+                } else {
+                    vec![Line::raw(format!("({})", err.trim()))]
+                }
+            } else {
+                ansi::to_lines(&text)
+            }
+        }
+    };
+    Doc {
+        name: spec.to_string(),
+        context: format!("git show {spec} — {}", root.display()),
+        lines,
+        numbered: false,
+        scroll: 0,
     }
 }
 
@@ -566,6 +629,24 @@ mod tests {
     fn requests_roundtrip() {
         let f = file_request(Path::new("C:/x/y.rs"));
         assert_eq!(parse_request(&f), Some(Request::File(PathBuf::from("C:/x/y.rs"))));
+        let s = show_request(Path::new("C:/repo"), "stash@{1}", None);
+        assert_eq!(
+            parse_request(&s),
+            Some(Request::Show {
+                root: PathBuf::from("C:/repo"),
+                spec: "stash@{1}".into(),
+                path: None,
+            })
+        );
+        let s = show_request(Path::new("C:/repo"), "a1b2c3d", Some("src/a.rs"));
+        assert_eq!(
+            parse_request(&s),
+            Some(Request::Show {
+                root: PathBuf::from("C:/repo"),
+                spec: "a1b2c3d".into(),
+                path: Some("src/a.rs".into()),
+            })
+        );
         let d = diff_request(Path::new("C:/repo"), "src/a.rs", "staged");
         assert_eq!(
             parse_request(&d),

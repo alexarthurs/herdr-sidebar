@@ -111,6 +111,75 @@ impl Drawer {
 struct DrawerPanel {
     expanded: bool,
     lines: Vec<String>,
+    /// What each line points at, parallel to `lines`.
+    refs: Vec<DrawerRef>,
+}
+
+/// What a drawer line points at, for clicks and context menus.
+#[derive(Clone, PartialEq, Eq, Default, Debug)]
+enum DrawerRef {
+    #[default]
+    None,
+    /// A short commit hash (GRAPH / COMMITS / FILE HISTORY lines).
+    Commit(String),
+    /// `stash@{n}`.
+    Stash(usize),
+    Branch {
+        name: String,
+        current: bool,
+    },
+    Remote {
+        name: String,
+        url: String,
+    },
+    Tag(String),
+}
+
+/// Parse the actionable reference out of one drawer line.
+fn parse_drawer_ref(kind: Drawer, line: &str) -> DrawerRef {
+    match kind {
+        Drawer::Graph | Drawer::Commits | Drawer::FileHistory => line
+            .split_whitespace()
+            .find(|tok| {
+                tok.len() >= 7
+                    && tok.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            })
+            .map(|h| DrawerRef::Commit(h.to_string()))
+            .unwrap_or(DrawerRef::None),
+        Drawer::Branches => {
+            let current = line.starts_with('*');
+            let name = line.trim_start_matches('*').trim().to_string();
+            if name.is_empty() || name.starts_with('(') {
+                DrawerRef::None
+            } else {
+                DrawerRef::Branch { name, current }
+            }
+        }
+        Drawer::Remotes => {
+            let mut it = line.split_whitespace();
+            match it.next() {
+                Some(name) => DrawerRef::Remote {
+                    name: name.to_string(),
+                    url: it.next().unwrap_or("").to_string(),
+                },
+                None => DrawerRef::None,
+            }
+        }
+        Drawer::Stashes => line
+            .strip_prefix("stash@{")
+            .and_then(|rest| rest.split('}').next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .map(DrawerRef::Stash)
+            .unwrap_or(DrawerRef::None),
+        Drawer::Tags => {
+            let name = line.trim().to_string();
+            if name.is_empty() || name.starts_with('(') {
+                DrawerRef::None
+            } else {
+                DrawerRef::Tag(name)
+            }
+        }
+    }
 }
 
 /// One discovered repository and its per-repo view state — including its own
@@ -190,7 +259,21 @@ impl Row {
     }
 }
 
-/// Context-menu actions for a staged/unstaged file row.
+/// What a context menu is about.
+#[derive(Clone)]
+enum MenuTarget {
+    File {
+        repo: usize,
+        entry: FileEntry,
+        staged: bool,
+    },
+    Drawer {
+        kind: Drawer,
+        index: usize,
+    },
+}
+
+/// Context-menu actions for file rows and drawer lines.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuAction {
     OpenDiff,
@@ -199,6 +282,20 @@ enum MenuAction {
     CopyPath,
     CopyRelativePath,
     Reveal,
+    // Drawer-line actions (commits, branches, stashes, remotes, tags).
+    ShowRef,
+    Checkout,
+    MergeInto,
+    DeleteBranch,
+    CherryPick,
+    Revert,
+    ResetHere,
+    StashApply,
+    StashPop,
+    StashDrop,
+    FetchRemote,
+    CopyRef,
+    DeleteTag,
 }
 
 #[derive(Clone, Copy)]
@@ -212,8 +309,7 @@ enum Overlay {
     Menu {
         x: u16,
         y: u16,
-        /// (repo, entry, staged) — the file row the menu targets.
-        target: (usize, FileEntry, bool),
+        target: MenuTarget,
         entries: Vec<MenuEntry>,
         selected: usize,
         rect: Rect,
@@ -221,6 +317,12 @@ enum Overlay {
     ConfirmDiscard {
         repo: usize,
         entry: FileEntry,
+    },
+    /// A y/N prompt guarding a destructive git command (reset, delete, drop).
+    ConfirmGit {
+        repo: usize,
+        prompt: String,
+        args: Vec<String>,
     },
     /// The ⚙ settings modal: mouse-toggleable panel settings.
     Settings {
@@ -604,6 +706,8 @@ impl App {
                 Ok(lines) => lines,
                 Err(e) => vec![format!("({e})")],
             };
+            let panel = &mut self.drawers[kind.index()];
+            panel.refs = panel.lines.iter().map(|l| parse_drawer_ref(kind, l)).collect();
         }
     }
 
@@ -896,19 +1000,34 @@ impl App {
         if let Some((index, line)) = self.row_hit(y) {
             let _ = line;
             match self.rows[index] {
-                // Clicking a changed file shows its diff, like VS Code.
+                // Clicking a changed file shows its diff, like VS Code —
+                // except on the hover − / + zone, which unstages/stages it.
                 Row::Staged(r, i) => {
                     self.focus = Focus::List;
                     self.select(index);
                     if let Some(entry) = self.repos[r].status.staged.get(i).cloned() {
-                        self.open_diff(r, &entry, true);
+                        if x >= self.last_width.saturating_sub(5) {
+                            if let Err(e) = self.repos[r].git.unstage(&entry) {
+                                self.flash = Some((e, true));
+                            }
+                            self.refresh();
+                        } else {
+                            self.open_diff(r, &entry, true);
+                        }
                     }
                 }
                 Row::Unstaged(r, i) => {
                     self.focus = Focus::List;
                     self.select(index);
                     if let Some(entry) = self.repos[r].status.unstaged.get(i).cloned() {
-                        self.open_diff(r, &entry, false);
+                        if x >= self.last_width.saturating_sub(5) {
+                            if let Err(e) = self.repos[r].git.stage(&entry) {
+                                self.flash = Some((e, true));
+                            }
+                            self.refresh();
+                        } else {
+                            self.open_diff(r, &entry, false);
+                        }
                     }
                 }
                 // The inline widgets: click focuses/acts without selecting.
@@ -942,28 +1061,62 @@ impl App {
                         self.activate();
                     }
                 }
-                Row::StagedHeader(_) | Row::ChangesHeader(_) | Row::DrawerHeader(_) => {
+                // Header hover −/+ unstages/stages the whole section.
+                Row::StagedHeader(r) => {
+                    self.focus = Focus::List;
+                    self.select(index);
+                    if x >= self.last_width.saturating_sub(6) {
+                        if let Some(repo) = self.repos.get(r)
+                            && let Err(e) = repo.git.unstage_all()
+                        {
+                            self.flash = Some((e, true));
+                        }
+                        self.refresh();
+                    } else {
+                        self.activate();
+                    }
+                }
+                Row::ChangesHeader(r) => {
+                    self.focus = Focus::List;
+                    self.select(index);
+                    if x >= self.last_width.saturating_sub(6) {
+                        if let Some(repo) = self.repos.get(r)
+                            && let Err(e) = repo.git.stage_all()
+                        {
+                            self.flash = Some((e, true));
+                        }
+                        self.refresh();
+                    } else {
+                        self.activate();
+                    }
+                }
+                Row::DrawerHeader(_) => {
                     self.focus = Focus::List;
                     self.select(index);
                     self.activate();
                 }
-                _ => {
+                Row::DrawerLine(kind, i) => {
                     self.focus = Focus::List;
                     self.select(index);
+                    self.open_drawer_ref(kind, i);
                 }
             }
         }
         None
     }
 
-    /// Ctrl+right-click: the VS Code-style context menu for a file row.
+    /// Ctrl+right-click: the VS Code / GitLens-style context menu.
     fn open_context_menu(&mut self, x: u16, y: u16) {
         let Some(index) = self.row_at(y) else { return };
         self.select(index);
         let (repo, entry, staged) = match self.rows[index] {
             Row::Staged(r, i) => (r, self.repos[r].status.staged.get(i), true),
             Row::Unstaged(r, i) => (r, self.repos[r].status.unstaged.get(i), false),
-            _ => return, // headers and drawer lines have no menu
+            Row::DrawerLine(kind, i) => {
+                self.open_drawer_menu(x, y, kind, i);
+                return;
+            }
+            _ => return, // section headers have no menu
         };
         let Some(entry) = entry.cloned() else { return };
         let mut entries = vec![
@@ -986,7 +1139,65 @@ impl App {
         self.overlay = Some(Overlay::Menu {
             x,
             y,
-            target: (repo, entry, staged),
+            target: MenuTarget::File { repo, entry, staged },
+            entries,
+            selected: 0,
+            rect: Rect::default(),
+        });
+    }
+
+    /// The GitLens-style menu for a commit / branch / stash / remote / tag.
+    fn open_drawer_menu(&mut self, x: u16, y: u16, kind: Drawer, index: usize) {
+        let Some(dref) = self.drawers[kind.index()].refs.get(index) else { return };
+        let entries: Vec<MenuEntry> = match dref {
+            DrawerRef::Commit(_) => vec![
+                MenuEntry::Action(MenuAction::ShowRef, "Show Changes"),
+                MenuEntry::Separator,
+                MenuEntry::Action(MenuAction::Checkout, "Checkout (Detached)"),
+                MenuEntry::Action(MenuAction::CherryPick, "Cherry-Pick"),
+                MenuEntry::Action(MenuAction::Revert, "Revert"),
+                MenuEntry::Action(MenuAction::ResetHere, "Reset Current Branch Here…"),
+                MenuEntry::Separator,
+                MenuEntry::Action(MenuAction::CopyRef, "Copy Hash"),
+            ],
+            DrawerRef::Branch { current: true, .. } => vec![
+                MenuEntry::Action(MenuAction::ShowRef, "Show Tip Commit"),
+                MenuEntry::Action(MenuAction::CopyRef, "Copy Branch Name"),
+            ],
+            DrawerRef::Branch { current: false, .. } => vec![
+                MenuEntry::Action(MenuAction::Checkout, "Checkout Branch"),
+                MenuEntry::Action(MenuAction::MergeInto, "Merge into Current Branch"),
+                MenuEntry::Separator,
+                MenuEntry::Action(MenuAction::DeleteBranch, "Delete Branch…"),
+                MenuEntry::Separator,
+                MenuEntry::Action(MenuAction::CopyRef, "Copy Branch Name"),
+            ],
+            DrawerRef::Stash(_) => vec![
+                MenuEntry::Action(MenuAction::ShowRef, "Show Changes"),
+                MenuEntry::Separator,
+                MenuEntry::Action(MenuAction::StashApply, "Apply Stash"),
+                MenuEntry::Action(MenuAction::StashPop, "Pop Stash"),
+                MenuEntry::Separator,
+                MenuEntry::Action(MenuAction::StashDrop, "Drop Stash…"),
+            ],
+            DrawerRef::Remote { .. } => vec![
+                MenuEntry::Action(MenuAction::FetchRemote, "Fetch"),
+                MenuEntry::Action(MenuAction::CopyRef, "Copy URL"),
+            ],
+            DrawerRef::Tag(_) => vec![
+                MenuEntry::Action(MenuAction::ShowRef, "Show Changes"),
+                MenuEntry::Action(MenuAction::Checkout, "Checkout Tag"),
+                MenuEntry::Separator,
+                MenuEntry::Action(MenuAction::DeleteTag, "Delete Tag…"),
+                MenuEntry::Separator,
+                MenuEntry::Action(MenuAction::CopyRef, "Copy Tag Name"),
+            ],
+            DrawerRef::None => return,
+        };
+        self.overlay = Some(Overlay::Menu {
+            x,
+            y,
+            target: MenuTarget::Drawer { kind, index },
             entries,
             selected: 0,
             rect: Rect::default(),
@@ -1000,6 +1211,7 @@ impl App {
             Activate,
             ToggleSetting(usize),
             DiscardConfirmed(usize, FileEntry),
+            GitConfirmed(usize, Vec<String>),
         }
         let row_count = self.settings_rows().len();
         let cmd = match self.overlay.as_mut() {
@@ -1035,6 +1247,12 @@ impl App {
                 }
                 _ => Cmd::Close,
             },
+            Some(Overlay::ConfirmGit { repo, args, .. }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    Cmd::GitConfirmed(*repo, args.clone())
+                }
+                _ => Cmd::Close,
+            },
             None => Cmd::Nothing,
         };
         match cmd {
@@ -1042,6 +1260,11 @@ impl App {
             Cmd::Close => self.overlay = None,
             Cmd::Activate => self.activate_menu_entry(),
             Cmd::ToggleSetting(index) => self.toggle_setting(index),
+            Cmd::GitConfirmed(repo, args) => {
+                self.overlay = None;
+                let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+                self.run_git(repo, &strs);
+            }
             Cmd::DiscardConfirmed(repo, entry) => {
                 self.overlay = None;
                 let result = match self.repos.get(repo) {
@@ -1254,7 +1477,15 @@ impl App {
             return;
         };
         let MenuEntry::Action(action, _) = entries[selected] else { return };
-        let (repo, entry, staged) = target;
+        match target {
+            MenuTarget::File { repo, entry, staged } => {
+                self.file_menu_action(action, repo, entry, staged)
+            }
+            MenuTarget::Drawer { kind, index } => self.drawer_menu_action(action, kind, index),
+        }
+    }
+
+    fn file_menu_action(&mut self, action: MenuAction, repo: usize, entry: FileEntry, staged: bool) {
         let repo_root = self.repos.get(repo).map(|r| r.git.root().to_path_buf());
         match action {
             MenuAction::StageOrUnstage => {
@@ -1287,6 +1518,106 @@ impl App {
                 let path = repo_root.unwrap_or_else(|| self.cwd.clone()).join(rel);
                 reveal(&path);
             }
+            _ => {}
+        }
+    }
+
+    fn drawer_menu_action(&mut self, action: MenuAction, kind: Drawer, index: usize) {
+        let Some(dref) = self.drawers[kind.index()].refs.get(index).cloned() else { return };
+        let repo = self.active;
+        let spec = match &dref {
+            DrawerRef::Commit(h) => h.clone(),
+            DrawerRef::Stash(n) => format!("stash@{{{n}}}"),
+            DrawerRef::Branch { name, .. } => name.clone(),
+            DrawerRef::Remote { name, .. } => name.clone(),
+            DrawerRef::Tag(t) => t.clone(),
+            DrawerRef::None => return,
+        };
+        match action {
+            MenuAction::ShowRef => self.open_drawer_ref(kind, index),
+            MenuAction::CopyRef => {
+                let text = match &dref {
+                    DrawerRef::Remote { url, .. } if !url.is_empty() => url.clone(),
+                    _ => spec,
+                };
+                self.flash = Some(match copy_to_clipboard(&text) {
+                    Ok(()) => (format!("copied: {text}"), false),
+                    Err(err) => (format!("copy failed: {err}"), true),
+                });
+            }
+            MenuAction::Checkout => self.run_git(repo, &["checkout", &spec]),
+            MenuAction::MergeInto => self.run_git(repo, &["merge", "--no-edit", &spec]),
+            MenuAction::CherryPick => self.run_git(repo, &["cherry-pick", &spec]),
+            MenuAction::Revert => self.run_git(repo, &["revert", "--no-edit", &spec]),
+            MenuAction::StashApply => self.run_git(repo, &["stash", "apply", &spec]),
+            MenuAction::StashPop => self.run_git(repo, &["stash", "pop", &spec]),
+            MenuAction::FetchRemote => self.run_git(repo, &["fetch", &spec]),
+            MenuAction::ResetHere => self.confirm_git(
+                repo,
+                format!("Reset current branch to {spec} (mixed)? (y/N)"),
+                vec!["reset".into(), "--mixed".into(), spec],
+            ),
+            MenuAction::DeleteBranch => self.confirm_git(
+                repo,
+                format!("Delete branch '{spec}'? (y/N)"),
+                vec!["branch".into(), "-D".into(), spec],
+            ),
+            MenuAction::StashDrop => self.confirm_git(
+                repo,
+                format!("Drop {spec}? (y/N)"),
+                vec!["stash".into(), "drop".into(), spec],
+            ),
+            MenuAction::DeleteTag => self.confirm_git(
+                repo,
+                format!("Delete tag '{spec}'? (y/N)"),
+                vec!["tag".into(), "-d".into(), spec],
+            ),
+            _ => {}
+        }
+    }
+
+    /// Run a git op for `repo`, flash the outcome, refresh everything (merge
+    /// conflicts and the like surface as the flashed git error).
+    fn run_git(&mut self, repo: usize, args: &[&str]) {
+        let result = match self.repos.get(repo) {
+            Some(r) => r.git.raw(args),
+            None => Err("repository is gone".to_string()),
+        };
+        match result {
+            Ok(_) => self.flash = Some((format!("git {} ✓", args.join(" ")), false)),
+            Err(e) => self.flash = Some((e, true)),
+        }
+        self.refresh();
+    }
+
+    fn confirm_git(&mut self, repo: usize, prompt: String, args: Vec<String>) {
+        self.overlay = Some(Overlay::ConfirmGit { repo, prompt, args });
+    }
+
+    /// Click/⏎ on a drawer line: show the commit / stash / tag / branch tip
+    /// in the preview pane (scrollable colored `git show`).
+    fn open_drawer_ref(&mut self, kind: Drawer, index: usize) {
+        let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) else {
+            self.flash = Some(("preview needs a herdr pane".into(), true));
+            return;
+        };
+        let Some(repo) = self.repos.get(self.active) else { return };
+        let spec = match self.drawers[kind.index()].refs.get(index) {
+            Some(DrawerRef::Commit(h)) => h.clone(),
+            Some(DrawerRef::Stash(n)) => format!("stash@{{{n}}}"),
+            Some(DrawerRef::Branch { name, .. }) => name.clone(),
+            Some(DrawerRef::Tag(t)) => t.clone(),
+            _ => return,
+        };
+        let path = (kind == Drawer::FileHistory)
+            .then(|| self.history_target.clone())
+            .flatten();
+        let payload =
+            herdr_aa_sidebar::viewer::show_request(repo.git.root(), &spec, path.as_deref());
+        if let Err(e) =
+            herdr_aa_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &payload)
+        {
+            self.flash = Some((e, true));
         }
     }
 
@@ -1455,6 +1786,7 @@ impl App {
         match row {
             // Widget rows aren't keyboard-selectable; nothing to activate.
             Row::Message(_) | Row::Commit(_) => {}
+            Row::DrawerLine(kind, i) => self.open_drawer_ref(kind, i),
             Row::RepoHeader(r) => {
                 self.repos[r].collapsed = !self.repos[r].collapsed;
                 self.rebuild();
@@ -1472,7 +1804,6 @@ impl App {
                 self.reload_expanded_drawers();
                 self.rebuild();
             }
-            Row::DrawerLine(..) => {}
             Row::Staged(r, i) => self.run_op(|git, e| git.unstage(e), r, i, true),
             Row::Unstaged(r, i) => self.run_op(|git, e| git.stage(e), r, i, false),
         }
@@ -1706,6 +2037,7 @@ impl App {
             self.zones.sync = Rect::default();
         }
         self.draw_list(frame, list);
+        let footer_empty = footer_lines.is_empty();
         frame.render_widget(Paragraph::new(footer_lines), footer);
         // Collapse button at the bottom-right of the last footer line,
         // mirroring the explorer (and herdr's own sidebar).
@@ -1715,6 +2047,15 @@ impl App {
             footer.width,
             1,
         );
+        if footer_empty {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    " ctrl+rclick for menus",
+                    Style::default().dim().italic(),
+                )),
+                last_line,
+            );
+        }
         let [_, footer_button] =
             Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(last_line);
         frame.render_widget(
@@ -1936,6 +2277,7 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, row)| {
+                let row_hovered = hovered == Some(i);
                 let item = match *row {
                     Row::RepoHeader(r) => {
                         repo_header_item(&self.repos[r], r == active, theme, width)
@@ -1956,12 +2298,14 @@ impl App {
                         self.repos[r].staged_collapsed,
                         Some(self.repos[r].status.staged.len()),
                         width,
+                        row_hovered.then_some('−'),
                     ),
                     Row::ChangesHeader(r) => section_item(
                         "Changes",
                         self.repos[r].changes_collapsed,
                         Some(self.repos[r].status.unstaged.len()),
                         width,
+                        row_hovered.then_some('+'),
                     ),
                     Row::DrawerHeader(kind) => {
                         let mut item = section_item(
@@ -1969,6 +2313,7 @@ impl App {
                             !self.drawers[kind.index()].expanded,
                             None,
                             width,
+                            None,
                         );
                         if kind == Drawer::FileHistory
                             && let Some(target) = &self.history_target
@@ -1984,10 +2329,18 @@ impl App {
                     Row::DrawerLine(kind, i) => {
                         drawer_line(kind, &self.drawers[kind.index()].lines[i])
                     }
-                    Row::Staged(r, i) => file_item(&self.repos[r].status.staged[i], width, theme),
-                    Row::Unstaged(r, i) => {
-                        file_item(&self.repos[r].status.unstaged[i], width, theme)
-                    }
+                    Row::Staged(r, i) => file_item(
+                        &self.repos[r].status.staged[i],
+                        width,
+                        theme,
+                        row_hovered.then_some('−'),
+                    ),
+                    Row::Unstaged(r, i) => file_item(
+                        &self.repos[r].status.unstaged[i],
+                        width,
+                        theme,
+                        row_hovered.then_some('+'),
+                    ),
                 };
                 if hovered == Some(i) {
                     item.style(Style::default().bg(HOVER_BG))
@@ -2043,6 +2396,9 @@ impl App {
                 format!(" Discard changes to '{}'? (y/N)", entry.path),
                 Style::default().fg(DELETED),
             )];
+        }
+        if let Some(Overlay::ConfirmGit { prompt, .. }) = &self.overlay {
+            return vec![Line::styled(format!(" {prompt}"), Style::default().fg(DELETED))];
         }
         if let Some((text, is_error)) = &self.flash {
             let color = if *is_error { DELETED } else { UNTRACKED };
@@ -2319,6 +2675,7 @@ fn section_item(
     collapsed: bool,
     count: Option<usize>,
     width: usize,
+    action: Option<char>,
 ) -> ListItem<'static> {
     let arrow = if collapsed { "▸" } else { "▾" };
     let left = Span::styled(format!(" {arrow} {title}"), Style::default().bold());
@@ -2329,13 +2686,17 @@ fn section_item(
         format!(" {count} "),
         Style::default().bg(BADGE_BLUE).fg(Color::White),
     );
-    let pad = width.saturating_sub(left.width() + badge.width() + 1).max(1);
-    ListItem::new(Line::from(vec![
-        left,
-        Span::raw(" ".repeat(pad)),
-        badge,
-        Span::raw(" "),
-    ]))
+    // Hovering shows the section-wide stage/unstage glyph before the badge.
+    let action_span = action.map(|a| Span::styled(format!("{a} "), Style::default().bold()));
+    let aw = action_span.as_ref().map(Span::width).unwrap_or(0);
+    let pad = width.saturating_sub(left.width() + badge.width() + 1 + aw).max(1);
+    let mut spans = vec![left, Span::raw(" ".repeat(pad))];
+    if let Some(a) = action_span {
+        spans.push(a);
+    }
+    spans.push(badge);
+    spans.push(Span::raw(" "));
+    ListItem::new(Line::from(spans))
 }
 
 /// The FILE HISTORY header with the followed file's name appended, dimmed.
@@ -2361,7 +2722,12 @@ fn drawer_line(kind: Drawer, text: &str) -> ListItem<'static> {
 
 /// A file row: icon, name colored by status, dimmed parent directory, and a
 /// right-aligned status letter — VS Code Source Control's row anatomy.
-fn file_item(entry: &FileEntry, width: usize, theme: IconTheme) -> ListItem<'static> {
+fn file_item(
+    entry: &FileEntry,
+    width: usize,
+    theme: IconTheme,
+    action: Option<char>,
+) -> ListItem<'static> {
     let (dir, name) = match entry.path.rsplit_once('/') {
         Some((dir, name)) => (Some(dir), name),
         None => (None, entry.path.as_str()),
@@ -2377,12 +2743,14 @@ fn file_item(entry: &FileEntry, width: usize, theme: IconTheme) -> ListItem<'sta
         Span::styled(format!("{} ", file_icon.glyph), icon_style),
         Span::styled(name.to_string(), Style::default().fg(color)),
     ];
+    // The hovered row shows the stage/unstage glyph beside the letter.
+    let tail = 2 + if action.is_some() { 2 } else { 0 };
     if let Some(dir) = dir {
         let sep = std::path::MAIN_SEPARATOR.to_string();
         // The status letter must survive narrow panes: give the dimmed dir only
         // the room left after icon + name + letter, ellipsizing like VS Code.
         let used: usize = spans.iter().map(Span::width).sum();
-        let avail = width.saturating_sub(used + 3);
+        let avail = width.saturating_sub(used + 1 + tail);
         let text = truncate_to(format!(" {}", dir.replace('/', &sep)), avail);
         if !text.is_empty() {
             spans.push(Span::styled(text, Style::default().dim()));
@@ -2390,8 +2758,11 @@ fn file_item(entry: &FileEntry, width: usize, theme: IconTheme) -> ListItem<'sta
     }
     let letter = Span::styled(entry.letter.to_string(), Style::default().fg(color).bold());
     let left_width: usize = spans.iter().map(Span::width).sum();
-    let pad = width.saturating_sub(left_width + 2).max(1);
+    let pad = width.saturating_sub(left_width + tail).max(1);
     spans.push(Span::raw(" ".repeat(pad)));
+    if let Some(a) = action {
+        spans.push(Span::styled(format!("{a} "), Style::default().bold()));
+    }
     spans.push(letter);
     spans.push(Span::raw(" "));
     ListItem::new(Line::from(spans))
@@ -2400,6 +2771,42 @@ fn file_item(entry: &FileEntry, width: usize, theme: IconTheme) -> ListItem<'sta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drawer_lines_parse_into_actionable_refs() {
+        assert_eq!(
+            parse_drawer_ref(Drawer::Commits, "a1b2c3d Add telemetry module"),
+            DrawerRef::Commit("a1b2c3d".into())
+        );
+        // Graph edge-only lines carry no commit; subject words never match
+        // (uppercase or non-hex letters, or too short).
+        assert_eq!(parse_drawer_ref(Drawer::Graph, "| \\"), DrawerRef::None);
+        assert_eq!(
+            parse_drawer_ref(Drawer::Graph, "* deadbee (HEAD -> main) Added decoded fallback"),
+            DrawerRef::Commit("deadbee".into())
+        );
+        assert_eq!(
+            parse_drawer_ref(Drawer::Branches, "* main"),
+            DrawerRef::Branch { name: "main".into(), current: true }
+        );
+        assert_eq!(
+            parse_drawer_ref(Drawer::Branches, "  origin/main"),
+            DrawerRef::Branch { name: "origin/main".into(), current: false }
+        );
+        assert_eq!(
+            parse_drawer_ref(Drawer::Stashes, "stash@{2}: WIP on main: 1a2b3c4 x"),
+            DrawerRef::Stash(2)
+        );
+        assert_eq!(
+            parse_drawer_ref(Drawer::Remotes, "origin  https://github.com/a/b.git"),
+            DrawerRef::Remote {
+                name: "origin".into(),
+                url: "https://github.com/a/b.git".into()
+            }
+        );
+        assert_eq!(parse_drawer_ref(Drawer::Tags, "v0.1.0"), DrawerRef::Tag("v0.1.0".into()));
+        assert_eq!(parse_drawer_ref(Drawer::Tags, "(none)"), DrawerRef::None);
+    }
 
     #[test]
     fn menu_navigation_skips_separators_and_clamps() {
