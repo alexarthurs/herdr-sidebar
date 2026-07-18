@@ -1,7 +1,7 @@
 //! Shared library behind the sidebar binaries: the sidebar TUI
-//! (`herdr-aa-sidebar`, hosting BOTH views — file explorer and source
+//! (`herdr-sidebar`, hosting BOTH views — file explorer and source
 //! control — plus the `--preview` file viewer) and the windowless ensure
-//! sidecar (`herdr-aa-sidebar-ensure`).
+//! sidecar (`herdr-sidebar-ensure`).
 
 pub mod actions;
 pub mod ansi;

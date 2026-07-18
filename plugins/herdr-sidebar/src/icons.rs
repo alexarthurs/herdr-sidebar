@@ -18,7 +18,8 @@ pub enum IconTheme {
 }
 
 impl IconTheme {
-    /// Initial theme from `HERDR_AA_FILETREE_ICONS`. Material (the Atom
+    /// Initial theme from `HERDR_SIDEBAR_ICONS` (legacy `HERDR_AA_*_ICONS`
+    /// still honored). Material (the Atom
     /// Material look) is the default — set `emoji` if the terminal font has no
     /// Nerd Font glyphs (or just press `i`).
     pub fn from_env(value: Option<&str>) -> Self {

@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 pub fn dir() -> PathBuf {
-    std::env::temp_dir().join("herdr-aa-sidebar-snooze")
+    std::env::temp_dir().join("herdr-sidebar-snooze")
 }
 
 fn marker(dir: &std::path::Path, tab: &str) -> PathBuf {

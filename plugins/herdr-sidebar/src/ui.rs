@@ -219,7 +219,7 @@ mod tests {
         let json = r#"{"result":{"panes":[
             {"pane_id":"w1:p1","tab_id":"w1:t1","label":"Sidebar"},
             {"pane_id":"w1:p2","tab_id":"w1:t1","label":"Source Control"},
-            {"pane_id":"w1:p3","tab_id":"w1:t1","tokens":{"herdr-aa-sidebar-git":{}}},
+            {"pane_id":"w1:p3","tab_id":"w1:t1","tokens":{"herdr-sidebar-git":{}}},
             {"pane_id":"w1:p9","tab_id":"w1:t2","label":"Source Control"}
         ]}}"#;
         let found = sibling_panes_of(json, "w1:p1", View::SourceControl);

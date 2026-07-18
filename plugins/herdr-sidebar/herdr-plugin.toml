@@ -1,4 +1,4 @@
-# Manifest for herdr-aa-sidebar — the VS Code sidebar for herdr: file explorer
+# Manifest for herdr-sidebar — the VS Code sidebar for herdr: file explorer
 # and source control in one plugin (one pane by default, separated panes on
 # request via the ⚙ settings).
 #
@@ -17,8 +17,8 @@
 #    goes right/down, so they split the leftmost pane and `pane swap` the new
 #    pane into the left slot.
 
-id = "herdr-aa-sidebar"
-name = "herdr-aa-sidebar"
+id = "herdr-sidebar"
+name = "herdr-sidebar"
 version = "0.3.0"
 description = "VS Code-style sidebar: file explorer + source control (with ✧ AI commit messages) in one herdr pane."
 min_herdr_version = "0.7.0"
@@ -34,7 +34,7 @@ command = ["cargo", "build", "--release"]
 id = "sidebar"
 title = "Sidebar"
 placement = "split"
-command = ["./target/release/herdr-aa-sidebar"]
+command = ["./target/release/herdr-sidebar"]
 
 # Toggle the sidebar: open left-docked / focus if unfocused / close if focused.
 [[actions]]
@@ -68,7 +68,7 @@ title = "Toggle source control"
 description = "Open a separate Source Control pane (focus it if open; close it if focused)."
 command = [
   "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-aa-sidebar'}).plugin_root; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'scripts') 'open-git.ps1')''',
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-sidebar'}).plugin_root; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'scripts') 'open-git.ps1')''',
 ]
 
 # Refresh every workspace onto the latest builds after a rebuild.

@@ -8,7 +8,7 @@ your branch so it lands on main with the merge.
 
 One herdr plugin, a VS Code-style sidebar for the terminal, as a **self-contained Rust crate**:
 
-- `plugins/herdr-aa-sidebar` — file explorer + source control in ONE binary (ratatui TUI).
+- `plugins/herdr-sidebar` — file explorer + source control in ONE binary (ratatui TUI).
   Unified mode shows both views in a single "Sidebar" pane with an activity-bar switcher
   (in-process, instant); the ⚙ settings can split them into separate Explorer /
   Source Control panes (`--view explorer|git` pins a pane's starting view). `--preview`
@@ -26,7 +26,7 @@ that path. Keep every crate buildable standalone from its own directory.
 Run from inside the plugin directory, not the repo root:
 
 ```
-cd plugins/herdr-aa-sidebar
+cd plugins/herdr-sidebar
 cargo build --release
 cargo test
 cargo clippy -- -D warnings
@@ -39,6 +39,9 @@ cargo clippy -- -D warnings
 - `herdr plugin action list` / `herdr plugin action invoke <plugin>.<action>` run manifest actions.
 - `herdr plugin log list --plugin <id>` shows plugin logs.
 - Manifest format: `herdr-plugin.toml` (`[[build]]`, `[[panes]]`, `[[actions]]`).
+- herdr.dev/docs/plugins lists an `[[actions]]` `contexts` field as REQUIRED, but no
+  working plugin ships it (checked herdr-file-viewer, herdr-spreader, ours, herdr-notes)
+  — doc/implementation drift; leave it out.
 
 ### Reference implementations (installed locally, read these before designing)
 
@@ -70,7 +73,7 @@ cargo clippy -- -D warnings
 - **Propagating a rebuild to every workspace**: plugin registration is global (one `plugin link`
   serves all workspaces), but stale panes keep old binaries AND a dead-but-open Explorer/Sidebar
   pane blocks the ensure hook's re-dock (it matches by label/token, not liveness). Run
-  `herdr plugin action invoke herdr-aa-sidebar.redeploy-windows` after rebuilding: it closes
+  `herdr plugin action invoke herdr-sidebar.redeploy-windows` after rebuilding: it closes
   every herdr-aa pane in every workspace, kills stragglers, and re-docks the focused workspace;
   the others re-dock via the focus hook the moment they're next visited.
 
@@ -136,7 +139,7 @@ Console flashes from hooks (Windows 11, verified live):
   relative script **argument** (`scripts/x.vbs`) resolves — the *program* itself still cannot
   be a relative path (resolved against herdr's own dir).
 - Rebuilds fail while any plugin exe is running; stray TUI processes can outlive their closed
-  panes — `Get-Process herdr-aa-sidebar | Stop-Process` before `cargo build --release`.
+  panes — `Get-Process herdr-sidebar | Stop-Process` before `cargo build --release`.
 
 Socket API (what the CLI wraps; usable directly from plugins, no subprocess needed):
 
@@ -237,10 +240,14 @@ HACKING.md — budget time for that before promising a patched build.
   (`s` key or the gear button) — never "merge"/"detach" in UI text, and the toggle is
   silent (the layout change is the feedback). Off spawns a second pane of the same binary
   pinned with `--view`, and each pane pins to its own view.
-- The sticky setting lives in `%APPDATA%\herdr\aa-sidebar.json` (`{merged, active}`); a
-  fresh sidebar opens on the last-active view.
-- The unified pane reports BOTH identity tokens (`herdr-aa-sidebar-explorer`,
-  `herdr-aa-sidebar-git`) so either launcher decision finds it; turning unified off clears
+- The sticky setting lives in `HERDR_PLUGIN_STATE_DIR/state.json` (resolves to
+  `%LOCALAPPDATA%\herdr\plugins\herdr-sidebar\` here) per the herdr plugin docs; herdr
+  injects that env for hooks/actions but NOT panes, so every `pane.split` we issue
+  forwards it via the `env` param (`state::spawn_env`). Legacy
+  `%APPDATA%\herdr\aa-sidebar.json` is migrated on first load. A fresh sidebar opens on
+  the last-active view.
+- The unified pane reports BOTH identity tokens (`herdr-sidebar-explorer`,
+  `herdr-sidebar-git`) so either launcher decision finds it; turning unified off clears
   the other token (null value — report_metadata MERGES token maps).
 - `c` (or "Change Folder…" in the context menu / both ⚙ Settings modals) re-roots the
   sidebar via the NATIVE OS folder picker (`rfd`, Windows IFileDialog / macOS NSOpenPanel;
@@ -278,7 +285,7 @@ HACKING.md — budget time for that before promising a patched build.
   from the porcelain `## branch...upstream [ahead N, behind M]` header.
 - Hotkey hints render as keycap chips (`wrap_hints` takes `(key, label)` pairs, shared in
   `ui.rs`). They live in the ⚙ Settings modal; the FOOTER copy is opt-in via the
-  "Footer hotkeys" setting (persisted as `hotkeys` in `aa-sidebar.json`, default hidden —
+  "Footer hotkeys" setting (persisted as `hotkeys` in the state file, default hidden —
   it clipped in narrow panes). The ✧ suggest button uses MDI "creation" (`\u{f0674}`,
   the outline ✨ silhouette) in the material theme.
 - There is NO collapse-to-sliver mode anymore (herdr's 10% ratio floor made the sliver
@@ -324,7 +331,7 @@ truncation bugs unit tests can't.
 
 ## README screenshots (how-to)
 
-The framed screenshots in `plugins/herdr-aa-sidebar/docs/media/` are produced with the
+The framed screenshots in `plugins/herdr-sidebar/docs/media/` are produced with the
 scripts in `tools/screenshots/` (capture → crop → frame). Full reshoot procedure, verified
 end-to-end twice:
 
@@ -354,7 +361,7 @@ end-to-end twice:
    docs/auth.md, modified routes.rs, dirty `acme-sdk` child repo, 1 commit ahead of a bare
    `.acme-origin.git`) — multi-repo + sync + diff all have something to show.
 3. **Stage**: new tab in this workspace with `--cwd` = acme-app, `herdr tab focus` it,
-   invoke `herdr-aa-sidebar.open-sidebar-windows`, close the tab's shell pane.
+   invoke `herdr-sidebar.open-sidebar-windows`, close the tab's shell pane.
 4. **Shots** (drive via `pane send-keys`, capture via `capture.ps1 <raw.png>`):
    *preview* — explorer view, expand src/api (`Down Down Enter`, `Down Enter`), select
    routes.rs, Enter opens the preview pane. *scm* — `2`, Down×4 to routes.rs, `o` opens

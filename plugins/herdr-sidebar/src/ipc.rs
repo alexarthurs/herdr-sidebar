@@ -38,7 +38,7 @@ pub fn call_text(method: &str, params: serde_json::Value) -> std::io::Result<Str
         std::io::Error::new(std::io::ErrorKind::NotFound, "no herdr socket path")
     })?;
     let request = serde_json::json!({
-        "id": format!("herdr-aa-sidebar:{method}"),
+        "id": format!("herdr-sidebar:{method}"),
         "method": method,
         "params": params,
     });

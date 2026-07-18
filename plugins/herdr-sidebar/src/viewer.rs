@@ -29,7 +29,7 @@ use crate::ipc;
 
 /// Metadata source/token that marks the viewer pane, so the sidebar can find
 /// and reuse it (distinct from the sidebar's own identity tokens).
-pub const METADATA_SOURCE: &str = "herdr-aa-sidebar-preview";
+pub const METADATA_SOURCE: &str = "herdr-sidebar-preview";
 
 /// How often the control file is re-checked while idle.
 const POLL: Duration = Duration::from_millis(250);
@@ -42,7 +42,7 @@ const MAX_LINES: usize = 5000;
 /// pane (tab) so tabs don't steer each other's viewers.
 pub fn control_path(sidebar_pane_id: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
-        "herdr-aa-sidebar-preview-{}.ctl",
+        "herdr-sidebar-preview-{}.ctl",
         sidebar_pane_id.replace(':', "_")
     ))
 }
@@ -296,7 +296,12 @@ fn close_own_pane() {
 
 /// The viewer's event loop; returns when the user closes it.
 pub fn run(control: &Path) -> std::io::Result<()> {
-    let theme = IconTheme::from_env(std::env::var("HERDR_AA_FILETREE_ICONS").ok().as_deref());
+    let theme = IconTheme::from_env(
+        std::env::var("HERDR_SIDEBAR_ICONS")
+            .or_else(|_| std::env::var("HERDR_AA_FILETREE_ICONS"))
+            .ok()
+            .as_deref(),
+    );
     let mut current = read_control(control);
     let mut doc = current.as_ref().map(load).unwrap_or_else(|| Doc {
         name: "(nothing to show)".into(),
@@ -548,6 +553,7 @@ fn spawn_viewer_pane(my_pane_id: &str, spawn_cwd: &Path, control: &Path) -> Resu
             "ratio": ratio,
             "focus": false,
             "cwd": spawn_cwd.display().to_string(),
+            "env": crate::state::spawn_env(),
         }),
     );
     let new_pane = response
@@ -562,7 +568,7 @@ fn spawn_viewer_pane(my_pane_id: &str, spawn_cwd: &Path, control: &Path) -> Resu
     }
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "herdr-aa-sidebar".to_string());
+        .unwrap_or_else(|_| "herdr-sidebar".to_string());
     #[cfg(windows)]
     let command = format!("& \"{exe}\" --preview \"{}\"", control.display());
     #[cfg(not(windows))]
@@ -674,7 +680,7 @@ mod tests {
         let json = format!(
             r#"{{"result":{{"panes":[
                 {{"pane_id":"w1:p1","tab_id":"w1:t1"}},
-                {{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-aa-sidebar-preview":"{}"}}}}
+                {{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-sidebar-preview":"{}"}}}}
             ]}}}}"#,
             now - 2
         );
@@ -682,7 +688,7 @@ mod tests {
         let stale = format!(
             r#"{{"result":{{"panes":[
                 {{"pane_id":"w1:p1","tab_id":"w1:t1"}},
-                {{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-aa-sidebar-preview":"{}"}}}}
+                {{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-sidebar-preview":"{}"}}}}
             ]}}}}"#,
             now - 999
         );

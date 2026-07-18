@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# open-git-panel.sh — unix launcher for the herdr-aa-sidebar source control pane.
+# open-git-panel.sh — unix launcher for the herdr-sidebar source control pane.
 #
 # Idempotent "launch-or-focus, toggle on repeat", scoped to the current tab:
 #   - no Source Control pane in the current tab      -> open one, DOCKED ON THE LEFT edge
@@ -20,13 +20,13 @@ set -uo pipefail
 
 herdr_bin="${HERDR_BIN_PATH:-herdr}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-bin="$script_dir/../target/release/herdr-aa-sidebar"
+bin="$script_dir/../target/release/herdr-sidebar"
 
 # Without the binary there is no decision logic; fall back to herdr's declarative
 # pane open (right split, not left-docked — degraded but functional).
 if [ ! -x "$bin" ]; then
   exec "$herdr_bin" plugin pane open \
-    --plugin herdr-aa-sidebar \
+    --plugin herdr-sidebar \
     --entrypoint git \
     --placement split \
     --direction right \
@@ -41,7 +41,7 @@ open_pane() {
   fid="${fp%%	*}"
   fcwd="${fp#*	}"
   if [ -z "$fid" ]; then
-    exec "$herdr_bin" plugin pane open --plugin herdr-aa-sidebar \
+    exec "$herdr_bin" plugin pane open --plugin herdr-sidebar \
       --entrypoint git --placement split --direction right --focus
   fi
 

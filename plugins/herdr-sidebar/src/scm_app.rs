@@ -21,16 +21,16 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use herdr_aa_sidebar::git::{FileEntry, Git, Status};
-use herdr_aa_sidebar::icons::{IconTheme, icon};
-use herdr_aa_sidebar::state::{self as sidebar, View};
-use herdr_aa_sidebar::state::Exit;
-use herdr_aa_sidebar::ui::{
+use herdr_sidebar::git::{FileEntry, Git, Status};
+use herdr_sidebar::icons::{IconTheme, icon};
+use herdr_sidebar::state::{self as sidebar, View};
+use herdr_sidebar::state::Exit;
+use herdr_sidebar::ui::{
     activity_icons, branch_icon, gear_icon, hits, hits_collapse_button, sibling_panes_of,
     sparkle_icon, truncate_to, within, wrap_hints,
 };
-use herdr_aa_sidebar::actions::{copy_to_clipboard, reveal};
-use herdr_aa_sidebar::suggest;
+use herdr_sidebar::actions::{copy_to_clipboard, reveal};
+use herdr_sidebar::suggest;
 
 // VS Code's dark-theme git decoration colors.
 const BUTTON_BLUE: Color = Color::Rgb(0x00, 0x78, 0xd4);
@@ -447,24 +447,24 @@ impl PaneCtl {
         if let Some(label) = label {
             params["label"] = serde_json::Value::String(label.to_string());
         }
-        let _ = herdr_aa_sidebar::ipc::call_text("pane.rename", params);
+        let _ = herdr_sidebar::ipc::call_text("pane.rename", params);
     }
 
     /// Resize our pane to `target` terminal columns over the socket API
     /// (`pane.resize` takes a split-RATIO delta; the plan converts columns).
     fn resize_to(&self, current: u16, target: u16) {
-        let Ok(layout) = herdr_aa_sidebar::ipc::call_text(
+        let Ok(layout) = herdr_sidebar::ipc::call_text(
             "pane.layout",
             serde_json::json!({ "pane_id": self.pane_id }),
         ) else {
             return;
         };
         let Some(step) =
-            herdr_aa_sidebar::launch::resize_plan(&layout, &self.pane_id, current, target)
+            herdr_sidebar::launch::resize_plan(&layout, &self.pane_id, current, target)
         else {
             return;
         };
-        let _ = herdr_aa_sidebar::ipc::call_text(
+        let _ = herdr_sidebar::ipc::call_text(
             "pane.resize",
             serde_json::json!({
                 "pane_id": self.pane_id,
@@ -482,7 +482,7 @@ impl PaneCtl {
         // dead panes and replace them (see launch::HEARTBEAT_STALE_SECS).
         let now = sidebar::unix_now().to_string();
         let mine = serde_json::json!({ my.plugin_id(): now });
-        let _ = herdr_aa_sidebar::ipc::call_text(
+        let _ = herdr_sidebar::ipc::call_text(
             "pane.report_metadata",
             serde_json::json!({ "pane_id": self.pane_id, "source": my.plugin_id(), "tokens": mine }),
         );
@@ -494,7 +494,7 @@ impl PaneCtl {
         } else {
             serde_json::json!({ other.plugin_id(): serde_json::Value::Null })
         };
-        let _ = herdr_aa_sidebar::ipc::call_text(
+        let _ = herdr_sidebar::ipc::call_text(
             "pane.report_metadata",
             serde_json::json!({
                 "pane_id": self.pane_id,
@@ -558,7 +558,8 @@ impl App {
             String::new()
         };
         let theme = IconTheme::from_env(
-            std::env::var("HERDR_AA_GIT_ICONS")
+            std::env::var("HERDR_SIDEBAR_ICONS")
+                .or_else(|_| std::env::var("HERDR_AA_GIT_ICONS"))
                 .or_else(|_| std::env::var("HERDR_AA_FILETREE_ICONS"))
                 .ok()
                 .as_deref(),
@@ -632,12 +633,12 @@ impl App {
     fn hide(&mut self) {
         let Some(ctl) = &self.pane_ctl else { return };
         if let Ok(json) =
-            herdr_aa_sidebar::ipc::call_text("pane.list", serde_json::json!({}))
+            herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({}))
         {
-            let tab = herdr_aa_sidebar::launch::tab_of(&json, &ctl.pane_id);
-            herdr_aa_sidebar::snooze::set(&herdr_aa_sidebar::snooze::dir(), &tab);
+            let tab = herdr_sidebar::launch::tab_of(&json, &ctl.pane_id);
+            herdr_sidebar::snooze::set(&herdr_sidebar::snooze::dir(), &tab);
         }
-        let _ = herdr_aa_sidebar::ipc::call_text(
+        let _ = herdr_sidebar::ipc::call_text(
             "pane.close",
             serde_json::json!({ "pane_id": ctl.pane_id }),
         );
@@ -1710,9 +1711,9 @@ impl App {
             .then(|| self.history_target.clone())
             .flatten();
         let payload =
-            herdr_aa_sidebar::viewer::show_request(repo.git.root(), &spec, path.as_deref());
+            herdr_sidebar::viewer::show_request(repo.git.root(), &spec, path.as_deref());
         if let Err(e) =
-            herdr_aa_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &payload)
+            herdr_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &payload)
         {
             self.flash = Some((e, true));
         }
@@ -1734,9 +1735,9 @@ impl App {
             "worktree"
         };
         let payload =
-            herdr_aa_sidebar::viewer::diff_request(repo.git.root(), &entry.path, kind);
+            herdr_sidebar::viewer::diff_request(repo.git.root(), &entry.path, kind);
         if let Err(e) =
-            herdr_aa_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &payload)
+            herdr_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &payload)
         {
             self.flash = Some((e, true));
         }
@@ -1802,11 +1803,11 @@ impl App {
     /// Close the other panel's standalone pane in our tab, if one is open.
     fn close_other_standalone_pane(&self) {
         let Some(ctl) = &self.pane_ctl else { return };
-        let Ok(json) = herdr_aa_sidebar::ipc::call_text("pane.list", serde_json::json!({})) else {
+        let Ok(json) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) else {
             return;
         };
         for id in sibling_panes_of(&json, &ctl.pane_id, MY_VIEW.other()) {
-            let _ = herdr_aa_sidebar::ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }));
+            let _ = herdr_sidebar::ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }));
         }
     }
 
@@ -1816,7 +1817,7 @@ impl App {
         // Grow to double width FIRST, then split 50/50 — each separated panel
         // keeps the width the unified sidebar had, instead of halving.
         ctl.resize_to(self.last_width, self.last_width.saturating_mul(2).saturating_add(1));
-        let response = herdr_aa_sidebar::ipc::call_text(
+        let response = herdr_sidebar::ipc::call_text(
             "pane.split",
             serde_json::json!({
                 "target_pane_id": ctl.pane_id,
@@ -1824,9 +1825,10 @@ impl App {
                 "ratio": 0.5,
                 "focus": false,
                 "cwd": self.cwd.display().to_string(),
+                "env": sidebar::spawn_env(),
             }),
         );
-        let Some(new_pane) = response.ok().and_then(|r| herdr_aa_sidebar::launch::split_pane_id(&r)) else {
+        let Some(new_pane) = response.ok().and_then(|r| herdr_sidebar::launch::split_pane_id(&r)) else {
             return;
         };
         let flag = MY_VIEW.other().view_flag();
@@ -1834,11 +1836,11 @@ impl App {
         let command = format!("& \"{}\" --view {flag}", exe.display());
         #[cfg(not(windows))]
         let command = format!("exec \"{}\" --view {flag}", exe.display());
-        let _ = herdr_aa_sidebar::ipc::call_text(
+        let _ = herdr_sidebar::ipc::call_text(
             "pane.send_input",
             serde_json::json!({ "pane_id": new_pane, "text": command, "keys": ["Enter"] }),
         );
-        let _ = herdr_aa_sidebar::ipc::call_text(
+        let _ = herdr_sidebar::ipc::call_text(
             "pane.rename",
             serde_json::json!({ "pane_id": new_pane, "label": MY_VIEW.other().label() }),
         );
@@ -2547,7 +2549,7 @@ impl App {
     /// Esc: close the preview pane beside us, if one is open.
     fn close_preview(&mut self) {
         if let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) {
-            herdr_aa_sidebar::viewer::close_in_tab(&pane_id);
+            herdr_sidebar::viewer::close_in_tab(&pane_id);
         }
     }
 
@@ -2935,8 +2937,8 @@ mod tests {
         );
         assert_eq!(pretty_worktree_line("(none)"), "(none)");
         assert_eq!(
-            pretty_remote_line("origin  https://github.com/alexarthurs/herdr-aa-sidebar.git"),
-            "origin  alexarthurs/herdr-aa-sidebar"
+            pretty_remote_line("origin  https://github.com/alexarthurs/herdr-sidebar.git"),
+            "origin  alexarthurs/herdr-sidebar"
         );
         assert_eq!(
             pretty_remote_line("up  git@github.com:me/repo.git"),

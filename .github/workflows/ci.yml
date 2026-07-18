@@ -15,7 +15,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     defaults:
       run:
-        working-directory: plugins/herdr-aa-sidebar
+        working-directory: plugins/herdr-sidebar
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -23,7 +23,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: plugins/herdr-aa-sidebar
+          workspaces: plugins/herdr-sidebar
       - run: cargo build --release
       - run: cargo test
       - run: cargo clippy --release -- -D warnings

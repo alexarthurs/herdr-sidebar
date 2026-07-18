@@ -11,12 +11,12 @@ everywhere, AI-drafted commit messages, and a file preview that opens right besi
 <img alt="Rust" src="https://img.shields.io/badge/Rust-self--contained_crate-orange?logo=rust&logoColor=white">
 <img alt="herdr" src="https://img.shields.io/badge/herdr-%E2%89%A5%200.7-5865a3">
 <img alt="Platforms" src="https://img.shields.io/badge/Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-supported-2ea44f">
-<img alt="CI" src="https://github.com/alexarthurs/herdr-aa-sidebar/actions/workflows/ci.yml/badge.svg">
+<img alt="CI" src="https://github.com/alexarthurs/herdr-sidebar/actions/workflows/ci.yml/badge.svg">
 <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
 
 <br><br>
 
-<img src="plugins/herdr-aa-sidebar/docs/media/hero.png" alt="The sidebar docked beside a 2x2 fleet of Claude Code and Codex agents" width="920">
+<img src="plugins/herdr-sidebar/docs/media/hero.png" alt="The sidebar docked beside a 2x2 fleet of Claude Code and Codex agents" width="920">
 
 </div>
 
@@ -27,7 +27,7 @@ on the left of every herdr tab, restores itself on focus, and is driven entirely
 or keystroke.
 
 ```
-herdr plugin install alexarthurs/herdr-aa-sidebar/plugins/herdr-aa-sidebar
+herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-sidebar
 ```
 
 ---
@@ -43,7 +43,7 @@ views ship in one small Rust binary.
 A real tree, not a directory dump:
 
 <div align="center">
-<img src="plugins/herdr-aa-sidebar/docs/media/preview.png" alt="Explorer view with a live file preview open beside the tree" width="920">
+<img src="plugins/herdr-sidebar/docs/media/preview.png" alt="Explorer view with a live file preview open beside the tree" width="920">
 </div>
 
 - Disclosure chevrons, nested indentation, and **two icon themes** — colored Nerd Font
@@ -58,7 +58,7 @@ A real tree, not a directory dump:
 ### 🔀 Source Control
 
 <div align="center">
-<img src="plugins/herdr-aa-sidebar/docs/media/source-control.png" alt="Source control: multi-repo staging, per-repo commit boxes, history drawers" width="920">
+<img src="plugins/herdr-sidebar/docs/media/source-control.png" alt="Source control: multi-repo staging, per-repo commit boxes, history drawers" width="920">
 </div>
 
 Everything you reach for in an editor's source-control panel, in a terminal pane:
@@ -82,7 +82,7 @@ Everything you reach for in an editor's source-control panel, in a terminal pane
 ## Prefer two panels? Take two panels.
 
 <div align="center">
-<img src="plugins/herdr-aa-sidebar/docs/media/separated.png" alt="Separated mode: Source Control and Explorer as independent panes, preview beside them" width="920">
+<img src="plugins/herdr-sidebar/docs/media/separated.png" alt="Separated mode: Source Control and Explorer as independent panes, preview beside them" width="920">
 </div>
 
 The ⚙ settings modal — mouse-toggleable like everything else — flips between:
@@ -92,7 +92,7 @@ The ⚙ settings modal — mouse-toggleable like everything else — flips betwe
   each keeping the full sidebar width.
 
 <div align="center">
-<img src="plugins/herdr-aa-sidebar/docs/media/settings.png" alt="The settings modal" width="920">
+<img src="plugins/herdr-sidebar/docs/media/settings.png" alt="The settings modal" width="920">
 </div>
 
 Icon theme, dotfile visibility, and the full hotkey reference live in the same modal
@@ -104,13 +104,13 @@ worktree, new window, it's just *there*.
 ## Install
 
 ```
-herdr plugin install alexarthurs/herdr-aa-sidebar/plugins/herdr-aa-sidebar
+herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-sidebar
 ```
 
 or from a local checkout:
 
 ```
-cd plugins/herdr-aa-sidebar
+cd plugins/herdr-sidebar
 cargo build --release
 herdr plugin link .
 ```
@@ -118,8 +118,8 @@ herdr plugin link .
 Open it with an action (or just focus a tab and let the hook dock it):
 
 ```
-herdr plugin action invoke herdr-aa-sidebar.open-sidebar-windows   # windows
-herdr plugin action invoke herdr-aa-sidebar.open-sidebar           # linux / macos
+herdr plugin action invoke herdr-sidebar.open-sidebar-windows   # windows
+herdr plugin action invoke herdr-sidebar.open-sidebar           # linux / macos
 ```
 
 **Requirements:** Rust to build, herdr ≥ 0.7. **Recommended:** a Nerd Font terminal face

@@ -33,10 +33,10 @@ function Strip-Verbatim([string]$p) {
     return $p
 }
 $PluginRoot = Strip-Verbatim (Split-Path -Parent $PSScriptRoot)
-$Bin = Join-Path $PluginRoot 'target\release\herdr-aa-sidebar.exe'
+$Bin = Join-Path $PluginRoot 'target\release\herdr-sidebar.exe'
 
 if (-not (Test-Path $Bin)) {
-    Write-Error "herdr-aa-sidebar.exe not found at $Bin -- run 'cargo build --release' in the plugin directory first."
+    Write-Error "herdr-sidebar.exe not found at $Bin -- run 'cargo build --release' in the plugin directory first."
     exit 1
 }
 

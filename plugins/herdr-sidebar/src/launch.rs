@@ -16,7 +16,7 @@ pub const PANE_LABEL: &str = "Explorer";
 
 /// Source id for `pane.report_metadata`; its token marks a pane as the
 /// Explorer independently of the (cosmetic, clearable) label.
-pub const METADATA_SOURCE: &str = "herdr-aa-sidebar-explorer";
+pub const METADATA_SOURCE: &str = "herdr-sidebar-explorer";
 
 /// Preferred explorer width in columns; the ratio is derived from the target pane.
 const TARGET_COLS: f64 = 32.0;
@@ -175,7 +175,7 @@ pub fn launch_decision(pane_list_json: &str, now: u64) -> String {
 
 /// Source-control identity for the separated Source Control pane.
 pub const SC_PANE_LABEL: &str = "Source Control";
-pub const SC_METADATA_SOURCE: &str = "herdr-aa-sidebar-git";
+pub const SC_METADATA_SOURCE: &str = "herdr-sidebar-git";
 
 /// Like [`launch_decision`], but for the separated Source Control pane (the
 /// unified Sidebar pane carries BOTH tokens, so it satisfies this too).
@@ -479,7 +479,7 @@ mod tests {
         // A collapsed explorer has its label cleared but keeps its token;
         // the token value is a fresh heartbeat timestamp.
         let json = pane_list(&format!(
-            r#"{FOCUSED},{{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-aa-sidebar-explorer":95}}}}"#
+            r#"{FOCUSED},{{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-sidebar-explorer":95}}}}"#
         ));
         assert_eq!(launch_decision(&json, 100), "FOCUS w1:p2");
     }
@@ -489,11 +489,11 @@ mod tests {
         // Stale heartbeat (or a pre-heartbeat token shape) = a dead TUI whose
         // pane must be closed and re-docked, never focused.
         let stale = pane_list(&format!(
-            r#"{FOCUSED},{{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-aa-sidebar-explorer":40}}}}"#
+            r#"{FOCUSED},{{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-sidebar-explorer":40}}}}"#
         ));
         assert_eq!(launch_decision(&stale, 100), "REPLACE w1:p2");
         let legacy = pane_list(&format!(
-            r#"{FOCUSED},{{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-aa-sidebar-explorer":{{"value":"explorer"}}}}}}"#
+            r#"{FOCUSED},{{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-sidebar-explorer":{{"value":"explorer"}}}}}}"#
         ));
         assert_eq!(launch_decision(&legacy, 100), "REPLACE w1:p2");
         // Label-only (no token yet): freshly spawned, NOT dead.
@@ -508,11 +508,11 @@ mod tests {
         assert_eq!(launch_decision(&corpse, 100), "REPLACE w1:p2");
         // Same rules for the separated Source Control decision.
         let sc_stale = pane_list(&format!(
-            r#"{FOCUSED},{{"pane_id":"w1:p3","tab_id":"w1:t1","tokens":{{"herdr-aa-sidebar-git":40}}}}"#
+            r#"{FOCUSED},{{"pane_id":"w1:p3","tab_id":"w1:t1","tokens":{{"herdr-sidebar-git":40}}}}"#
         ));
         assert_eq!(launch_decision_git(&sc_stale, 100), "REPLACE w1:p3");
         let sc_live = pane_list(&format!(
-            r#"{FOCUSED},{{"pane_id":"w1:p3","tab_id":"w1:t1","tokens":{{"herdr-aa-sidebar-git":95}}}}"#
+            r#"{FOCUSED},{{"pane_id":"w1:p3","tab_id":"w1:t1","tokens":{{"herdr-sidebar-git":95}}}}"#
         ));
         assert_eq!(launch_decision_git(&sc_live, 100), "FOCUS w1:p3");
     }

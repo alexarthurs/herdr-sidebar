@@ -1,8 +1,8 @@
 # stage-shoot-session.ps1 [-Session shoot] [-WithGrid] -- stand up the SHARED
-# screenshot backdrop for the herdr-aa-* plugin repos in an isolated named
+# screenshot backdrop for the herdr-sidebar* plugin repos in an isolated named
 # herdr session (never touches the real session). Idempotent: safe to re-run.
 #
-# Roster (agreed between the herdr-aa-notes and herdr-aa-sidebar agents; also
+# Roster (agreed between the herdr-aa-notes and herdr-sidebar agents; also
 # recorded in both repos' CLAUDE.md "README screenshots" sections):
 #   spaces:  acme-app [main, 1 ahead]  acme-api [main]  acme-web [dev]
 #            billing-service [main]

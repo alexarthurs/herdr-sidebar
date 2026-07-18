@@ -57,8 +57,8 @@ impl View {
     /// The plugin that renders this view.
     pub fn plugin_id(self) -> &'static str {
         match self {
-            View::Explorer => "herdr-aa-sidebar-explorer",
-            View::SourceControl => "herdr-aa-sidebar-git",
+            View::Explorer => "herdr-sidebar-explorer",
+            View::SourceControl => "herdr-sidebar-git",
         }
     }
 
@@ -118,10 +118,44 @@ impl Default for State {
     }
 }
 
-/// State file location: `%APPDATA%\herdr\aa-sidebar.json` on Windows,
-/// `$XDG_CONFIG_HOME/herdr/aa-sidebar.json` (or `~/.config/…`) elsewhere —
-/// beside herdr's own config so it is easy to find and survives temp cleaning.
+/// Durable state belongs in herdr's per-plugin state dir (docs: "store
+/// runtime state in HERDR_PLUGIN_STATE_DIR"). herdr injects that env for
+/// hooks/actions but NOT panes, so our launchers pass it into every pane
+/// they split (see [`spawn_env`]); when it didn't reach us, fall back to
+/// the conventional location herdr resolves it to.
 pub fn state_path() -> Option<PathBuf> {
+    Some(state_dir()?.join("state.json"))
+}
+
+fn state_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("HERDR_PLUGIN_STATE_DIR")
+        && !dir.is_empty()
+    {
+        return Some(PathBuf::from(dir));
+    }
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
+    Some(base?.join("herdr").join("plugins").join("herdr-sidebar"))
+}
+
+/// Env for panes WE spawn, forwarding the state dir (panes don't inherit
+/// the hook/action env herdr injects).
+pub fn spawn_env() -> serde_json::Value {
+    match state_dir() {
+        Some(dir) => serde_json::json!({
+            "HERDR_PLUGIN_STATE_DIR": dir.display().to_string(),
+        }),
+        None => serde_json::json!({}),
+    }
+}
+
+/// The pre-rename location (`%APPDATA%\herdr\aa-sidebar.json` / the XDG
+/// config dir), read once so existing settings survive the migration.
+fn legacy_state_path() -> Option<PathBuf> {
     #[cfg(windows)]
     let base = std::env::var_os("APPDATA").map(PathBuf::from);
     #[cfg(not(windows))]
@@ -132,10 +166,16 @@ pub fn state_path() -> Option<PathBuf> {
 }
 
 pub fn load_state() -> State {
-    state_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|json| parse_state(&json))
-        .unwrap_or_default()
+    if let Some(json) = state_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+        return parse_state(&json);
+    }
+    // One-time migration from the legacy config-dir file.
+    if let Some(json) = legacy_state_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+        let state = parse_state(&json);
+        save_state(state);
+        return state;
+    }
+    State::default()
 }
 
 /// Best-effort persist; the sidebar still works for this session if it fails.
@@ -196,7 +236,7 @@ mod tests {
         assert_eq!(View::Explorer.other(), View::SourceControl);
         assert_eq!(View::SourceControl.other(), View::Explorer);
         assert_eq!(View::Explorer.label(), "Explorer");
-        assert_eq!(View::SourceControl.plugin_id(), "herdr-aa-sidebar-git");
+        assert_eq!(View::SourceControl.plugin_id(), "herdr-sidebar-git");
     }
 
 }

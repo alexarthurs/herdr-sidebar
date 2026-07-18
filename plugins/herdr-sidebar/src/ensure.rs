@@ -14,7 +14,7 @@ struct Lock(PathBuf);
 
 impl Lock {
     fn acquire() -> Option<Self> {
-        let dir = std::env::temp_dir().join("herdr-aa-sidebar-ensure.lock");
+        let dir = std::env::temp_dir().join("herdr-sidebar-ensure.lock");
         if std::fs::create_dir(&dir).is_ok() {
             return Some(Self(dir));
         }
@@ -110,6 +110,7 @@ fn open(panes_json: &str, focus_new: bool) -> std::io::Result<()> {
     if !fcwd.is_empty() {
         split["cwd"] = serde_json::Value::String(fcwd.to_string());
     }
+    split["env"] = crate::state::spawn_env();
     let response = ipc::call_text("pane.split", split)?;
     let Some(new_pane) = launch::split_pane_id(&response) else {
         return Ok(());
@@ -191,12 +192,12 @@ fn explorer_command() -> Option<String> {
     let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     #[cfg(windows)]
     {
-        let exe = dir.join("herdr-aa-sidebar.exe");
+        let exe = dir.join("herdr-sidebar.exe");
         Some(format!("& \"{}\"", exe.display()))
     }
     #[cfg(not(windows))]
     {
-        let exe = dir.join("herdr-aa-sidebar");
+        let exe = dir.join("herdr-sidebar");
         Some(format!("exec \"{}\"", exe.display()))
     }
 }

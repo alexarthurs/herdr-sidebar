@@ -20,5 +20,6 @@ labels: bug
 
 **Evidence**
 
-<!-- Pane screenshot, `herdr plugin log list --plugin herdr-aa-sidebar` output,
-     or the contents of `%APPDATA%/herdr/aa-sidebar.json` if persistence-related. -->
+<!-- Pane screenshot, `herdr plugin log list --plugin herdr-sidebar` output,
+     or the contents of `%LOCALAPPDATA%/herdr/plugins/herdr-sidebar/state.json`
+     if persistence-related. -->

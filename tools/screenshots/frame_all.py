@@ -2,7 +2,7 @@
 
 Usage: python frame_all.py <dir with crop-*.png>
 Reads crop-{hero,preview,scm,separated,settings}.png from that directory and
-writes the framed set to plugins/herdr-aa-sidebar/docs/media/.
+writes the framed set to plugins/herdr-sidebar/docs/media/.
 """
 
 import os
@@ -13,7 +13,7 @@ from frame_pil import frame
 
 CROPS = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MEDIA = os.path.join(REPO, "plugins", "herdr-aa-sidebar", "docs", "media")
+MEDIA = os.path.join(REPO, "plugins", "herdr-sidebar", "docs", "media")
 
 JOBS = [
     ("crop-hero.png", "hero.png", "herdr — sidebar + agents"),

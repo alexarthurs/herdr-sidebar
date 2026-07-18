@@ -8,7 +8,7 @@
 # (running the newest binaries) the moment each workspace is next focused.
 #
 # Invoke after rebuilding either plugin:
-#   herdr plugin action invoke herdr-aa-sidebar.redeploy-windows
+#   herdr plugin action invoke herdr-sidebar.redeploy-windows
 
 $ErrorActionPreference = 'Continue'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -37,11 +37,11 @@ foreach ($ws in $workspaces) {
 }
 
 # Stragglers holding old binaries (a closed pane does not always kill its TUI).
-Get-CimInstance Win32_Process -Filter "Name LIKE 'herdr-aa-%'" | ForEach-Object {
+Get-CimInstance Win32_Process -Filter "Name LIKE 'herdr-sidebar%'" | ForEach-Object {
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
     Write-Output "killed $($_.ProcessId) $($_.Name)"
 }
 
 # Re-dock the focused workspace right away; the rest refresh on next focus.
-& $HerdrBin plugin action invoke herdr-aa-sidebar.open-sidebar-windows *> $null
+& $HerdrBin plugin action invoke herdr-sidebar.open-sidebar-windows *> $null
 Write-Output 'redeploy complete - other workspaces re-dock on next focus'

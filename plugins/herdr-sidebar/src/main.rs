@@ -1,4 +1,4 @@
-//! herdr-aa-sidebar — the VS Code sidebar for herdr: file explorer and source
+//! herdr-sidebar — the VS Code sidebar for herdr: file explorer and source
 //! control in ONE binary. In unified mode both views share a pane and the
 //! activity bar switches between them IN PROCESS (instant, no flash); in
 //! separated mode the same binary runs one pane per view, pinned with
@@ -14,7 +14,7 @@ use std::io::Read;
 use std::time::Duration;
 
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
-use herdr_aa_sidebar::{launch, state, viewer};
+use herdr_sidebar::{launch, state, viewer};
 use state::{Exit, View};
 
 /// How often the source-control view re-reads `git status` while idle.
@@ -49,16 +49,16 @@ fn main() -> std::io::Result<()> {
         }
         Some("--preview") => {
             let Some(control) = std::env::args().nth(2) else {
-                eprintln!("herdr-aa-sidebar: --preview needs a control-file path");
+                eprintln!("herdr-sidebar: --preview needs a control-file path");
                 std::process::exit(2);
             };
             return viewer::run(std::path::Path::new(&control));
         }
         Some("--view") => {}
         Some(other) => {
-            eprintln!("herdr-aa-sidebar: unknown argument `{other}`");
+            eprintln!("herdr-sidebar: unknown argument `{other}`");
             eprintln!(
-                "usage: herdr-aa-sidebar [--view explorer|git|--preview <ctl>|--launch-decision [git]|--focused-pane|--open-plan|--focused-tab]"
+                "usage: herdr-sidebar [--view explorer|git|--preview <ctl>|--launch-decision [git]|--focused-pane|--open-plan|--focused-tab]"
             );
             std::process::exit(2);
         }

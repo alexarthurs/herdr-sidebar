@@ -1,4 +1,4 @@
-# herdr-aa-sidebar
+# herdr-sidebar
 
 **The sidebar your terminal was missing** — a VS Code-inspired file explorer + source
 control panel in one dockable herdr pane.
@@ -11,7 +11,7 @@ keys, and settings.
 ## Install
 
 ```
-herdr plugin install alexarthurs/herdr-aa-sidebar/plugins/herdr-aa-sidebar
+herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-sidebar
 ```
 
 or from a local checkout:
@@ -24,6 +24,6 @@ herdr plugin link .
 Open it (or just focus a tab — the hook docks it):
 
 ```
-herdr plugin action invoke herdr-aa-sidebar.open-sidebar-windows   # windows
-herdr plugin action invoke herdr-aa-sidebar.open-sidebar           # linux / macos
+herdr plugin action invoke herdr-sidebar.open-sidebar-windows   # windows
+herdr plugin action invoke herdr-sidebar.open-sidebar           # linux / macos
 ```

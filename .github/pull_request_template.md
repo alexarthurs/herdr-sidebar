@@ -8,7 +8,7 @@
 
 ## Checklist
 
-- [ ] `cargo build --release` succeeds (run from `plugins/herdr-aa-sidebar`)
+- [ ] `cargo build --release` succeeds (run from `plugins/herdr-sidebar`)
 - [ ] `cargo test` passes (add/adjust tests for behavior changes)
 - [ ] `cargo clippy --release -- -D warnings` is clean
 - [ ] Exercised in a live herdr pane if the change touches the TUI, launcher

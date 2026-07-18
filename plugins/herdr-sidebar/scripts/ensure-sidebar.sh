@@ -9,13 +9,13 @@ set -uo pipefail
 
 herdr_bin="${HERDR_BIN_PATH:-herdr}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-bin="$script_dir/../target/release/herdr-aa-sidebar"
+bin="$script_dir/../target/release/herdr-sidebar"
 [ -x "$bin" ] || exit 0
 
 # Focus events arrive in bursts (tab.focused + workspace.focused for one switch)
 # and concurrent ensures each open an explorer — serialize with an atomic mkdir
 # lock. Losing the race skips this ensure; the next focus event re-fires it.
-lock_dir="${TMPDIR:-/tmp}/herdr-aa-sidebar-ensure.lock"
+lock_dir="${TMPDIR:-/tmp}/herdr-sidebar-ensure.lock"
 if ! mkdir "$lock_dir" 2>/dev/null; then
   # Break locks older than 30s (a crashed ensure), otherwise yield.
   now="$(date +%s)"
@@ -35,7 +35,7 @@ decision="$(printf '%s' "$panes" | "$bin" --launch-decision 2>/dev/null || true)
 
 # Respect a tab the user toggled closed (open-explorer.sh writes the marker) —
 # otherwise the very next focus event would reopen what they just closed.
-snooze_dir="${TMPDIR:-/tmp}/herdr-aa-sidebar-snooze"
+snooze_dir="${TMPDIR:-/tmp}/herdr-sidebar-snooze"
 tab="$(printf '%s' "$panes" | "$bin" --focused-tab 2>/dev/null || true)"
 [ -n "$tab" ] && [ -f "$snooze_dir/${tab//:/_}" ] && exit 0
 
