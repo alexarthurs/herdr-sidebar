@@ -238,6 +238,15 @@ HACKING.md — budget time for that before promising a patched build.
 - Footer hotkeys render as keycap chips (`wrap_hints` takes `(key, label)` pairs, shared in `ui.rs`). The ✧ suggest button uses MDI "creation" (`\u{f0674}`,
   the outline ✨ silhouette) in the material theme.
 
+### Diff preview
+
+- Clicking a changed file in Source Control (or `o`, or the context menu's Open Diff)
+  shows its colored `git diff` in the SAME preview pane the explorer uses: the control
+  file carries typed requests (`file/<path>` / `diff/<root>/<rel>/<kind>`, tab-separated),
+  the viewer parses git's ANSI output with the in-crate `ansi.rs` SGR parser (ansi-to-tui
+  pins an older ratatui — don't add it), and diffs re-run every ~2s so they live-update.
+  Staged rows show `--cached`; untracked files render via `diff --no-index NUL <file>`.
+
 ### Verifying a plugin TUI end-to-end
 
 Drive the real binary in a throwaway herdr pane instead of unit-testing rendering:
