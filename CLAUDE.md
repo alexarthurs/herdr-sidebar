@@ -144,6 +144,11 @@ Pane identity & titles:
 - `pane.report_metadata {pane_id, source, tokens:{name:value}}` attaches **metadata tokens**
   that show up in `pane.list` — a durable pane identity that survives label changes. The
   filetree TUI tags its pane this way so its detection works while the label is cleared.
+- `report_metadata` **MERGES** the token map: sending `tokens: {}` is a no-op, it does NOT
+  clear previously-reported tokens. To remove a token, report it with an explicit **null
+  value** (`tokens: {name: null}`) — verified live. A `source` can also report tokens whose
+  keys belong to another plugin's namespace (the merged Sidebar pane reports both plugins'
+  identity tokens so both launchers recognize the one pane).
 - Pane border titles come from `border_label`: metadata title → manual label (`pane rename`)
   → detected-agent label. The raw terminal (OSC) title is NOT used — clear the label on a
   non-agent pane and the border shows **no title at all**.
@@ -180,6 +185,21 @@ HACKING.md — budget time for that before promising a patched build.
 - Emoji with variation-selector (VS16) sequences render at inconsistent widths across
   terminal emulators and break column alignment — the shared icon map avoids them; keep it
   that way when adding icons.
+
+### Merged sidebar (both plugins, see each crate's `sidebar.rs`)
+
+- Both panels can merge into one **"Sidebar"** pane with a VS Code-style activity bar. The
+  two views share the pane by **process swap**: the first binary is the HOST; switching runs
+  the other binary with `--sidebar-guest` in the same terminal and waits; the guest exits
+  with code 42 (`EXIT_SWITCH`) to hand back. The host restores the terminal before spawning
+  and re-inits after — two TUIs never own the pty at once.
+- The sticky setting lives in `%APPDATA%\herdr\aa-sidebar.json` (`{merged, active}`); a fresh
+  sidebar opens on the last-active view. `sidebar.rs`, `icons.rs`, and `ipc.rs` are
+  **copy-mirrored** between the crates (no shared workspace, deliberately) — edit both.
+- The Sidebar pane reports BOTH plugins' metadata tokens so either toggle action finds it;
+  detach clears the other token (null value) and splits the other view back out.
+- Gotcha: after the ✨ suggestion lands, panel focus moves to the message box — keys like
+  `m` then type text instead of triggering actions (Esc returns to the list).
 
 ### Verifying a plugin TUI end-to-end
 

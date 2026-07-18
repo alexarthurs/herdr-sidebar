@@ -84,6 +84,95 @@ impl Git {
         let out = run_in(&self.root, &["commit", "-m", message])?;
         Ok(out.lines().next().unwrap_or("committed").to_string())
     }
+
+    /// Throw away a file's working-tree changes: untracked files are deleted,
+    /// tracked ones restored from HEAD (the caller confirms first).
+    pub fn discard(&self, entry: &FileEntry) -> Result<(), String> {
+        if entry.letter == 'U' {
+            return run_in(&self.root, &["clean", "-fd", "--", &entry.path]).map(drop);
+        }
+        run_in(&self.root, &["checkout", "--", &entry.path]).map(drop)
+    }
+
+    /// The diff a commit-message suggestion should describe: the staged diff
+    /// when something is staged (that is what would be committed), else the
+    /// working-tree diff. Untracked files only appear as names, so they ride
+    /// along in the returned path list either way.
+    pub fn diff_for_message(&self) -> Result<(String, Vec<String>), String> {
+        let staged = run_in(&self.root, &["diff", "--cached", "--stat", "--patch"])?;
+        let (diff, names_args): (String, &[&str]) = if staged.trim().is_empty() {
+            let unstaged = run_in(&self.root, &["diff", "--stat", "--patch"])?;
+            (unstaged, &["diff", "--name-only"])
+        } else {
+            (staged, &["diff", "--cached", "--name-only"])
+        };
+        let mut files: Vec<String> = run_in(&self.root, names_args)?
+            .lines()
+            .map(str::to_string)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if files.is_empty() {
+            // Nothing tracked changed: describe the untracked files instead.
+            files = run_in(&self.root, &["ls-files", "--others", "--exclude-standard"])?
+                .lines()
+                .map(str::to_string)
+                .filter(|l| !l.is_empty())
+                .collect();
+        }
+        Ok((diff, files))
+    }
+
+    // ---- Drawer queries (display-only lists, VS Code Git-Graph style) ----
+
+    pub fn graph(&self, limit: usize) -> Result<Vec<String>, String> {
+        let n = format!("-{limit}");
+        lines(run_in(&self.root, &["log", "--graph", "--oneline", "--decorate=short", &n])?)
+    }
+
+    pub fn commits(&self, limit: usize) -> Result<Vec<String>, String> {
+        let n = format!("-{limit}");
+        lines(run_in(
+            &self.root,
+            &["log", "--oneline", "--decorate=short", "--date=short", &n],
+        )?)
+    }
+
+    pub fn file_history(&self, path: &str, limit: usize) -> Result<Vec<String>, String> {
+        let n = format!("-{limit}");
+        lines(run_in(&self.root, &["log", "--oneline", "--follow", &n, "--", path])?)
+    }
+
+    /// Local + remote branches, the current one first and starred.
+    pub fn branches(&self) -> Result<Vec<String>, String> {
+        lines(run_in(
+            &self.root,
+            &["branch", "-a", "--sort=-committerdate", "--format=%(HEAD) %(refname:short)"],
+        )?)
+    }
+
+    pub fn remotes(&self) -> Result<Vec<String>, String> {
+        let out = run_in(&self.root, &["remote", "-v"])?;
+        // `remote -v` lists fetch and push separately; one line per remote reads better.
+        let mut seen = Vec::new();
+        for line in out.lines() {
+            if let Some(rest) = line.strip_suffix(" (fetch)") {
+                seen.push(rest.replace('\t', "  "));
+            }
+        }
+        Ok(seen)
+    }
+
+    pub fn stashes(&self) -> Result<Vec<String>, String> {
+        lines(run_in(&self.root, &["stash", "list"])?)
+    }
+
+    pub fn tags(&self) -> Result<Vec<String>, String> {
+        lines(run_in(&self.root, &["tag", "--sort=-creatordate"])?)
+    }
+}
+
+fn lines(out: String) -> Result<Vec<String>, String> {
+    Ok(out.lines().map(str::to_string).filter(|l| !l.is_empty()).collect())
 }
 
 fn run_in(dir: &Path, args: &[&str]) -> Result<String, String> {

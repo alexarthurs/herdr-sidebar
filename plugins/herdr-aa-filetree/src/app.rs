@@ -14,7 +14,18 @@ use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph};
 
 use herdr_aa_filetree::actions::{self, MenuAction, MenuEntry};
 use herdr_aa_filetree::icons::{IconTheme, icon};
+use herdr_aa_filetree::sidebar::{self, View};
 use herdr_aa_filetree::tree::{Row, Tree};
+
+/// Why the event loop ended; the supervisor in main.rs acts on it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Exit {
+    Quit,
+    /// The user picked the other view in the merged sidebar.
+    Switch,
+}
+
+const MY_VIEW: View = View::Explorer;
 
 /// Below this pane width the explorer renders as the collapsed sliver.
 const SLIVER_THRESHOLD: u16 = 14;
@@ -35,15 +46,30 @@ impl PaneCtl {
         Some(Self { pane_id })
     }
 
-    /// Tag our pane with the Explorer metadata token so the ensure logic can
-    /// recognize it even while the (cosmetic) label is cleared.
-    fn report_identity(&self) {
+    /// Report identity tokens: always our own (so the ensure logic recognizes
+    /// this pane even while the cosmetic label is cleared); in merged mode
+    /// also the other view's — one Sidebar pane satisfies both plugins'
+    /// launchers — otherwise clear the other view's token.
+    fn report_tokens(&self, my: View, merged: bool) {
+        let mine = serde_json::json!({ my.plugin_id(): my.token() });
+        let _ = herdr_aa_filetree::ipc::call_text(
+            "pane.report_metadata",
+            serde_json::json!({ "pane_id": self.pane_id, "source": my.plugin_id(), "tokens": mine }),
+        );
+        let other = my.other();
+        // Clearing needs an explicit null VALUE: report_metadata MERGES the
+        // token map, so an empty map is a no-op (verified live, herdr 0.7.1).
+        let other_tokens = if merged {
+            serde_json::json!({ other.plugin_id(): other.token() })
+        } else {
+            serde_json::json!({ other.plugin_id(): serde_json::Value::Null })
+        };
         let _ = herdr_aa_filetree::ipc::call_text(
             "pane.report_metadata",
             serde_json::json!({
                 "pane_id": self.pane_id,
-                "source": herdr_aa_filetree::launch::METADATA_SOURCE,
-                "tokens": { herdr_aa_filetree::launch::METADATA_SOURCE: "explorer" },
+                "source": other.plugin_id(),
+                "tokens": other_tokens,
             }),
         );
     }
@@ -149,6 +175,27 @@ pub struct App {
     overlay: Option<Overlay>,
     /// Transient status/error line shown in the footer until the next action.
     notice: Option<String>,
+    // Merged-sidebar state.
+    sidebar_state: sidebar::State,
+    other_exe: Option<std::path::PathBuf>,
+    activity: ActivityZones,
+}
+
+/// Activity-bar click zones from the last draw: the bar's row, and the column
+/// ranges of the explorer icon, source-control icon, and detach button.
+#[derive(Clone, Copy)]
+struct ActivityZones {
+    row: u16,
+    explorer: (u16, u16),
+    source_control: (u16, u16),
+    detach: (u16, u16),
+}
+
+impl Default for ActivityZones {
+    fn default() -> Self {
+        // row = MAX: nothing hit-tests true before the first draw.
+        Self { row: u16::MAX, explorer: (0, 0), source_control: (0, 0), detach: (0, 0) }
+    }
 }
 
 impl App {
@@ -161,10 +208,11 @@ impl App {
         }
         let theme = IconTheme::from_env(std::env::var("HERDR_AA_FILETREE_ICONS").ok().as_deref());
         let pane_ctl = PaneCtl::from_env();
-        if let Some(ctl) = &pane_ctl {
-            ctl.report_identity();
-        }
-        Self {
+        let other_exe = herdr_aa_filetree::ipc::call_text("plugin.list", serde_json::json!({}))
+            .ok()
+            .and_then(|json| sidebar::other_binary(&json, MY_VIEW.other()));
+        let sidebar_state = sidebar::load_state();
+        let app = Self {
             tree,
             rows,
             state,
@@ -179,7 +227,35 @@ impl App {
             body: BodyGeom::default(),
             overlay: None,
             notice: None,
+            sidebar_state,
+            other_exe,
+            activity: ActivityZones::default(),
+        };
+        app.apply_identity();
+        app
+    }
+
+    /// The merged sidebar is on and actually usable (other plugin present).
+    fn merged(&self) -> bool {
+        self.sidebar_state.merged && self.other_exe.is_some()
+    }
+
+    /// The label this pane should carry while expanded.
+    fn pane_label(&self) -> &'static str {
+        if self.merged() {
+            sidebar::SIDEBAR_LABEL
+        } else {
+            herdr_aa_filetree::launch::PANE_LABEL
         }
+    }
+
+    /// Push our label + metadata tokens to herdr for the current mode.
+    fn apply_identity(&self) {
+        let Some(ctl) = &self.pane_ctl else { return };
+        if !self.collapsed {
+            ctl.set_label(Some(self.pane_label()));
+        }
+        ctl.report_tokens(MY_VIEW, self.merged());
     }
 
     /// Collapsed by the button, or manually dragged down to a sliver.
@@ -205,7 +281,7 @@ impl App {
         }
         self.collapsed = false;
         if let Some(ctl) = &self.pane_ctl {
-            ctl.set_label(Some(herdr_aa_filetree::launch::PANE_LABEL));
+            ctl.set_label(Some(self.pane_label()));
             ctl.resize_to(
                 self.last_width,
                 self.expanded_width.max(DEFAULT_EXPANDED_WIDTH),
@@ -213,26 +289,112 @@ impl App {
         }
     }
 
-    /// Handle one key press; returns `false` when the app should exit.
-    pub fn on_key(&mut self, key: KeyEvent) -> bool {
+    // ---- Merged-sidebar operations ----
+
+    /// Turn the merged sidebar on from this panel: adopt this pane as the
+    /// Sidebar and close the other panel's standalone pane in this tab.
+    fn merge_on(&mut self) {
+        if self.merged() {
+            return;
+        }
+        if self.other_exe.is_none() {
+            self.notice = Some("install herdr-aa-git to merge".into());
+            return;
+        }
+        self.sidebar_state = sidebar::State { merged: true, active: MY_VIEW };
+        sidebar::save_state(self.sidebar_state);
+        self.close_other_standalone_pane();
+        self.apply_identity();
+        self.notice = Some("merged into Sidebar — 1/2 switch views, d detach".into());
+    }
+
+    /// Split the other view back out into its own pane and leave merged mode.
+    fn detach(&mut self) {
+        if !self.merged() {
+            return;
+        }
+        self.sidebar_state = sidebar::State { merged: false, active: MY_VIEW };
+        sidebar::save_state(self.sidebar_state);
+        self.apply_identity();
+        self.spawn_other_pane();
+        self.notice = Some("detached — panels are separate again".into());
+    }
+
+    /// Hand the pane to the other view (the supervisor swaps processes).
+    fn switch_to(&mut self, view: View) -> Option<Exit> {
+        if !self.merged() || view == MY_VIEW {
+            return None;
+        }
+        self.sidebar_state.active = view;
+        sidebar::save_state(self.sidebar_state);
+        Some(Exit::Switch)
+    }
+
+    /// Close the other panel's standalone pane in our tab, if one is open.
+    fn close_other_standalone_pane(&self) {
+        let Some(ctl) = &self.pane_ctl else { return };
+        let Ok(json) = herdr_aa_filetree::ipc::call_text("pane.list", serde_json::json!({}))
+        else {
+            return;
+        };
+        for id in sibling_panes_of(&json, &ctl.pane_id, MY_VIEW.other()) {
+            let _ =
+                herdr_aa_filetree::ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }));
+        }
+    }
+
+    /// Open the other view in a fresh pane beside this one (detach).
+    fn spawn_other_pane(&self) {
+        let (Some(ctl), Some(exe)) = (&self.pane_ctl, &self.other_exe) else { return };
+        let response = herdr_aa_filetree::ipc::call_text(
+            "pane.split",
+            serde_json::json!({
+                "target_pane_id": ctl.pane_id,
+                "direction": "right",
+                "ratio": 0.5,
+                "focus": false,
+                "cwd": self.tree.root_path().display().to_string(),
+            }),
+        );
+        let Some(new_pane) =
+            response.ok().and_then(|r| herdr_aa_filetree::launch::split_pane_id(&r))
+        else {
+            return;
+        };
+        #[cfg(windows)]
+        let command = format!("& \"{}\"", exe.display());
+        #[cfg(not(windows))]
+        let command = format!("exec \"{}\"", exe.display());
+        let _ = herdr_aa_filetree::ipc::call_text(
+            "pane.send_input",
+            serde_json::json!({ "pane_id": new_pane, "text": command, "keys": ["Enter"] }),
+        );
+        let _ = herdr_aa_filetree::ipc::call_text(
+            "pane.rename",
+            serde_json::json!({ "pane_id": new_pane, "label": MY_VIEW.other().label() }),
+        );
+    }
+
+    /// Handle one key press; `Some(exit)` ends the event loop.
+    pub fn on_key(&mut self, key: KeyEvent) -> Option<Exit> {
         if key.kind != KeyEventKind::Press {
-            return true;
+            return None;
         }
         self.notice = None;
         if self.overlay.is_some() {
             self.overlay_key(key);
-            return true;
+            return None;
         }
         if self.collapsed() {
             // Sliver mode: only expand or quit.
             match key.code {
-                KeyCode::Char('q') => return false,
+                KeyCode::Char('q') => return Some(Exit::Quit),
                 _ => self.expand(),
             }
-            return true;
+            return None;
         }
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return false,
+            KeyCode::Char('q') | KeyCode::Esc => return Some(Exit::Quit),
             KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
             KeyCode::PageUp => self.move_by(-(self.page as isize)),
@@ -252,21 +414,26 @@ impl App {
             }
             KeyCode::Char('i') => self.theme = self.theme.toggled(),
             KeyCode::Char('b') => self.collapse(),
+            KeyCode::Char('m') => self.merge_on(),
+            KeyCode::Char('d') => self.detach(),
+            KeyCode::Char('1') => return self.switch_to(View::Explorer),
+            KeyCode::Char('2') => return self.switch_to(View::SourceControl),
             _ => {}
         }
-        true
+        None
     }
 
-    pub fn on_mouse(&mut self, mouse: MouseEvent) {
+    /// `Some(exit)` ends the event loop, mirroring on_key.
+    pub fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Exit> {
         if self.collapsed() {
             if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.expand();
             }
-            return;
+            return None;
         }
         if self.overlay.is_some() {
             self.overlay_mouse(mouse);
-            return;
+            return None;
         }
         match mouse.kind {
             MouseEventKind::Moved => {
@@ -275,12 +442,25 @@ impl App {
             MouseEventKind::ScrollUp => self.move_by(-3),
             MouseEventKind::ScrollDown => self.move_by(3),
             MouseEventKind::Down(MouseButton::Left) => {
+                let zones = self.activity;
+                if self.merged() && mouse.row == zones.row {
+                    if (zones.explorer.0..zones.explorer.1).contains(&mouse.column) {
+                        return self.switch_to(View::Explorer);
+                    }
+                    if (zones.source_control.0..zones.source_control.1).contains(&mouse.column) {
+                        return self.switch_to(View::SourceControl);
+                    }
+                    if (zones.detach.0..zones.detach.1).contains(&mouse.column) {
+                        self.detach();
+                        return None;
+                    }
+                }
                 if hits_collapse_button(mouse.column, mouse.row, self.last_width, self.last_height)
                 {
                     self.collapse();
-                    return;
+                    return None;
                 }
-                let Some(index) = self.row_at(mouse.row) else { return };
+                let index = self.row_at(mouse.row)?;
                 self.select(index);
                 let row = &self.rows[index];
                 if row.is_dir && hits_chevron(mouse.column, row.depth) {
@@ -293,6 +473,7 @@ impl App {
             }
             _ => {}
         }
+        None
     }
 
     /// Open the file context menu at the click position, targeting the row
@@ -630,12 +811,22 @@ impl App {
         }
 
         // No own border/title: herdr already frames the pane and titles it with
-        // the pane label ("Explorer") — a second border read as a double frame.
-        let [header, body, footer] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
-                .areas(frame.area());
+        // the pane label ("Explorer"/"Sidebar") — a second border read as a
+        // double frame.
+        let footer_height = self.footer_height(frame.area().width);
+        let activity_height = u16::from(self.merged());
+        let [activity, header, body, footer] = Layout::vertical([
+            Constraint::Length(activity_height),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(footer_height),
+        ])
+        .areas(frame.area());
         self.page = body.height.saturating_sub(1).max(1) as usize;
 
+        if self.merged() {
+            self.draw_activity_bar(frame, activity);
+        }
         let root_label = format!(" {}", self.tree.root_name().to_uppercase());
         frame.render_widget(Paragraph::new(root_label.bold().fg(Color::LightBlue)), header);
 
@@ -663,43 +854,117 @@ impl App {
             offset: self.state.offset(),
         };
 
-        // Collapse button at the bottom-right, mirroring herdr's own sidebar.
-        let [footer_left, footer_button] =
-            Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(footer);
+        // Collapse button at the bottom-right of the LAST footer line,
+        // mirroring herdr's own sidebar. hits_collapse_button targets the
+        // pane's bottom row, which is exactly that line.
+        let last_line = Rect::new(
+            footer.x,
+            footer.y + footer.height.saturating_sub(1),
+            footer.width,
+            1,
+        );
+        let [_, footer_button] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(last_line);
         frame.render_widget(
             Paragraph::new("«".bold().fg(Color::LightBlue)).alignment(Alignment::Center),
             footer_button,
         );
-        let footer = footer_left;
-        let footer_line: Line = if let Some(notice) = &self.notice {
-            format!(" {notice}").fg(Color::Yellow).into()
+        let footer_lines: Vec<Line> = if let Some(notice) = &self.notice {
+            vec![format!(" {notice}").fg(Color::Yellow).into()]
         } else {
             match &self.overlay {
-                Some(Overlay::Prompt { title, input, .. }) => Line::from(vec![
+                Some(Overlay::Prompt { title, input, .. }) => vec![Line::from(vec![
                     Span::styled(format!(" {title}: "), Style::default().bold()),
                     Span::raw(input.clone()),
                     Span::styled("█", Style::default().dim()),
                     Span::styled("  (⏎ ok · esc cancel)", Style::default().dim()),
-                ]),
+                ])],
                 Some(Overlay::ConfirmDelete { path, .. }) => {
                     let name = path
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    format!(" Delete '{name}' permanently? (y/N)").fg(Color::Red).into()
+                    vec![format!(" Delete '{name}' permanently? (y/N)").fg(Color::Red).into()]
                 }
-                _ => {
-                    " ↑↓ move  ←→ fold  ⏎ toggle  r refresh  . dotfiles  i icons  « b collapse  q quit"
-                        .dim()
-                        .into()
-                }
+                _ => wrap_hints(&self.hints(), frame.area().width, 3),
             }
         };
-        frame.render_widget(Paragraph::new(footer_line), footer);
+        frame.render_widget(Paragraph::new(footer_lines), footer);
 
         if matches!(self.overlay, Some(Overlay::Menu { .. })) {
             self.draw_menu(frame);
         }
+    }
+
+    /// The hotkey hints for the current mode.
+    fn hints(&self) -> Vec<&'static str> {
+        let mut hints = vec![
+            "↑↓ move",
+            "←→ fold",
+            "⏎ toggle",
+            "r refresh",
+            ". dotfiles",
+            "i icons",
+            "b collapse",
+            "q quit",
+        ];
+        if self.merged() {
+            hints.extend(["1 files", "2 git", "d detach"]);
+        } else if self.other_exe.is_some() {
+            hints.push("m merge");
+        }
+        hints
+    }
+
+    /// Rows the footer needs at `width` (the hint lines; notices and prompts
+    /// always fit in one of them).
+    fn footer_height(&self, width: u16) -> u16 {
+        if self.notice.is_some() || self.overlay.is_some() {
+            return 1;
+        }
+        wrap_hints(&self.hints(), width, 3).len() as u16
+    }
+
+    /// The VS Code activity bar: view-switcher icons plus a detach button.
+    fn draw_activity_bar(&mut self, frame: &mut Frame, area: Rect) {
+        let (exp_icon, git_icon) = activity_icons(self.theme);
+        let active = |on: bool| {
+            if on {
+                Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().dim()
+            }
+        };
+        let spans = [
+            Span::raw(" "),
+            Span::styled(format!(" {exp_icon} "), active(true)),
+            Span::raw(" "),
+            Span::styled(format!(" {git_icon} "), active(false)),
+        ];
+        // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
+        let mut x = area.x;
+        let mut bounds = Vec::new();
+        for span in &spans {
+            let w = span.width() as u16;
+            bounds.push((x, x + w));
+            x += w;
+        }
+        let detach = Span::styled(" ◫ ", Style::default().dim());
+        let detach_w = detach.width() as u16;
+        let detach_x = area.x + area.width.saturating_sub(detach_w);
+        self.activity = ActivityZones {
+            row: area.y,
+            explorer: bounds[1],
+            source_control: bounds[3],
+            detach: (detach_x, detach_x + detach_w),
+        };
+
+        let pad = usize::from(area.width)
+            .saturating_sub(spans.iter().map(Span::width).sum::<usize>() + usize::from(detach_w));
+        let mut line = spans.to_vec();
+        line.push(Span::raw(" ".repeat(pad)));
+        line.push(detach);
+        frame.render_widget(Paragraph::new(Line::from(line)), area);
     }
 
     /// Render the context-menu popup near its anchor, clamped inside the pane,
@@ -790,6 +1055,83 @@ fn row_item(row: &Row, theme: IconTheme, hovered: bool) -> ListItem<'static> {
     } else {
         item
     }
+}
+
+/// Theme-matched activity-bar icons: (explorer, source control).
+fn activity_icons(theme: IconTheme) -> (&'static str, &'static str) {
+    match theme {
+        IconTheme::Material => ("\u{f07b}", "\u{e725}"),
+        IconTheme::Emoji => ("📁", "🔀"),
+    }
+}
+
+/// Pack hotkey hints into as many footer lines as they need at `width`
+/// (max 4), instead of clipping. `reserve` columns stay free on the LAST line
+/// (for the « collapse button). Copy-mirrored with herdr-aa-git's app.rs.
+fn wrap_hints(hints: &[&'static str], width: u16, reserve: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(8));
+    let reserve = usize::from(reserve);
+    let mut lines: Vec<String> = vec![String::new()];
+    for hint in hints {
+        let full = lines.len() >= 4;
+        let current = lines.last_mut().unwrap();
+        if current.is_empty() {
+            *current = format!(" {hint}");
+            continue;
+        }
+        let candidate_len = current.chars().count() + 2 + hint.chars().count();
+        if candidate_len <= width.saturating_sub(reserve) || full {
+            current.push_str("  ");
+            current.push_str(hint);
+        } else {
+            lines.push(format!(" {hint}"));
+        }
+    }
+    lines.into_iter().map(|l| Line::from(l.dim())).collect()
+}
+
+/// Pane ids in the same tab as `my_pane_id` that belong to the `other` view
+/// (matched by its standalone label or its metadata token), from a `pane.list`
+/// response. Copy-mirrored with herdr-aa-git's app.rs.
+fn sibling_panes_of(pane_list_json: &str, my_pane_id: &str, other: View) -> Vec<String> {
+    #[derive(serde::Deserialize)]
+    struct Msg {
+        result: Res,
+    }
+    #[derive(serde::Deserialize)]
+    struct Res {
+        #[serde(default)]
+        panes: Vec<Pane>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Pane {
+        pane_id: Option<String>,
+        label: Option<String>,
+        tab_id: Option<String>,
+        #[serde(default)]
+        tokens: serde_json::Map<String, serde_json::Value>,
+    }
+    let Ok(msg) = serde_json::from_str::<Msg>(pane_list_json.trim_start_matches('\u{feff}'))
+    else {
+        return Vec::new();
+    };
+    let panes = &msg.result.panes;
+    let Some(my_tab) = panes
+        .iter()
+        .find(|p| p.pane_id.as_deref() == Some(my_pane_id))
+        .and_then(|p| p.tab_id.clone())
+    else {
+        return Vec::new();
+    };
+    panes
+        .iter()
+        .filter(|p| p.tab_id.as_deref() == Some(my_tab.as_str()))
+        .filter(|p| p.pane_id.as_deref() != Some(my_pane_id))
+        .filter(|p| {
+            p.label.as_deref() == Some(other.label()) || p.tokens.contains_key(other.plugin_id())
+        })
+        .filter_map(|p| p.pane_id.clone())
+        .collect()
 }
 
 /// Next selectable (non-separator) menu index in `direction`, staying put at
