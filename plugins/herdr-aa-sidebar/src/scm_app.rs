@@ -74,17 +74,19 @@ enum Drawer {
     Commits,
     FileHistory,
     Branches,
+    Worktrees,
     Remotes,
     Stashes,
     Tags,
 }
 
 impl Drawer {
-    const ALL: [Drawer; 7] = [
+    const ALL: [Drawer; 8] = [
         Drawer::Graph,
         Drawer::Commits,
         Drawer::FileHistory,
         Drawer::Branches,
+        Drawer::Worktrees,
         Drawer::Remotes,
         Drawer::Stashes,
         Drawer::Tags,
@@ -92,13 +94,14 @@ impl Drawer {
 
     fn title(self) -> &'static str {
         match self {
-            Drawer::Graph => "GRAPH",
-            Drawer::Commits => "COMMITS",
-            Drawer::FileHistory => "FILE HISTORY",
-            Drawer::Branches => "BRANCHES",
-            Drawer::Remotes => "REMOTES",
-            Drawer::Stashes => "STASHES",
-            Drawer::Tags => "TAGS",
+            Drawer::Graph => "Graph",
+            Drawer::Commits => "Commits",
+            Drawer::FileHistory => "File History",
+            Drawer::Branches => "Branches",
+            Drawer::Worktrees => "Worktrees",
+            Drawer::Remotes => "Remotes",
+            Drawer::Stashes => "Stashes",
+            Drawer::Tags => "Tags",
         }
     }
 
@@ -133,6 +136,8 @@ enum DrawerRef {
         url: String,
     },
     Tag(String),
+    /// A worktree's checkout path.
+    Worktree(String),
 }
 
 /// Parse the actionable reference out of one drawer line.
@@ -163,6 +168,14 @@ fn parse_drawer_ref(kind: Drawer, line: &str) -> DrawerRef {
                     url: it.next().unwrap_or("").to_string(),
                 },
                 None => DrawerRef::None,
+            }
+        }
+        Drawer::Worktrees => {
+            let path = line.split_whitespace().next().unwrap_or("").to_string();
+            if path.is_empty() || path.starts_with('(') {
+                DrawerRef::None
+            } else {
+                DrawerRef::Worktree(path)
             }
         }
         Drawer::Stashes => line
@@ -296,6 +309,7 @@ enum MenuAction {
     FetchRemote,
     CopyRef,
     DeleteTag,
+    RemoveWorktree,
 }
 
 #[derive(Clone, Copy)]
@@ -457,7 +471,7 @@ pub struct App {
     list: ListState,
     focus: Focus,
     theme: IconTheme,
-    drawers: [DrawerPanel; 7],
+    drawers: [DrawerPanel; 8],
     /// The file the FILE HISTORY drawer follows: the last selected file row.
     history_target: Option<String>,
     /// One-shot footer notice: (text, is_error). Cleared on the next key press.
@@ -697,6 +711,7 @@ impl App {
                     None => Ok(vec!["(select a file above)".to_string()]),
                 },
                 Drawer::Branches => git.branches(),
+                Drawer::Worktrees => git.worktrees(),
                 Drawer::Remotes => git.remotes(),
                 Drawer::Stashes => git.stashes(),
                 Drawer::Tags => git.tags(),
@@ -1192,6 +1207,12 @@ impl App {
                 MenuEntry::Separator,
                 MenuEntry::Action(MenuAction::CopyRef, "Copy Tag Name"),
             ],
+            DrawerRef::Worktree(_) => vec![
+                MenuEntry::Action(MenuAction::Reveal, "Reveal in File Explorer"),
+                MenuEntry::Action(MenuAction::CopyRef, "Copy Path"),
+                MenuEntry::Separator,
+                MenuEntry::Action(MenuAction::RemoveWorktree, "Remove Worktree…"),
+            ],
             DrawerRef::None => return,
         };
         self.overlay = Some(Overlay::Menu {
@@ -1531,10 +1552,17 @@ impl App {
             DrawerRef::Branch { name, .. } => name.clone(),
             DrawerRef::Remote { name, .. } => name.clone(),
             DrawerRef::Tag(t) => t.clone(),
+            DrawerRef::Worktree(p) => p.clone(),
             DrawerRef::None => return,
         };
         match action {
             MenuAction::ShowRef => self.open_drawer_ref(kind, index),
+            MenuAction::Reveal => reveal(std::path::Path::new(&spec)),
+            MenuAction::RemoveWorktree => self.confirm_git(
+                repo,
+                format!("Remove worktree '{spec}'? (y/N)"),
+                vec!["worktree".into(), "remove".into(), spec],
+            ),
             MenuAction::CopyRef => {
                 let text = match &dref {
                     DrawerRef::Remote { url, .. } if !url.is_empty() => url.clone(),
@@ -2137,16 +2165,29 @@ impl App {
     }
 
     fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
-        // "SOURCE CONTROL", like VS Code — the sections inside are already
-        // named Changes/Staged Changes, so the panel must not be too.
-        let left = Span::styled(" ▾ SOURCE CONTROL", Style::default().bold());
+        // A single repo titles the panel with its NAME, like VS Code's repo
+        // rows (the sections inside are already Changes/Staged Changes);
+        // several repos fall back to a neutral "Source Control".
+        let title = match self.active_repo() {
+            Some(repo) if self.repos.len() == 1 => repo.name.clone(),
+            _ => "Source Control".to_string(),
+        };
+        let left = Span::styled(format!(" ▾ {title}"), Style::default().bold());
         // With several repos visible, the header names the one the commit box
-        // and sync act on.
+        // and sync act on; a single repo shows branch + ahead/behind arrows.
         let right_text = match self.active_repo() {
             Some(repo) if self.repos.len() > 1 => {
                 format!("{} · {} ", repo.name, repo.status.branch)
             }
-            Some(repo) => format!("{} ", repo.status.branch),
+            Some(repo) => {
+                let s = &repo.status;
+                let counts = if s.ahead + s.behind > 0 {
+                    format!(" {}↑ {}↓", s.ahead, s.behind)
+                } else {
+                    String::new()
+                };
+                format!("{}{} ", s.branch, counts)
+            }
             None => String::new(),
         };
         let branch = Span::styled(right_text, Style::default().dim());
@@ -2528,11 +2569,17 @@ fn repo_header_item(repo: &Repo, active: bool, theme: IconTheme, width: usize) -
         Span::raw(format!("{} ", repo_icon.glyph)),
         Span::styled(repo.name.clone(), name_style),
     ];
+    let s = &repo.status;
+    let counts = if s.ahead + s.behind > 0 {
+        format!(" {}↑ {}↓", s.ahead, s.behind)
+    } else {
+        String::new()
+    };
     let branch = Span::styled(
-        format!("{} {}", branch_icon(theme), repo.branch_decor()),
+        format!("{} {}{}", branch_icon(theme), repo.branch_decor(), counts),
         Style::default().dim(),
     );
-    let icons = Span::styled(" ⟳  ✓ ", Style::default().dim());
+    let icons = Span::styled(" ⇅  ✓ ", Style::default().dim());
     let used: usize =
         left.iter().map(Span::width).sum::<usize>() + branch.width() + icons.width();
     let pad = width.saturating_sub(used).max(1);
@@ -2705,7 +2752,7 @@ fn section_item(
 fn file_history_header(collapsed: bool, file: &str) -> ListItem<'static> {
     let arrow = if collapsed { "▸" } else { "▾" };
     ListItem::new(Line::from(vec![
-        Span::styled(format!(" {arrow} FILE HISTORY"), Style::default().bold()),
+        Span::styled(format!(" {arrow} File History"), Style::default().bold()),
         Span::styled(format!("  {file}"), Style::default().dim()),
     ]))
 }
@@ -2808,6 +2855,11 @@ mod tests {
         );
         assert_eq!(parse_drawer_ref(Drawer::Tags, "v0.1.0"), DrawerRef::Tag("v0.1.0".into()));
         assert_eq!(parse_drawer_ref(Drawer::Tags, "(none)"), DrawerRef::None);
+        assert_eq!(
+            parse_drawer_ref(Drawer::Worktrees, "C:/Users/x/proj  a1b2c3d [main]"),
+            DrawerRef::Worktree("C:/Users/x/proj".into())
+        );
+        assert_eq!(parse_drawer_ref(Drawer::Worktrees, "(none)"), DrawerRef::None);
     }
 
     #[test]
@@ -2823,11 +2875,20 @@ mod tests {
     }
 
     #[test]
-    fn drawer_titles_match_git_graph() {
+    fn drawer_titles_are_title_case_and_include_worktrees() {
         let titles: Vec<&str> = Drawer::ALL.iter().map(|d| d.title()).collect();
         assert_eq!(
             titles,
-            ["GRAPH", "COMMITS", "FILE HISTORY", "BRANCHES", "REMOTES", "STASHES", "TAGS"]
+            [
+                "Graph",
+                "Commits",
+                "File History",
+                "Branches",
+                "Worktrees",
+                "Remotes",
+                "Stashes",
+                "Tags"
+            ]
         );
     }
 

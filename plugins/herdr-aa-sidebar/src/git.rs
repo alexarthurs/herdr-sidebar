@@ -220,6 +220,12 @@ impl Git {
         lines(run_in(&self.root, &["tag", "--sort=-creatordate"])?)
     }
 
+    /// One line per worktree (`git worktree list`): path, short head,
+    /// [branch] — the primary checkout first.
+    pub fn worktrees(&self) -> Result<Vec<String>, String> {
+        lines(run_in(&self.root, &["worktree", "list"])?)
+    }
+
     /// Run an arbitrary git command in this repo — the escape hatch the
     /// drawer context menus use (checkout / merge / cherry-pick / …).
     pub fn raw(&self, args: &[&str]) -> Result<String, String> {
