@@ -115,14 +115,89 @@ struct DrawerPanel {
     lines: Vec<String>,
 }
 
+/// One discovered repository and its per-repo view state — including its own
+/// commit message, so the multi-repo view mirrors VS Code's per-repo inputs.
+struct Repo {
+    git: Git,
+    name: String,
+    status: Status,
+    collapsed: bool,
+    staged_collapsed: bool,
+    changes_collapsed: bool,
+    message: Vec<char>,
+    cursor: usize,
+}
+
+impl Repo {
+    fn new(git: Git) -> Self {
+        Self {
+            name: git.name(),
+            git,
+            status: Status::default(),
+            collapsed: false,
+            staged_collapsed: false,
+            changes_collapsed: false,
+            message: Vec::new(),
+            cursor: 0,
+        }
+    }
+
+    /// The repo row's branch decoration: `name*` when the tree is dirty.
+    fn branch_decor(&self) -> String {
+        let dirty = if self.status.staged.is_empty() && self.status.unstaged.is_empty() {
+            ""
+        } else {
+            "*"
+        };
+        format!("{}{dirty}", self.status.branch)
+    }
+}
+
+/// List rows; the first index on the repo-scoped variants is the repo.
 #[derive(Clone, Copy)]
 enum Row {
-    StagedHeader,
-    ChangesHeader,
-    Staged(usize),
-    Unstaged(usize),
+    /// Only rendered when more than one repository is visible.
+    RepoHeader(usize),
+    /// The repo's inline message box (3 screen lines) — multi-repo only.
+    Message(usize),
+    /// The repo's inline ✓ Commit button — multi-repo only.
+    Commit(usize),
+    StagedHeader(usize),
+    ChangesHeader(usize),
+    Staged(usize, usize),
+    Unstaged(usize, usize),
     DrawerHeader(Drawer),
     DrawerLine(Drawer, usize),
+}
+
+impl Row {
+    /// The repository a row belongs to (drawers follow the active repo).
+    fn repo(self) -> Option<usize> {
+        match self {
+            Row::RepoHeader(r)
+            | Row::Message(r)
+            | Row::Commit(r)
+            | Row::StagedHeader(r)
+            | Row::ChangesHeader(r)
+            | Row::Staged(r, _)
+            | Row::Unstaged(r, _) => Some(r),
+            Row::DrawerHeader(_) | Row::DrawerLine(..) => None,
+        }
+    }
+
+    /// Screen lines this row occupies (the inline message box is bordered).
+    fn height(self) -> u16 {
+        match self {
+            Row::Message(_) => 3,
+            _ => 1,
+        }
+    }
+
+    /// Keyboard navigation (j/k, wheel) skips widget rows — they are clicked,
+    /// like VS Code's inputs, not list entries.
+    fn selectable(self) -> bool {
+        !matches!(self, Row::Message(_) | Row::Commit(_))
+    }
 }
 
 /// Context-menu actions for a staged/unstaged file row.
@@ -146,13 +221,14 @@ enum Overlay {
     Menu {
         x: u16,
         y: u16,
-        /// (entry, staged) — the file row the menu targets.
-        target: (FileEntry, bool),
+        /// (repo, entry, staged) — the file row the menu targets.
+        target: (usize, FileEntry, bool),
         entries: Vec<MenuEntry>,
         selected: usize,
         rect: Rect,
     },
     ConfirmDiscard {
+        repo: usize,
         entry: FileEntry,
     },
     /// The ⚙ settings modal: mouse-toggleable panel settings.
@@ -193,6 +269,8 @@ struct ClickZones {
     message: Rect,
     sparkle: Rect,
     button: Rect,
+    /// The Sync Changes row (zero-sized when hidden).
+    sync: Rect,
 }
 
 /// Handle for identity/label control of our own pane over the socket API.
@@ -242,24 +320,28 @@ impl PaneCtl {
 }
 
 pub struct App {
-    repo: Result<Git, String>,
+    /// Every repository visible from the cwd (VS Code style: the containing
+    /// repo plus child repos). Empty = "not a git repository".
+    repos: Vec<Repo>,
+    /// Why discovery came up empty, for the placeholder screen.
+    discover_err: String,
+    /// The repo the commit box / drawers / sync act on: the one the selection
+    /// is in.
+    active: usize,
     cwd: PathBuf,
-    status: Status,
     rows: Vec<Row>,
     list: ListState,
     focus: Focus,
     theme: IconTheme,
-    message: Vec<char>,
-    cursor: usize,
-    staged_collapsed: bool,
-    changes_collapsed: bool,
     drawers: [DrawerPanel; 7],
     /// The file the FILE HISTORY drawer follows: the last selected file row.
     history_target: Option<String>,
     /// One-shot footer notice: (text, is_error). Cleared on the next key press.
     flash: Option<(String, bool)>,
-    /// Pending ✨ commit-message generation, polled from tick().
+    /// Pending ✧ commit-message generation, polled from tick().
     suggesting: Option<Receiver<String>>,
+    /// Pending Sync Changes run, polled from tick().
+    syncing: Option<Receiver<Result<String, String>>>,
     overlay: Option<Overlay>,
     hovered: Option<usize>,
     body: BodyGeom,
@@ -276,7 +358,12 @@ const MY_VIEW: View = View::SourceControl;
 
 impl App {
     pub fn new(cwd: PathBuf) -> Self {
-        let repo = Git::discover(&cwd);
+        let repos: Vec<Repo> = Git::discover_all(&cwd).into_iter().map(Repo::new).collect();
+        let discover_err = if repos.is_empty() {
+            Git::discover(&cwd).err().unwrap_or_else(|| "no repositories found".to_string())
+        } else {
+            String::new()
+        };
         let theme = IconTheme::from_env(
             std::env::var("HERDR_AA_GIT_ICONS")
                 .or_else(|_| std::env::var("HERDR_AA_FILETREE_ICONS"))
@@ -289,21 +376,19 @@ impl App {
         let sidebar_state = sidebar::load_state();
         let pane_ctl = PaneCtl::from_env();
         let mut app = Self {
-            repo,
+            repos,
+            discover_err,
+            active: 0,
             cwd,
-            status: Status::default(),
             rows: Vec::new(),
             list: ListState::default(),
             focus: Focus::List,
             theme,
-            message: Vec::new(),
-            cursor: 0,
-            staged_collapsed: false,
-            changes_collapsed: false,
             drawers: Default::default(),
             history_target: None,
             flash: None,
             suggesting: None,
+            syncing: None,
             overlay: None,
             hovered: None,
             body: BodyGeom::default(),
@@ -319,6 +404,20 @@ impl App {
         app
     }
 
+    fn active_repo(&self) -> Option<&Repo> {
+        self.repos.get(self.active)
+    }
+
+    fn active_repo_mut(&mut self) -> Option<&mut Repo> {
+        let i = self.active;
+        self.repos.get_mut(i)
+    }
+
+    /// More than one repo: VS Code-style per-repo inline inputs in the list.
+    fn multi(&self) -> bool {
+        self.repos.len() > 1
+    }
+
     /// The merged sidebar is on and actually usable (other plugin present).
     fn merged(&self) -> bool {
         self.sidebar_state.merged && self.other_exe.is_some()
@@ -332,29 +431,40 @@ impl App {
         ctl.report_tokens(MY_VIEW, self.merged());
     }
 
-    /// Re-read git status; keeps the flash so periodic ticks don't eat notices.
+    /// Re-read every repo's git status (this is the change auto-detection —
+    /// tick() calls it every [`crate::REFRESH_EVERY`]); keeps the flash so
+    /// periodic ticks don't eat notices.
     pub fn refresh(&mut self) {
-        if let Ok(git) = &self.repo {
-            match git.status() {
-                Ok(status) => self.status = status,
-                Err(e) => self.flash = Some((e, true)),
+        let mut error = None;
+        for repo in &mut self.repos {
+            match repo.git.status() {
+                Ok(status) => repo.status = status,
+                Err(e) => error = Some(e),
             }
+        }
+        if let Some(e) = error {
+            self.flash = Some((e, true));
         }
         self.reload_expanded_drawers();
         self.rebuild();
     }
 
     /// Periodic timer tick: retry repo discovery if we started outside one,
-    /// pick up external changes, and collect a finished ✨ suggestion.
+    /// pick up external changes, and collect finished ✧ suggestion / sync runs.
     pub fn tick(&mut self) {
-        if self.repo.is_err() {
-            self.repo = Git::discover(&self.cwd);
+        if self.repos.is_empty() {
+            self.repos = Git::discover_all(&self.cwd).into_iter().map(Repo::new).collect();
+            if !self.repos.is_empty() {
+                self.discover_err.clear();
+            }
         }
         if let Some(rx) = &self.suggesting {
             match rx.try_recv() {
                 Ok(message) => {
-                    self.message = message.chars().collect();
-                    self.cursor = self.message.len();
+                    if let Some(repo) = self.active_repo_mut() {
+                        repo.message = message.chars().collect();
+                        repo.cursor = repo.message.len();
+                    }
                     self.focus = Focus::Message;
                     self.flash = Some(("✧ suggestion ready — edit or ⏎ to commit".into(), false));
                     self.suggesting = None;
@@ -366,11 +476,29 @@ impl App {
                 }
             }
         }
+        if let Some(rx) = &self.syncing {
+            match rx.try_recv() {
+                Ok(Ok(summary)) => {
+                    self.flash = Some((summary, false));
+                    self.syncing = None;
+                }
+                Ok(Err(e)) => {
+                    self.flash = Some((e, true));
+                    self.syncing = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.flash = Some(("sync failed".into(), true));
+                    self.syncing = None;
+                }
+            }
+        }
         self.refresh();
     }
 
     fn reload_expanded_drawers(&mut self) {
-        let Ok(git) = &self.repo else { return };
+        let Some(git) = self.active_repo().map(|r| r.git.clone()) else { return };
+        let git = &git;
         for kind in Drawer::ALL {
             if !self.drawers[kind.index()].expanded {
                 continue;
@@ -398,19 +526,32 @@ impl App {
     fn rebuild(&mut self) {
         self.hovered = None;
         self.rows.clear();
-        // Like VS Code, the Staged section only exists while something is staged.
-        if !self.status.staged.is_empty() {
-            self.rows.push(Row::StagedHeader);
-            if !self.staged_collapsed {
-                for i in 0..self.status.staged.len() {
-                    self.rows.push(Row::Staged(i));
+        let multi = self.repos.len() > 1;
+        for (r, repo) in self.repos.iter().enumerate() {
+            if multi {
+                self.rows.push(Row::RepoHeader(r));
+                if repo.collapsed {
+                    continue;
+                }
+                // VS Code gives every repo its own message box and Commit
+                // button, inline in the list.
+                self.rows.push(Row::Message(r));
+                self.rows.push(Row::Commit(r));
+            }
+            // Like VS Code, the Staged section only exists while something is staged.
+            if !repo.status.staged.is_empty() {
+                self.rows.push(Row::StagedHeader(r));
+                if !repo.staged_collapsed {
+                    for i in 0..repo.status.staged.len() {
+                        self.rows.push(Row::Staged(r, i));
+                    }
                 }
             }
-        }
-        self.rows.push(Row::ChangesHeader);
-        if !self.changes_collapsed {
-            for i in 0..self.status.unstaged.len() {
-                self.rows.push(Row::Unstaged(i));
+            self.rows.push(Row::ChangesHeader(r));
+            if !repo.changes_collapsed {
+                for i in 0..repo.status.unstaged.len() {
+                    self.rows.push(Row::Unstaged(r, i));
+                }
             }
         }
         for kind in Drawer::ALL {
@@ -421,16 +562,52 @@ impl App {
                 }
             }
         }
+        if self.rows.is_empty() {
+            self.list.select(None);
+            return;
+        }
         let index = self.list.selected().unwrap_or(0).min(self.rows.len() - 1);
-        self.list.select(Some(index));
-        self.update_history_target();
+        self.list.select(Some(self.nearest_selectable(index)));
+        self.follow_selection();
     }
 
-    /// Keep the FILE HISTORY drawer following the selected file row.
-    fn update_history_target(&mut self) {
-        let path = match self.list.selected().and_then(|i| self.rows.get(i)) {
-            Some(Row::Staged(i)) => self.status.staged.get(*i).map(|e| e.path.clone()),
-            Some(Row::Unstaged(i)) => self.status.unstaged.get(*i).map(|e| e.path.clone()),
+    /// The closest keyboard-selectable row to `from` (widget rows — inline
+    /// message boxes and commit buttons — are skipped).
+    fn nearest_selectable(&self, from: usize) -> usize {
+        if self.rows.get(from).is_some_and(|r| r.selectable()) {
+            return from;
+        }
+        let after = (from..self.rows.len()).find(|&i| self.rows[i].selectable());
+        let before = (0..from).rev().find(|&i| self.rows[i].selectable());
+        after.or(before).unwrap_or(0)
+    }
+
+    /// Keep the active repo and the FILE HISTORY drawer following the
+    /// selection: drawers, commit box, and sync all act on the selected
+    /// row's repository.
+    fn follow_selection(&mut self) {
+        let selected = self.list.selected().and_then(|i| self.rows.get(i)).copied();
+        if let Some(r) = selected.and_then(Row::repo)
+            && r != self.active
+            && r < self.repos.len()
+        {
+            self.active = r;
+            self.history_target = None;
+            self.reload_expanded_drawers();
+            let keep = self.list.selected();
+            self.rebuild();
+            if let Some(i) = keep {
+                self.list.select(Some(i.min(self.rows.len().saturating_sub(1))));
+            }
+            return;
+        }
+        let path = match selected {
+            Some(Row::Staged(r, i)) if r == self.active => {
+                self.repos[r].status.staged.get(i).map(|e| e.path.clone())
+            }
+            Some(Row::Unstaged(r, i)) if r == self.active => {
+                self.repos[r].status.unstaged.get(i).map(|e| e.path.clone())
+            }
             _ => return, // keep the last file while browsing elsewhere
         };
         if path.is_some() && path != self.history_target {
@@ -438,7 +615,7 @@ impl App {
             if self.drawers[Drawer::FileHistory.index()].expanded {
                 self.reload_expanded_drawers();
                 // Line count may have changed; rebuild WITHOUT re-entering
-                // update_history_target (path is unchanged now).
+                // follow_selection (path is unchanged now).
                 let selected = self.list.selected();
                 self.rebuild();
                 if let Some(i) = selected {
@@ -468,33 +645,40 @@ impl App {
 
     fn on_message_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Enter => self.commit(),
+            KeyCode::Enter => {
+                self.commit();
+                return;
+            }
             KeyCode::Esc => self.focus = Focus::List,
             KeyCode::Tab => self.focus = Focus::Commit,
             KeyCode::BackTab => self.focus = Focus::List,
             KeyCode::Down => self.focus = Focus::Commit,
+            _ => {}
+        }
+        let Some(repo) = self.active_repo_mut() else { return };
+        match key.code {
             KeyCode::Backspace => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                    self.message.remove(self.cursor);
+                if repo.cursor > 0 {
+                    repo.cursor -= 1;
+                    repo.message.remove(repo.cursor);
                 }
             }
             KeyCode::Delete => {
-                if self.cursor < self.message.len() {
-                    self.message.remove(self.cursor);
+                if repo.cursor < repo.message.len() {
+                    repo.message.remove(repo.cursor);
                 }
             }
-            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Right => self.cursor = (self.cursor + 1).min(self.message.len()),
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.message.len(),
+            KeyCode::Left => repo.cursor = repo.cursor.saturating_sub(1),
+            KeyCode::Right => repo.cursor = (repo.cursor + 1).min(repo.message.len()),
+            KeyCode::Home => repo.cursor = 0,
+            KeyCode::End => repo.cursor = repo.message.len(),
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.message.clear();
-                self.cursor = 0;
+                repo.message.clear();
+                repo.cursor = 0;
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.message.insert(self.cursor, c);
-                self.cursor += 1;
+                repo.message.insert(repo.cursor, c);
+                repo.cursor += 1;
             }
             _ => {}
         }
@@ -529,6 +713,7 @@ impl App {
             KeyCode::Char('i') => self.theme = self.theme.toggled(),
             KeyCode::Char('A') => self.suggest_message(),
             KeyCode::Char('s') => self.open_settings(),
+            KeyCode::Char('S') => self.sync_changes(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => return self.switch_to(View::SourceControl),
             _ => {}
@@ -589,15 +774,47 @@ impl App {
             self.commit();
             return None;
         }
-        if let Some(index) = self.row_at(y) {
-            self.focus = Focus::List;
-            self.select(index);
-            // Single click toggles section/drawer headers, selects file rows.
-            if matches!(
-                self.rows[index],
-                Row::StagedHeader | Row::ChangesHeader | Row::DrawerHeader(_)
-            ) {
-                self.activate();
+        if hits(z.sync, x, y) {
+            self.sync_changes();
+            return None;
+        }
+        if let Some((index, line)) = self.row_hit(y) {
+            match self.rows[index] {
+                // The inline widgets: click focuses/acts without selecting.
+                Row::Message(r) => {
+                    self.active = r;
+                    // The box's middle line holds the input and the ✧ button.
+                    if line == 1 && x >= self.last_width.saturating_sub(4) {
+                        self.suggest_message();
+                    } else {
+                        self.focus = Focus::Message;
+                    }
+                    self.follow_selection();
+                }
+                Row::Commit(r) => self.commit_repo(r),
+                Row::RepoHeader(r) => {
+                    self.focus = Focus::List;
+                    self.select(index);
+                    // Right-side action icons: ⟳ sync · ✓ commit (fixed
+                    // offsets from the right edge, see repo_header_item).
+                    let w = self.last_width;
+                    if x >= w.saturating_sub(3) && x < w {
+                        self.commit_repo(r);
+                    } else if x >= w.saturating_sub(6) && x < w.saturating_sub(3) {
+                        self.sync_repo(r);
+                    } else {
+                        self.activate();
+                    }
+                }
+                Row::StagedHeader(_) | Row::ChangesHeader(_) | Row::DrawerHeader(_) => {
+                    self.focus = Focus::List;
+                    self.select(index);
+                    self.activate();
+                }
+                _ => {
+                    self.focus = Focus::List;
+                    self.select(index);
+                }
             }
         }
         None
@@ -607,9 +824,9 @@ impl App {
     fn open_context_menu(&mut self, x: u16, y: u16) {
         let Some(index) = self.row_at(y) else { return };
         self.select(index);
-        let (entry, staged) = match self.rows[index] {
-            Row::Staged(i) => (self.status.staged.get(i), true),
-            Row::Unstaged(i) => (self.status.unstaged.get(i), false),
+        let (repo, entry, staged) = match self.rows[index] {
+            Row::Staged(r, i) => (r, self.repos[r].status.staged.get(i), true),
+            Row::Unstaged(r, i) => (r, self.repos[r].status.unstaged.get(i), false),
             _ => return, // headers and drawer lines have no menu
         };
         let Some(entry) = entry.cloned() else { return };
@@ -630,7 +847,7 @@ impl App {
         self.overlay = Some(Overlay::Menu {
             x,
             y,
-            target: (entry, staged),
+            target: (repo, entry, staged),
             entries,
             selected: 0,
             rect: Rect::default(),
@@ -643,7 +860,7 @@ impl App {
             Close,
             Activate,
             ToggleSetting(usize),
-            DiscardConfirmed(FileEntry),
+            DiscardConfirmed(usize, FileEntry),
         }
         let row_count = self.settings_rows().len();
         let cmd = match self.overlay.as_mut() {
@@ -673,8 +890,10 @@ impl App {
                 KeyCode::Enter | KeyCode::Char(' ') => Cmd::ToggleSetting(*selected),
                 _ => Cmd::Nothing,
             },
-            Some(Overlay::ConfirmDiscard { entry }) => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => Cmd::DiscardConfirmed(entry.clone()),
+            Some(Overlay::ConfirmDiscard { repo, entry }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    Cmd::DiscardConfirmed(*repo, entry.clone())
+                }
                 _ => Cmd::Close,
             },
             None => Cmd::Nothing,
@@ -684,11 +903,11 @@ impl App {
             Cmd::Close => self.overlay = None,
             Cmd::Activate => self.activate_menu_entry(),
             Cmd::ToggleSetting(index) => self.toggle_setting(index),
-            Cmd::DiscardConfirmed(entry) => {
+            Cmd::DiscardConfirmed(repo, entry) => {
                 self.overlay = None;
-                let result = match &self.repo {
-                    Ok(git) => git.discard(&entry),
-                    Err(e) => Err(e.clone()),
+                let result = match self.repos.get(repo) {
+                    Some(r) => r.git.discard(&entry),
+                    None => Err("repository is gone".to_string()),
                 };
                 match result {
                     Ok(()) => self.flash = Some((format!("discarded {}", entry.path), false)),
@@ -880,25 +1099,27 @@ impl App {
             return;
         };
         let MenuEntry::Action(action, _) = entries[selected] else { return };
-        let (entry, staged) = target;
+        let (repo, entry, staged) = target;
+        let repo_root = self.repos.get(repo).map(|r| r.git.root().to_path_buf());
         match action {
             MenuAction::StageOrUnstage => {
-                let result = match &self.repo {
-                    Ok(git) if staged => git.unstage(&entry),
-                    Ok(git) => git.stage(&entry),
-                    Err(e) => Err(e.clone()),
+                let result = match self.repos.get(repo) {
+                    Some(r) if staged => r.git.unstage(&entry),
+                    Some(r) => r.git.stage(&entry),
+                    None => Err("repository is gone".to_string()),
                 };
                 if let Err(e) = result {
                     self.flash = Some((e, true));
                 }
                 self.refresh();
             }
-            MenuAction::Discard => self.overlay = Some(Overlay::ConfirmDiscard { entry }),
+            MenuAction::Discard => self.overlay = Some(Overlay::ConfirmDiscard { repo, entry }),
             MenuAction::CopyPath | MenuAction::CopyRelativePath => {
+                let rel = entry.path.replace('/', std::path::MAIN_SEPARATOR_STR);
                 let text = if action == MenuAction::CopyPath {
-                    self.cwd.join(entry.path.replace('/', std::path::MAIN_SEPARATOR_STR)).display().to_string()
+                    repo_root.unwrap_or_else(|| self.cwd.clone()).join(&rel).display().to_string()
                 } else {
-                    entry.path.replace('/', std::path::MAIN_SEPARATOR_STR)
+                    rel
                 };
                 self.flash = Some(match copy_to_clipboard(&text) {
                     Ok(()) => (format!("copied: {text}"), false),
@@ -906,7 +1127,8 @@ impl App {
                 });
             }
             MenuAction::Reveal => {
-                let path = self.cwd.join(entry.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+                let rel = entry.path.replace('/', std::path::MAIN_SEPARATOR_STR);
+                let path = repo_root.unwrap_or_else(|| self.cwd.clone()).join(rel);
                 reveal(&path);
             }
         }
@@ -988,14 +1210,29 @@ impl App {
     fn select(&mut self, index: usize) {
         if !self.rows.is_empty() {
             self.list.select(Some(index.min(self.rows.len() - 1)));
-            self.update_history_target();
+            self.follow_selection();
         }
     }
 
     fn move_by(&mut self, delta: isize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let len = self.rows.len() as isize;
         let current = self.list.selected().unwrap_or(0) as isize;
-        let next = (current + delta).clamp(0, self.rows.len().saturating_sub(1) as isize);
-        self.select(next as usize);
+        let step = if delta >= 0 { 1 } else { -1 };
+        let mut next = (current + delta).clamp(0, len - 1);
+        // Widget rows aren't keyboard stops: keep going in the same direction,
+        // falling back to the nearest stop at the ends.
+        while (0..len).contains(&next) && !self.rows[next as usize].selectable() {
+            next += step;
+        }
+        let next = if (0..len).contains(&next) {
+            next as usize
+        } else {
+            self.nearest_selectable((current + delta).clamp(0, len - 1) as usize)
+        };
+        self.select(next);
     }
 
     /// Enter/Space on the selected row: toggle a section/drawer, or move a
@@ -1005,12 +1242,18 @@ impl App {
             return;
         };
         match row {
-            Row::StagedHeader => {
-                self.staged_collapsed = !self.staged_collapsed;
+            // Widget rows aren't keyboard-selectable; nothing to activate.
+            Row::Message(_) | Row::Commit(_) => {}
+            Row::RepoHeader(r) => {
+                self.repos[r].collapsed = !self.repos[r].collapsed;
                 self.rebuild();
             }
-            Row::ChangesHeader => {
-                self.changes_collapsed = !self.changes_collapsed;
+            Row::StagedHeader(r) => {
+                self.repos[r].staged_collapsed = !self.repos[r].staged_collapsed;
+                self.rebuild();
+            }
+            Row::ChangesHeader(r) => {
+                self.repos[r].changes_collapsed = !self.repos[r].changes_collapsed;
                 self.rebuild();
             }
             Row::DrawerHeader(kind) => {
@@ -1019,49 +1262,50 @@ impl App {
                 self.rebuild();
             }
             Row::DrawerLine(..) => {}
-            Row::Staged(i) => self.run_op(|git, e| git.unstage(e), i, true),
-            Row::Unstaged(i) => self.run_op(|git, e| git.stage(e), i, false),
+            Row::Staged(r, i) => self.run_op(|git, e| git.unstage(e), r, i, true),
+            Row::Unstaged(r, i) => self.run_op(|git, e| git.stage(e), r, i, false),
         }
     }
 
     fn run_op(
         &mut self,
         op: impl Fn(&Git, &FileEntry) -> Result<(), String>,
+        repo: usize,
         index: usize,
         staged: bool,
     ) {
-        let Ok(git) = &self.repo else { return };
-        let list = if staged { &self.status.staged } else { &self.status.unstaged };
+        let Some(repo) = self.repos.get(repo) else { return };
+        let list = if staged { &repo.status.staged } else { &repo.status.unstaged };
         let Some(entry) = list.get(index) else { return };
-        if let Err(e) = op(git, entry) {
+        if let Err(e) = op(&repo.git, entry) {
             self.flash = Some((e, true));
         }
         self.refresh();
     }
 
     fn stage_all(&mut self) {
-        let Ok(git) = &self.repo else { return };
-        if let Err(e) = git.stage_all() {
+        let Some(repo) = self.active_repo() else { return };
+        if let Err(e) = repo.git.stage_all() {
             self.flash = Some((e, true));
         }
         self.refresh();
     }
 
     fn unstage_all(&mut self) {
-        let Ok(git) = &self.repo else { return };
-        if let Err(e) = git.unstage_all() {
+        let Some(repo) = self.active_repo() else { return };
+        if let Err(e) = repo.git.unstage_all() {
             self.flash = Some((e, true));
         }
         self.refresh();
     }
 
-    /// Kick off ✨ commit-message generation in the background.
+    /// Kick off ✧ commit-message generation in the background.
     fn suggest_message(&mut self) {
         if self.suggesting.is_some() {
             return;
         }
-        let Ok(git) = &self.repo else { return };
-        match git.diff_for_message() {
+        let Some(repo) = self.active_repo() else { return };
+        match repo.git.diff_for_message() {
             Ok((diff, files)) if diff.trim().is_empty() && files.is_empty() => {
                 self.flash = Some(("no changes to describe".into(), true));
             }
@@ -1073,23 +1317,51 @@ impl App {
         }
     }
 
+    /// VS Code's Sync Changes (pull --rebase, then push) on a background
+    /// thread; tick() collects the outcome.
+    fn sync_changes(&mut self) {
+        self.sync_repo(self.active);
+    }
+
+    fn sync_repo(&mut self, index: usize) {
+        if self.syncing.is_some() {
+            return;
+        }
+        let Some(repo) = self.repos.get(index) else { return };
+        if !repo.status.has_upstream {
+            self.flash = Some(("no upstream to sync with".into(), true));
+            return;
+        }
+        let git = repo.git.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(git.sync());
+        });
+        self.syncing = Some(rx);
+    }
+
     fn commit(&mut self) {
-        let Ok(git) = &self.repo else { return };
-        let message: String = self.message.iter().collect();
+        self.commit_repo(self.active);
+    }
+
+    fn commit_repo(&mut self, index: usize) {
+        let Some(repo) = self.repos.get_mut(index) else { return };
+        let message: String = repo.message.iter().collect();
         if message.trim().is_empty() {
+            self.active = index;
             self.flash = Some(("Commit message is empty.".to_string(), true));
             self.focus = Focus::Message;
             return;
         }
-        if self.status.staged.is_empty() {
+        if repo.status.staged.is_empty() {
             self.flash = Some(("No staged changes to commit.".to_string(), true));
             return;
         }
-        match git.commit(message.trim()) {
+        match repo.git.commit(message.trim()) {
             Ok(summary) => {
                 self.flash = Some((summary, false));
-                self.message.clear();
-                self.cursor = 0;
+                repo.message.clear();
+                repo.cursor = 0;
                 self.focus = Focus::List;
             }
             Err(e) => self.flash = Some((e, true)),
@@ -1097,13 +1369,38 @@ impl App {
         self.refresh();
     }
 
-    /// The visible row index at a pane-local mouse row, if it lands on one.
-    fn row_at(&self, mouse_row: u16) -> Option<usize> {
+    /// The visible row at a pane-local mouse row plus the line within it
+    /// (rows vary in height: the inline message boxes are 3 lines tall).
+    fn row_hit(&self, mouse_row: u16) -> Option<(usize, u16)> {
         if mouse_row < self.body.top || mouse_row >= self.body.top + self.body.height {
             return None;
         }
-        let index = self.body.offset + usize::from(mouse_row - self.body.top);
-        (index < self.rows.len()).then_some(index)
+        let mut y = self.body.top;
+        for index in self.body.offset..self.rows.len() {
+            let h = self.rows[index].height();
+            if mouse_row < y + h {
+                return Some((index, mouse_row - y));
+            }
+            y += h;
+        }
+        None
+    }
+
+    /// The visible row index at a pane-local mouse row, if it lands on one.
+    fn row_at(&self, mouse_row: u16) -> Option<usize> {
+        self.row_hit(mouse_row).map(|(index, _)| index)
+    }
+
+    /// The screen row where `index`'s first line is drawn, if visible.
+    fn row_y(&self, index: usize) -> Option<u16> {
+        let mut y = self.body.top;
+        for i in self.body.offset..self.rows.len() {
+            if i == index {
+                return (y < self.body.top + self.body.height).then_some(y);
+            }
+            y += self.rows[i].height();
+        }
+        None
     }
 
     // ---- Rendering ----
@@ -1112,21 +1409,31 @@ impl App {
         let area = frame.area();
         self.last_width = area.width;
 
-        if let Err(e) = &self.repo {
+        if self.repos.is_empty() {
             let text = format!(
-                "Not a git repository.\n\n{e}\n\nOpen this pane inside a repo,\nor press q to quit.",
+                "Not a git repository.\n\n{}\n\nOpen this pane inside a repo,\nor press q to quit.",
+                self.discover_err,
             );
             frame.render_widget(Paragraph::new(text).dim().wrap(Wrap { trim: false }), area);
             return;
         }
 
+        // With several repos, VS Code puts a message box + Commit button
+        // INSIDE each repo's section (rendered as list rows); the single-repo
+        // view keeps them fixed at the top. The Sync Changes row only appears
+        // when there is something to sync (or a sync is running).
+        let multi = self.multi();
+        let message_height = if multi { 0 } else { 3 };
+        let button_height = u16::from(!multi);
+        let sync_height = u16::from(!multi && self.sync_label().is_some());
         let footer_lines = self.footer_lines(area.width);
         let activity_height = u16::from(self.merged());
-        let [activity, header, message, button, list, footer] = Layout::vertical([
+        let [activity, header, message, button, sync, list, footer] = Layout::vertical([
             Constraint::Length(activity_height),
             Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
+            Constraint::Length(message_height),
+            Constraint::Length(button_height),
+            Constraint::Length(sync_height),
             Constraint::Min(0),
             Constraint::Length(footer_lines.len() as u16),
         ])
@@ -1137,8 +1444,16 @@ impl App {
             self.draw_activity_bar(frame, activity);
         }
         self.draw_header(frame, header);
-        self.draw_message(frame, message);
-        self.draw_button(frame, button);
+        if !multi {
+            self.draw_message(frame, message);
+            self.draw_button(frame, button);
+            self.draw_sync(frame, sync);
+        } else {
+            self.zones.message = Rect::default();
+            self.zones.sparkle = Rect::default();
+            self.zones.button = Rect::default();
+            self.zones.sync = Rect::default();
+        }
         self.draw_list(frame, list);
         frame.render_widget(Paragraph::new(footer_lines), footer);
 
@@ -1191,7 +1506,16 @@ impl App {
 
     fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
         let left = Span::styled(" ▾ CHANGES", Style::default().bold());
-        let branch = Span::styled(format!("{} ", self.status.branch), Style::default().dim());
+        // With several repos visible, the header names the one the commit box
+        // and sync act on.
+        let right_text = match self.active_repo() {
+            Some(repo) if self.repos.len() > 1 => {
+                format!("{} · {} ", repo.name, repo.status.branch)
+            }
+            Some(repo) => format!("{} ", repo.status.branch),
+            None => String::new(),
+        };
+        let branch = Span::styled(right_text, Style::default().dim());
         // In unified mode the ⚙ lives in the activity bar; standalone puts it
         // at the header's right edge.
         let gear = if self.merged() {
@@ -1224,29 +1548,35 @@ impl App {
         frame.render_widget(boxed, area);
         self.zones.message = area;
 
-        // The ✧ suggest button lives at the right end of the input line — an
-        // outline glyph in the normal foreground, not the colored ✨ emoji.
-        let sparkle_glyph = if self.suggesting.is_some() { "…" } else { "✧" };
+        // The suggest button lives at the right end of the input line — a
+        // monochrome OUTLINE of the ✨ sparkles shape (MDI "creation" in the
+        // material theme) in the normal foreground, never the colored emoji.
+        let sparkle_glyph =
+            if self.suggesting.is_some() { "…" } else { sparkle_icon(self.theme) };
         let sparkle_w = Span::raw(sparkle_glyph).width() as u16 + 1;
         let [text_area, sparkle_area] =
             Layout::horizontal([Constraint::Min(0), Constraint::Length(sparkle_w)]).areas(inner);
         frame.render_widget(Paragraph::new(sparkle_glyph), sparkle_area);
         self.zones.sparkle = sparkle_area;
 
-        if self.message.is_empty() && !focused {
-            let placeholder = format!("Message (⏎ to commit on \"{}\")", self.status.branch);
+        let (message, cursor, branch) = match self.active_repo() {
+            Some(r) => (r.message.clone(), r.cursor, r.status.branch.clone()),
+            None => (Vec::new(), 0, String::new()),
+        };
+        if message.is_empty() && !focused {
+            let placeholder = format!("Message (⏎ to commit on \"{branch}\")");
             frame.render_widget(Paragraph::new(placeholder).dim().italic(), text_area);
             return;
         }
 
         // Single-line input with horizontal scroll keeping the cursor visible.
         let width = text_area.width.saturating_sub(1) as usize;
-        let start = self.cursor.saturating_sub(width);
-        let visible: String = self.message.iter().skip(start).take(width.max(1)).collect();
+        let start = cursor.saturating_sub(width);
+        let visible: String = message.iter().skip(start).take(width.max(1)).collect();
         frame.render_widget(Paragraph::new(visible), text_area);
         if focused {
             frame.set_cursor_position(Position::new(
-                text_area.x + (self.cursor - start) as u16,
+                text_area.x + (cursor - start) as u16,
                 text_area.y,
             ));
         }
@@ -1263,26 +1593,67 @@ impl App {
         self.zones.button = area;
     }
 
+    /// The Sync Changes label, or `None` while there is nothing to sync
+    /// (which hides the row entirely).
+    fn sync_label(&self) -> Option<String> {
+        if self.syncing.is_some() {
+            return Some("⇅ Syncing…".to_string());
+        }
+        let status = &self.active_repo()?.status;
+        if !status.has_upstream || status.ahead + status.behind == 0 {
+            return None;
+        }
+        Some(format!("⇅ Sync Changes  {}↑ {}↓", status.ahead, status.behind))
+    }
+
+    /// A secondary button below Commit, VS Code's Sync Changes: pull + push
+    /// with the outgoing↑ / incoming↓ counts.
+    fn draw_sync(&mut self, frame: &mut Frame, area: Rect) {
+        self.zones.sync = area;
+        let Some(label) = self.sync_label() else { return };
+        let style = if self.syncing.is_some() {
+            Style::default().bg(Color::Rgb(0x2d, 0x2d, 0x33)).fg(Color::Gray)
+        } else {
+            Style::default().bg(Color::Rgb(0x3a, 0x3d, 0x41)).fg(Color::White)
+        };
+        frame.render_widget(Paragraph::new(label).centered().style(style), area);
+    }
+
     fn draw_list(&mut self, frame: &mut Frame, area: Rect) {
         let width = area.width as usize;
         let theme = self.theme;
         let hovered = self.hovered;
+        let active = self.active;
         let items: Vec<ListItem> = self
             .rows
             .iter()
             .enumerate()
             .map(|(i, row)| {
                 let item = match *row {
-                    Row::StagedHeader => section_item(
-                        "Staged Changes",
-                        self.staged_collapsed,
-                        Some(self.status.staged.len()),
+                    Row::RepoHeader(r) => {
+                        repo_header_item(&self.repos[r], r == active, theme, width)
+                    }
+                    Row::Message(r) => message_box_item(
+                        &self.repos[r],
+                        r == active && self.focus == Focus::Message,
+                        theme,
                         width,
                     ),
-                    Row::ChangesHeader => section_item(
+                    Row::Commit(r) => commit_button_item(
+                        r == active,
+                        r == active && self.focus == Focus::Commit,
+                        width,
+                    ),
+                    Row::StagedHeader(r) => section_item(
+                        "Staged Changes",
+                        self.repos[r].staged_collapsed,
+                        Some(self.repos[r].status.staged.len()),
+                        width,
+                    ),
+                    Row::ChangesHeader(r) => section_item(
                         "Changes",
-                        self.changes_collapsed,
-                        Some(self.status.unstaged.len()),
+                        self.repos[r].changes_collapsed,
+                        Some(self.repos[r].status.unstaged.len()),
                         width,
                     ),
                     Row::DrawerHeader(kind) => {
@@ -1306,8 +1677,10 @@ impl App {
                     Row::DrawerLine(kind, i) => {
                         drawer_line(kind, &self.drawers[kind.index()].lines[i])
                     }
-                    Row::Staged(i) => file_item(&self.status.staged[i], width, theme),
-                    Row::Unstaged(i) => file_item(&self.status.unstaged[i], width, theme),
+                    Row::Staged(r, i) => file_item(&self.repos[r].status.staged[i], width, theme),
+                    Row::Unstaged(r, i) => {
+                        file_item(&self.repos[r].status.unstaged[i], width, theme)
+                    }
                 };
                 if hovered == Some(i) {
                     item.style(Style::default().bg(HOVER_BG))
@@ -1328,12 +1701,32 @@ impl App {
             height: area.height,
             offset: self.list.offset(),
         };
+
+        // Terminal cursor inside the focused INLINE message box (multi-repo).
+        if self.multi() && self.focus == Focus::Message {
+            let target = self
+                .rows
+                .iter()
+                .position(|row| matches!(row, Row::Message(r) if *r == self.active));
+            if let Some(index) = target
+                && let Some(y) = self.row_y(index)
+                && y + 1 < area.y + area.height
+                && let Some(repo) = self.active_repo()
+            {
+                let field = usize::from(inline_field_width(self.last_width));
+                let start = repo.cursor.saturating_sub(field.saturating_sub(1));
+                frame.set_cursor_position(Position::new(
+                    area.x + 1 + (repo.cursor - start) as u16,
+                    y + 1,
+                ));
+            }
+        }
     }
 
     /// Footer content: a flash message, or the hotkey hints wrapped so they
     /// never clip in a narrow sidebar.
     fn footer_lines(&self, width: u16) -> Vec<Line<'static>> {
-        if let Some(Overlay::ConfirmDiscard { entry }) = &self.overlay {
+        if let Some(Overlay::ConfirmDiscard { entry, .. }) = &self.overlay {
             return vec![Line::styled(
                 format!(" Discard changes to '{}'? (y/N)", entry.path),
                 Style::default().fg(DELETED),
@@ -1347,18 +1740,19 @@ impl App {
                 Style::default().fg(color),
             )];
         }
-        let mut hints: Vec<&'static str> = vec![
-            "⏎ un/stage",
-            "a all",
-            "u none",
-            "c msg",
-            "A ✧msg",
-            "s settings",
-            "r refresh",
-            "q quit",
+        let mut hints: Vec<(&'static str, &'static str)> = vec![
+            ("⏎", "stage"),
+            ("a", "all"),
+            ("u", "none"),
+            ("c", "msg"),
+            ("A", "suggest"),
+            ("S", "sync"),
+            ("s", "settings"),
+            ("r", "refresh"),
+            ("q", "quit"),
         ];
         if self.merged() {
-            hints.extend(["1 files", "2 git"]);
+            hints.extend([("1", "files"), ("2", "git")]);
         }
         wrap_hints(&hints, width, 0)
     }
@@ -1430,6 +1824,16 @@ fn gear_icon(theme: IconTheme) -> &'static str {
     }
 }
 
+/// Monochrome outline sparkles for the suggest button: MDI "creation"
+/// (the classic three-sparkle ✨ silhouette) with a text-presentation
+/// fallback for the emoji theme.
+fn sparkle_icon(theme: IconTheme) -> &'static str {
+    match theme {
+        IconTheme::Material => "\u{f0674}",
+        IconTheme::Emoji => "✧",
+    }
+}
+
 fn within(x: u16, (start, end): (u16, u16)) -> bool {
     (start..end).contains(&x)
 }
@@ -1438,29 +1842,46 @@ fn hits(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
 }
 
+/// Keycap chip colors for the footer hints — a subtle "keyboard key" look
+/// instead of a wall of dim text.
+const KEYCAP_BG: Color = Color::Rgb(0x32, 0x36, 0x3d);
+const KEYCAP_FG: Color = Color::Rgb(0xc9, 0xce, 0xd6);
+
+/// Rendered width of one `key label` hint: keycap padding + gap + label.
+fn hint_width(key: &str, label: &str) -> usize {
+    Span::raw(key).width() + 2 + 1 + Span::raw(label).width()
+}
+
 /// Pack hotkey hints into as many footer lines as they need at `width`
-/// (max 4), instead of clipping. `reserve` columns stay free on the LAST line
-/// (for a corner button).
-fn wrap_hints(hints: &[&'static str], width: u16, reserve: u16) -> Vec<Line<'static>> {
+/// (max 4), instead of clipping — each as a keycap chip plus a dim label.
+/// `reserve` columns stay free on the LAST line (for a corner button).
+fn wrap_hints(
+    hints: &[(&'static str, &'static str)],
+    width: u16,
+    reserve: u16,
+) -> Vec<Line<'static>> {
     let width = usize::from(width.max(8));
     let reserve = usize::from(reserve);
-    let mut lines: Vec<String> = vec![String::new()];
-    for hint in hints {
+    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut used: usize = 1;
+    for (key, label) in hints {
+        let w = hint_width(key, label);
         let full = lines.len() >= 4;
-        let current = lines.last_mut().unwrap();
-        if current.is_empty() {
-            *current = format!(" {hint}");
-            continue;
+        let empty = lines.last().is_some_and(Vec::is_empty);
+        if !empty && used + 2 + w > width.saturating_sub(reserve) && !full {
+            lines.push(Vec::new());
+            used = 1;
         }
-        let candidate_len = current.chars().count() + 2 + hint.chars().count();
-        if candidate_len <= width.saturating_sub(reserve) || full {
-            current.push_str("  ");
-            current.push_str(hint);
-        } else {
-            lines.push(format!(" {hint}"));
-        }
+        let line = lines.last_mut().unwrap();
+        line.push(Span::raw(if line.is_empty() { " " } else { "  " }));
+        line.push(Span::styled(
+            format!(" {key} "),
+            Style::default().bg(KEYCAP_BG).fg(KEYCAP_FG),
+        ));
+        line.push(Span::styled(format!(" {label}"), Style::default().dim()));
+        used += if line.len() == 3 { w } else { 2 + w };
     }
-    lines.into_iter().map(|l| Line::from(l.dim())).collect()
+    lines.into_iter().map(Line::from).collect()
 }
 
 /// Pane ids in the same tab as `my_pane_id` that belong to the `other` view
@@ -1520,6 +1941,115 @@ fn step_menu(entries: &[MenuEntry], from: usize, direction: isize) -> usize {
             return index as usize;
         }
     }
+}
+
+/// Theme-matched branch glyph for repo rows.
+fn branch_icon(theme: IconTheme) -> &'static str {
+    match theme {
+        IconTheme::Material => "\u{e725}",
+        IconTheme::Emoji => "⎇",
+    }
+}
+
+/// A repository row, matching VS Code's multi-repo Source Control: disclosure
+/// arrow, repo icon and name on the left; branch (starred when dirty) and the
+/// ⟳ sync / ✓ commit action icons on the right. The right-edge icon columns
+/// are FIXED (last 6 cells) — left_click's hit zones rely on that.
+fn repo_header_item(repo: &Repo, active: bool, theme: IconTheme, width: usize) -> ListItem<'static> {
+    let arrow = if repo.collapsed { "▸" } else { "▾" };
+    let repo_icon = icon(theme, "", true, false);
+    let name_style = if active { Style::default().bold() } else { Style::default().dim().bold() };
+    let left = vec![
+        Span::styled(format!(" {arrow} "), Style::default().bold()),
+        Span::raw(format!("{} ", repo_icon.glyph)),
+        Span::styled(repo.name.clone(), name_style),
+    ];
+    let branch = Span::styled(
+        format!("{} {}", branch_icon(theme), repo.branch_decor()),
+        Style::default().dim(),
+    );
+    let icons = Span::styled(" ⟳  ✓ ", Style::default().dim());
+    let used: usize =
+        left.iter().map(Span::width).sum::<usize>() + branch.width() + icons.width();
+    let pad = width.saturating_sub(used).max(1);
+    let mut spans = left;
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(branch);
+    spans.push(icons);
+    ListItem::new(Line::from(spans))
+}
+
+/// Columns the inline message box's input field spans (between the left
+/// border and the ✧ button).
+fn inline_field_width(pane_width: u16) -> u16 {
+    pane_width.saturating_sub(2 + 3)
+}
+
+/// A repo's inline message box, VS Code style: a 3-line bordered input with
+/// the ✧ suggest button at its right end.
+fn message_box_item(
+    repo: &Repo,
+    focused: bool,
+    theme: IconTheme,
+    width: usize,
+) -> ListItem<'static> {
+    let border = if focused {
+        Style::default().fg(BUTTON_BLUE)
+    } else {
+        Style::default().dim()
+    };
+    let horizontal = "─".repeat(width.saturating_sub(2));
+    let field = usize::from(inline_field_width(width as u16));
+
+    let content: Span = if repo.message.is_empty() && !focused {
+        let placeholder = truncate_to(
+            format!("Message (⏎ to commit on \"{}\")", repo.status.branch),
+            field,
+        );
+        Span::styled(placeholder, Style::default().dim().italic())
+    } else {
+        let start = repo.cursor.saturating_sub(field.saturating_sub(1));
+        let visible: String = repo.message.iter().skip(start).take(field.max(1)).collect();
+        Span::raw(visible)
+    };
+    let pad = field.saturating_sub(content.width());
+    let middle = Line::from(vec![
+        Span::styled("│", border),
+        content,
+        Span::raw(" ".repeat(pad)),
+        Span::raw(format!("{} ", sparkle_icon(theme))),
+        Span::styled("│", border),
+    ]);
+    ListItem::new(vec![
+        Line::from(Span::styled(format!("┌{horizontal}┐"), border)),
+        middle,
+        Line::from(Span::styled(format!("└{horizontal}┘"), border)),
+    ])
+}
+
+/// A repo's inline ✓ Commit button with the VS Code dropdown chevron at its
+/// right end; only the active repo's button is fully lit.
+fn commit_button_item(active: bool, focused: bool, width: usize) -> ListItem<'static> {
+    let (bg, fg) = match (active, focused) {
+        (true, true) => (BUTTON_BLUE_FOCUS, Color::White),
+        (true, false) => (BUTTON_BLUE, Color::White),
+        (false, _) => (Color::Rgb(0x24, 0x45, 0x5c), Color::Rgb(0x9a, 0xb2, 0xc2)),
+    };
+    let label = "✓ Commit";
+    let body_w = width.saturating_sub(2);
+    let left_pad = body_w.saturating_sub(label.chars().count()) / 2;
+    let right_pad = body_w.saturating_sub(left_pad + label.chars().count());
+    let mut style = Style::default().bg(bg).fg(fg);
+    if focused {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    ListItem::new(Line::from(vec![
+        Span::styled(
+            format!("{}{label}{}", " ".repeat(left_pad), " ".repeat(right_pad)),
+            style,
+        ),
+        Span::styled("│∨", style.dim()),
+    ]))
 }
 
 /// A collapsible section header; `count` renders as a right-aligned badge
@@ -1690,19 +2220,28 @@ mod tests {
 
     #[test]
     fn hints_wrap_instead_of_clipping() {
-        let hints = ["⏎ un/stage", "a all", "u none", "q quit"];
+        let hints = [("⏎", "stage"), ("a", "all"), ("u", "none"), ("q", "quit")];
         let wide = wrap_hints(&hints, 80, 0);
         assert_eq!(wide.len(), 1);
-        let narrow = wrap_hints(&hints, 18, 0);
+        let narrow = wrap_hints(&hints, 14, 0);
         assert!(narrow.len() >= 2, "narrow pane stacks hints");
         for line in &narrow {
-            assert!(line.width() <= 18, "no line exceeds the pane width");
+            assert!(line.width() <= 14, "no line exceeds the pane width");
         }
     }
 
     #[test]
     fn hints_never_exceed_four_lines() {
-        let hints = ["aaaa", "bbbb", "cccc", "dddd", "eeee", "ffff", "gggg", "hhhh"];
+        let hints = [
+            ("a", "aaa"),
+            ("b", "bbb"),
+            ("c", "ccc"),
+            ("d", "ddd"),
+            ("e", "eee"),
+            ("f", "fff"),
+            ("g", "ggg"),
+            ("h", "hhh"),
+        ];
         assert!(wrap_hints(&hints, 10, 0).len() <= 4);
     }
 

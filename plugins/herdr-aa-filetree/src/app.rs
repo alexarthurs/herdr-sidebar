@@ -1086,19 +1086,19 @@ impl App {
     }
 
     /// The hotkey hints for the current mode.
-    fn hints(&self) -> Vec<&'static str> {
+    fn hints(&self) -> Vec<(&'static str, &'static str)> {
         let mut hints = vec![
-            "↑↓ move",
-            "←→ fold",
-            "⏎ toggle",
-            "r refresh",
-            ". dotfiles",
-            "s settings",
-            "b collapse",
-            "q quit",
+            ("↑↓", "move"),
+            ("←→", "fold"),
+            ("⏎", "toggle"),
+            ("r", "refresh"),
+            (".", "dotfiles"),
+            ("s", "settings"),
+            ("b", "collapse"),
+            ("q", "quit"),
         ];
         if self.merged() {
-            hints.extend(["1 files", "2 git"]);
+            hints.extend([("1", "files"), ("2", "git")]);
         }
         hints
     }
@@ -1260,29 +1260,47 @@ fn gear_icon(theme: IconTheme) -> &'static str {
     }
 }
 
+/// Keycap chip colors for the footer hints — a subtle "keyboard key" look
+/// instead of a wall of dim text.
+const KEYCAP_BG: Color = Color::Rgb(0x32, 0x36, 0x3d);
+const KEYCAP_FG: Color = Color::Rgb(0xc9, 0xce, 0xd6);
+
+/// Rendered width of one `key label` hint: keycap padding + gap + label.
+fn hint_width(key: &str, label: &str) -> usize {
+    Span::raw(key).width() + 2 + 1 + Span::raw(label).width()
+}
+
 /// Pack hotkey hints into as many footer lines as they need at `width`
-/// (max 4), instead of clipping. `reserve` columns stay free on the LAST line
-/// (for the « collapse button). Copy-mirrored with herdr-aa-git's app.rs.
-fn wrap_hints(hints: &[&'static str], width: u16, reserve: u16) -> Vec<Line<'static>> {
+/// (max 4), instead of clipping — each as a keycap chip plus a dim label.
+/// `reserve` columns stay free on the LAST line (for the « collapse button).
+/// Copy-mirrored with herdr-aa-git's app.rs.
+fn wrap_hints(
+    hints: &[(&'static str, &'static str)],
+    width: u16,
+    reserve: u16,
+) -> Vec<Line<'static>> {
     let width = usize::from(width.max(8));
     let reserve = usize::from(reserve);
-    let mut lines: Vec<String> = vec![String::new()];
-    for hint in hints {
+    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut used: usize = 1;
+    for (key, label) in hints {
+        let w = hint_width(key, label);
         let full = lines.len() >= 4;
-        let current = lines.last_mut().unwrap();
-        if current.is_empty() {
-            *current = format!(" {hint}");
-            continue;
+        let empty = lines.last().is_some_and(Vec::is_empty);
+        if !empty && used + 2 + w > width.saturating_sub(reserve) && !full {
+            lines.push(Vec::new());
+            used = 1;
         }
-        let candidate_len = current.chars().count() + 2 + hint.chars().count();
-        if candidate_len <= width.saturating_sub(reserve) || full {
-            current.push_str("  ");
-            current.push_str(hint);
-        } else {
-            lines.push(format!(" {hint}"));
-        }
+        let line = lines.last_mut().unwrap();
+        line.push(Span::raw(if line.is_empty() { " " } else { "  " }));
+        line.push(Span::styled(
+            format!(" {key} "),
+            Style::default().bg(KEYCAP_BG).fg(KEYCAP_FG),
+        ));
+        line.push(Span::styled(format!(" {label}"), Style::default().dim()));
+        used += if line.len() == 3 { w } else { 2 + w };
     }
-    lines.into_iter().map(|l| Line::from(l.dim())).collect()
+    lines.into_iter().map(Line::from).collect()
 }
 
 /// Pane ids in the same tab as `my_pane_id` that belong to the `other` view
