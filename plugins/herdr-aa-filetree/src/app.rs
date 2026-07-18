@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
 use herdr_aa_filetree::icons::{IconTheme, icon};
 use herdr_aa_filetree::tree::{Row, Tree};
@@ -23,52 +23,40 @@ const SLIVER_TARGET: u16 = 5;
 /// Expanded width to restore when nothing better is known.
 const DEFAULT_EXPANDED_WIDTH: u16 = 32;
 
-/// Handle for resizing our own pane through the herdr CLI.
+/// Handle for resizing our own pane through the herdr socket API.
 struct PaneCtl {
-    herdr_bin: String,
     pane_id: String,
 }
 
 impl PaneCtl {
     fn from_env() -> Option<Self> {
         let pane_id = std::env::var("HERDR_PANE_ID").ok().filter(|id| !id.is_empty())?;
-        let herdr_bin = std::env::var("HERDR_BIN_PATH")
-            .ok()
-            .filter(|b| !b.is_empty())
-            .unwrap_or_else(|| "herdr".to_string());
-        Some(Self { herdr_bin, pane_id })
+        Some(Self { pane_id })
     }
 
-    /// Resize our pane to `target` terminal columns. `pane resize --amount` is
-    /// a split-RATIO delta, so the exact amount comes from the live layout via
-    /// [`herdr_aa_filetree::launch::resize_plan`]. Blocking on purpose: both CLI calls are
-    /// ~instant, and waiting avoids leaving zombie children behind on unix.
+    /// Resize our pane to `target` terminal columns over the socket API.
+    /// `pane.resize`'s amount is a split-RATIO delta, so the exact amount comes
+    /// from the live layout via [`herdr_aa_filetree::launch::resize_plan`].
     fn resize_to(&self, current: u16, target: u16) {
-        let layout = std::process::Command::new(&self.herdr_bin)
-            .args(["pane", "layout", "--pane", &self.pane_id])
-            .stderr(std::process::Stdio::null())
-            .output();
-        let Ok(layout) = layout else { return };
-        let layout_json = String::from_utf8_lossy(&layout.stdout);
+        let Ok(layout) = herdr_aa_filetree::ipc::call_text(
+            "pane.layout",
+            serde_json::json!({ "pane_id": self.pane_id }),
+        ) else {
+            return;
+        };
         let Some(step) =
-            herdr_aa_filetree::launch::resize_plan(&layout_json, &self.pane_id, current, target)
+            herdr_aa_filetree::launch::resize_plan(&layout, &self.pane_id, current, target)
         else {
             return;
         };
-        let _ = std::process::Command::new(&self.herdr_bin)
-            .args([
-                "pane",
-                "resize",
-                "--direction",
-                step.direction,
-                "--amount",
-                &format!("{:.4}", step.amount),
-                "--pane",
-                &self.pane_id,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let _ = herdr_aa_filetree::ipc::call_text(
+            "pane.resize",
+            serde_json::json!({
+                "pane_id": self.pane_id,
+                "direction": step.direction,
+                "amount": step.amount,
+            }),
+        );
     }
 }
 
@@ -286,13 +274,11 @@ impl App {
             return;
         }
 
-        let block = Block::bordered().title(" EXPLORER ".bold());
-        let inner = block.inner(frame.area());
-        frame.render_widget(block, frame.area());
-
+        // No own border/title: herdr already frames the pane and titles it with
+        // the pane label ("Explorer") — a second border read as a double frame.
         let [header, body, footer] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
-                .areas(inner);
+                .areas(frame.area());
         self.page = body.height.saturating_sub(1).max(1) as usize;
 
         // Root name on the left, the collapse button on the right.
@@ -327,7 +313,8 @@ impl App {
         );
     }
 
-    /// The collapsed strip: `»` on top, EXPLORER written sideways beneath it.
+    /// The collapsed strip: `»` on top, EXPLORER rotated 90° beneath it
+    /// (braille pixel art — terminals can't rotate real glyphs).
     fn draw_sliver(&mut self, frame: &mut Frame) {
         let height = frame.area().height as usize;
         let lines = sliver_lines(height);
@@ -362,22 +349,22 @@ fn row_item(row: &Row, theme: IconTheme) -> ListItem<'static> {
     ]))
 }
 
-/// True when a click at pane-local (column, row) lands on the `«` button, which
-/// sits in the 3-cell region at the right end of the header line (row 1, inside
-/// the border).
+/// True when a click at pane-local (column, row) lands on the `«` button: the
+/// 3-cell region at the right end of the header line (row 0 — the TUI draws no
+/// border of its own).
 fn hits_collapse_button(column: u16, row: u16, pane_width: u16) -> bool {
-    row == 1 && column >= pane_width.saturating_sub(4)
+    row == 0 && column >= pane_width.saturating_sub(4)
 }
 
 /// The sliver's lines for a pane of the given height: expand button on top,
-/// then E X P L O R E R vertically, truncated on tiny panes.
+/// then EXPLORER rotated 90° clockwise, truncated on tiny panes.
 fn sliver_lines(height: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = vec![
         Line::from("»".bold().fg(Color::LightBlue)),
         Line::raw(""),
     ];
-    for ch in "EXPLORER".chars().take(height.saturating_sub(2)) {
-        lines.push(Line::from(ch.to_string().bold().fg(Color::LightBlue)));
+    for row in herdr_aa_filetree::sideways::lines("EXPLORER", height.saturating_sub(2)) {
+        lines.push(Line::from(row.fg(Color::LightBlue)));
     }
     lines
 }
@@ -388,19 +375,18 @@ mod tests {
 
     #[test]
     fn collapse_button_hit_region_is_header_right_edge() {
-        assert!(hits_collapse_button(30, 1, 32));
-        assert!(hits_collapse_button(28, 1, 32));
-        assert!(!hits_collapse_button(27, 1, 32), "left of the button");
-        assert!(!hits_collapse_button(30, 0, 32), "border row");
-        assert!(!hits_collapse_button(30, 2, 32), "tree row");
+        assert!(hits_collapse_button(30, 0, 32));
+        assert!(hits_collapse_button(28, 0, 32));
+        assert!(!hits_collapse_button(27, 0, 32), "left of the button");
+        assert!(!hits_collapse_button(30, 1, 32), "tree row");
     }
 
     #[test]
-    fn sliver_spells_explorer_and_truncates_on_short_panes() {
+    fn sliver_has_expand_button_then_braille_and_truncates() {
         let lines = sliver_lines(20);
         let chars: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert_eq!(chars[0], "»");
-        assert_eq!(chars[2..], ["E", "X", "P", "L", "O", "R", "E", "R"]);
+        assert!(chars[2].chars().all(|c| ('\u{2800}'..='\u{28ff}').contains(&c)));
         assert_eq!(sliver_lines(5).len(), 5, "never exceeds the pane height");
     }
 }

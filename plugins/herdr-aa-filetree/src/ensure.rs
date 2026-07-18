@@ -167,9 +167,10 @@ fn open(panes_json: &str, focus_new: bool) -> std::io::Result<()> {
 
     if focus_new {
         focus(&new_pane)?;
-    } else if target == fid {
-        // The swap leaves focus with the LEFT SLOT, i.e. on the explorer when we
-        // split the focused pane — hand focus back to the displaced pane.
+    } else {
+        // Quiet mode must never move focus, but the split/swap can (focus
+        // follows the SLOT, not the pane) — unconditionally restore the pane
+        // that was focused when we started.
         focus(fid)?;
     }
     Ok(())
