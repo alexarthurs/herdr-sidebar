@@ -1,0 +1,27 @@
+[package]
+name = "herdr-aa-sidebar"
+version = "0.2.0"
+edition = "2024"
+description = "VS Code-style sidebar for herdr: file explorer + source control in one pane"
+license = "MIT"
+
+[lib]
+name = "herdr_aa_sidebar"
+path = "src/lib.rs"
+
+[[bin]]
+name = "herdr-aa-sidebar"
+path = "src/main.rs"
+
+# Windowless sidecar for [[events]] hooks: GUI subsystem on Windows (never owns a
+# console) talking to herdr's socket API directly — spawning console tools from a
+# hook flashes a Windows Terminal window per process on Windows 11.
+[[bin]]
+name = "herdr-aa-sidebar-ensure"
+path = "src/bin/ensure.rs"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -6,10 +6,15 @@ record it here in the relevant section before finishing the task, the way the Wi
 below were captured. If you're working in a feature worktree, commit the CLAUDE.md update on
 your branch so it lands on main with the merge.
 
-Two herdr plugins, VS Code-style panels for the terminal, each a **self-contained Rust crate**:
+One herdr plugin, a VS Code-style sidebar for the terminal, as a **self-contained Rust crate**:
 
-- `plugins/herdr-aa-filetree` — file explorer (VS Code Explorer, but a ratatui TUI in a herdr pane)
-- `plugins/herdr-aa-git` — source control panel (VS Code Source Control, same idea)
+- `plugins/herdr-aa-sidebar` — file explorer + source control in ONE binary (ratatui TUI).
+  Unified mode shows both views in a single "Sidebar" pane with an activity-bar switcher
+  (in-process, instant); the ⚙ settings can split them into separate Explorer /
+  Source Control panes (`--view explorer|git` pins a pane's starting view). `--preview`
+  runs the file-preview pane. Views live in `src/explorer_app.rs` / `src/scm_app.rs`
+  (bin modules); shared pieces (icons, ipc, launch parsing, state, ui helpers) are lib
+  modules — nothing is copy-mirrored anymore.
 
 There is deliberately **no root cargo workspace**: `herdr plugin install <owner>/<repo>/<subdir>`
 treats the subdirectory as the plugin root, and each plugin's `herdr-plugin.toml` points at
@@ -25,7 +30,7 @@ be kept in sync by hand — `icons.rs` (same emoji map in both) and the `launch.
 Run from inside the plugin directory, not the repo root:
 
 ```
-cd plugins/herdr-aa-filetree   # or plugins/herdr-aa-git
+cd plugins/herdr-aa-sidebar
 cargo build --release
 cargo test
 cargo clippy -- -D warnings
@@ -69,11 +74,11 @@ cargo clippy -- -D warnings
 - **Propagating a rebuild to every workspace**: plugin registration is global (one `plugin link`
   serves all workspaces), but stale panes keep old binaries AND a dead-but-open Explorer/Sidebar
   pane blocks the ensure hook's re-dock (it matches by label/token, not liveness). Run
-  `herdr plugin action invoke herdr-aa-filetree.redeploy-windows` after rebuilding: it closes
+  `herdr plugin action invoke herdr-aa-sidebar.redeploy-windows` after rebuilding: it closes
   every herdr-aa pane in every workspace, kills stragglers, and re-docks the focused workspace;
   the others re-dock via the focus hook the moment they're next visited.
 
-### herdr behavior findings (verified live by herdr-aa-filetree against herdr 0.7.1)
+### herdr behavior findings (verified live against herdr 0.7.1)
 
 Pane geometry & CLI semantics:
 
@@ -125,7 +130,7 @@ Console flashes from hooks (Windows 11, verified live):
   relative script **argument** (`scripts/x.vbs`) resolves — the *program* itself still cannot
   be a relative path (resolved against herdr's own dir).
 - Rebuilds fail while any plugin exe is running; stray TUI processes can outlive their closed
-  panes — `Get-Process herdr-aa-filetree | Stop-Process` before `cargo build --release`.
+  panes — `Get-Process herdr-aa-sidebar | Stop-Process` before `cargo build --release`.
 
 Socket API (what the CLI wraps; usable directly from plugins, no subprocess needed):
 
@@ -149,7 +154,7 @@ Pane identity & titles:
 
 - `pane.report_metadata {pane_id, source, tokens:{name:value}}` attaches **metadata tokens**
   that show up in `pane.list` — a durable pane identity that survives label changes. The
-  filetree TUI tags its pane this way so its detection works while the label is cleared.
+  sidebar TUI tags its pane this way so its detection works while the label is cleared.
 - `report_metadata` **MERGES** the token map: sending `tokens: {}` is a no-op, it does NOT
   clear previously-reported tokens. To remove a token, report it with an explicit **null
   value** (`tokens: {name: null}`) — verified live. A `source` can also report tokens whose
@@ -186,42 +191,30 @@ HACKING.md — budget time for that before promising a patched build.
 
 - Without keyboard-enhancement protocols (not enabled in herdr panes), **modifier+Enter is
   indistinguishable from plain Enter** in most Windows terminals — a "Ctrl+Enter" binding
-  silently means "Enter". Design keymaps so unmodified keys suffice (herdr-aa-git's commit
+  silently means "Enter". Design keymaps so unmodified keys suffice (the commit
   box accepts plain Enter for this reason).
 - Emoji with variation-selector (VS16) sequences render at inconsistent widths across
   terminal emulators and break column alignment — the shared icon map avoids them; keep it
   that way when adding icons.
 
-### Unified sidebar (both plugins, see each crate's `sidebar.rs`)
+### Unified sidebar (see `src/state.rs`)
 
-- Both panels can combine into one **"Sidebar"** pane with a VS Code-style activity bar.
-  User-facing wording is **"Unified sidebar: on/off"**, toggled in the ⚙ Settings modal
+- Both views ship in ONE binary: the activity bar switches them **in process** (instant,
+  no flash — the terminal session is held across switches). The old two-crate host/guest
+  process-swap protocol is gone.
+- User-facing wording is **"Unified sidebar: on/off"**, toggled in the ⚙ Settings modal
   (`s` key or the gear button) — never "merge"/"detach" in UI text, and the toggle is
-  deliberately silent (no footer flash; the layout change is the feedback).
-- The two views share the pane by **process swap**: the first binary is the HOST; switching
-  runs the other binary with `--sidebar-guest` in the same terminal and waits; the guest
-  exits with code 42 (`EXIT_SWITCH`) to hand back. The host restores the terminal before
-  spawning and re-inits after — two TUIs never own the pty at once.
-- The sticky setting lives in `%APPDATA%\herdr\aa-sidebar.json` (`{merged, active}`); a fresh
-  sidebar opens on the last-active view. `sidebar.rs`, `icons.rs`, and `ipc.rs` are
-  **copy-mirrored** between the crates (no shared workspace, deliberately) — edit both.
-- The Sidebar pane reports BOTH plugins' metadata tokens so either toggle action finds it;
-  turning unified off clears the other token (null value) and splits the other view back out.
-- Gotcha: after the ✨ suggestion lands, panel focus moves to the message box — letter keys
+  silent (the layout change is the feedback). Off spawns a second pane of the same binary
+  pinned with `--view`, and each pane pins to its own view.
+- The sticky setting lives in `%APPDATA%\herdra-sidebar.json` (`{merged, active}`); a
+  fresh sidebar opens on the last-active view.
+- The unified pane reports BOTH identity tokens (`herdr-aa-sidebar-explorer`,
+  `herdr-aa-sidebar-git`) so either launcher decision finds it; turning unified off clears
+  the other token (null value — report_metadata MERGES token maps).
+- Gotcha: after the ✧ suggestion lands, panel focus moves to the message box — letter keys
   then type text instead of triggering actions (Esc returns to the list).
 
-### Explorer specifics (herdr-aa-filetree)
-
-- Clicking a file (or Enter on it) opens it in a PREVIEW PANE beside the sidebar (the
-  tree stays visible): one viewer process (`herdr-aa-filetree --preview <control-file>`)
-  per tab, found by its `herdr-aa-filetree-preview` metadata token and steered through a
-  control file it polls every 250ms — further clicks reload in place, no pane churn. The
-  pane lands between sidebar and editor via split-right-neighbor + swap; `q`/Esc/✕ closes
-  it (the viewer pane.closes itself). Double-clicking a folder name toggles it (450ms
-  same-row window — crossterm has no native double-click event).
-- The activity bar row is 3 rows tall (blank padding above/below the icons).
-
-### Source Control panel specifics (herdr-aa-git)
+### Source Control view specifics (`src/scm_app.rs`)
 
 - **Multi-repo**: `Git::discover_all` lists the repo containing the cwd plus child repos two
   levels down (`.git` dir or file), skipping `target`/`node_modules`/`.claude` (the agent
@@ -235,8 +228,7 @@ HACKING.md — budget time for that before promising a patched build.
 - **Sync Changes** (`S` or the ⇅ button, shown only when ahead/behind ≠ 0): `pull --rebase
   --autostash` then `push`, on a background thread polled from tick(). Ahead/behind parse
   from the porcelain `## branch...upstream [ahead N, behind M]` header.
-- Footer hotkeys render as keycap chips (`wrap_hints` takes `(key, label)` pairs now —
-  copy-mirrored between the crates). The ✧ suggest button uses MDI "creation" (`\u{f0674}`,
+- Footer hotkeys render as keycap chips (`wrap_hints` takes `(key, label)` pairs, shared in `ui.rs`). The ✧ suggest button uses MDI "creation" (`\u{f0674}`,
   the outline ✨ silhouette) in the material theme.
 
 ### Verifying a plugin TUI end-to-end
