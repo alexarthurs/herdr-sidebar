@@ -2137,7 +2137,9 @@ impl App {
     }
 
     fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
-        let left = Span::styled(" ▾ CHANGES", Style::default().bold());
+        // "SOURCE CONTROL", like VS Code — the sections inside are already
+        // named Changes/Staged Changes, so the panel must not be too.
+        let left = Span::styled(" ▾ SOURCE CONTROL", Style::default().bold());
         // With several repos visible, the header names the one the commit box
         // and sync act on.
         let right_text = match self.active_repo() {
