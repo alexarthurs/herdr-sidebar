@@ -1087,7 +1087,7 @@ impl App {
         let footer_height = self.footer_height(frame.area().width);
         // A breathing row above and below the icons keeps the activity bar
         // from crowding the pane border.
-        let activity_height = if self.merged() { 2 } else { 0 };
+        let activity_height = if self.merged() { 3 } else { 0 };
         let [activity, header, body, footer] = Layout::vertical([
             Constraint::Length(activity_height),
             Constraint::Length(1),
@@ -1218,10 +1218,10 @@ impl App {
     }
 
     /// The VS Code activity bar: view-switcher icons plus a detach button.
-    /// The area is two rows tall — icons on the first (the pane border
-    /// above provides the top gap), a blank spacer below.
+    /// The area is three rows tall — icons on the middle one, one blank
+    /// spacer row each side.
     fn draw_activity_bar(&mut self, frame: &mut Frame, area: Rect) {
-        let area = Rect::new(area.x, area.y, area.width, 1);
+        let area = Rect::new(area.x, area.y + 1, area.width, 1);
         let (exp_icon, git_icon) = activity_icons(self.theme);
         let active = |on: bool| {
             if on {
