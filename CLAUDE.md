@@ -235,8 +235,14 @@ HACKING.md — budget time for that before promising a patched build.
 - **Sync Changes** (`S` or the ⇅ button, shown only when ahead/behind ≠ 0): `pull --rebase
   --autostash` then `push`, on a background thread polled from tick(). Ahead/behind parse
   from the porcelain `## branch...upstream [ahead N, behind M]` header.
-- Footer hotkeys render as keycap chips (`wrap_hints` takes `(key, label)` pairs, shared in `ui.rs`). The ✧ suggest button uses MDI "creation" (`\u{f0674}`,
+- Hotkey hints render as keycap chips (`wrap_hints` takes `(key, label)` pairs, shared in
+  `ui.rs`). They live in the ⚙ Settings modal; the FOOTER copy is opt-in via the
+  "Footer hotkeys" setting (persisted as `hotkeys` in `aa-sidebar.json`, default hidden —
+  it clipped in narrow panes). The ✧ suggest button uses MDI "creation" (`\u{f0674}`,
   the outline ✨ silhouette) in the material theme.
+- **Esc must never exit a sidebar TUI** — a stray Esc used to drop the pane back to the
+  shell prompt (user-reported). Esc closes overlays, then closes the tab's preview pane
+  (`viewer::close_in_tab`); only `q` quits.
 
 ### Diff preview
 

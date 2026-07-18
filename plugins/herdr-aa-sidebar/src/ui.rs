@@ -34,9 +34,8 @@ pub fn wrap_hints(
     let mut used: usize = 1;
     for (key, label) in hints {
         let w = hint_width(key, label);
-        let full = lines.len() >= 4;
         let empty = lines.last().is_some_and(Vec::is_empty);
-        if !empty && used + 2 + w > width.saturating_sub(reserve) && !full {
+        if !empty && used + 2 + w > width.saturating_sub(reserve) {
             lines.push(Vec::new());
             used = 1;
         }
@@ -179,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn hints_never_exceed_four_lines() {
+    fn hints_have_no_line_cap() {
         let hints = [
             ("a", "aaa"),
             ("b", "bbb"),
@@ -190,7 +189,13 @@ mod tests {
             ("g", "ggg"),
             ("h", "hhh"),
         ];
-        assert!(wrap_hints(&hints, 10, 0).len() <= 4);
+        // Every chip lands on its own line rather than overflowing the
+        // width — there is no line cap to clip against anymore.
+        let lines = wrap_hints(&hints, 10, 0);
+        assert_eq!(lines.len(), hints.len());
+        for line in &lines {
+            assert!(line.width() <= 10, "no line exceeds the pane width");
+        }
     }
 
     #[test]

@@ -411,6 +411,16 @@ pub fn open_in_pane(my_pane_id: &str, spawn_cwd: &Path, payload: &str) -> Result
     spawn_viewer_pane(my_pane_id, spawn_cwd, &control)
 }
 
+/// Close this tab's viewer pane if one is open (Esc from the sidebar).
+pub fn close_in_tab(my_pane_id: &str) {
+    let Ok(json) = ipc::call_text("pane.list", serde_json::json!({})) else {
+        return;
+    };
+    if let Some((id, _)) = viewer_pane_in_tab(&json, my_pane_id) {
+        let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }));
+    }
+}
+
 /// The viewer pane in the same tab, by metadata token, plus whether its
 /// heartbeat says it is DEAD (`(pane_id, stale)`).
 fn viewer_pane_in_tab(pane_list_json: &str, my_pane_id: &str) -> Option<(String, bool)> {

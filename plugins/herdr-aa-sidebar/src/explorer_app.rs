@@ -161,6 +161,7 @@ enum Setting {
     UnifiedSidebar,
     IconTheme,
     HiddenFiles,
+    Hotkeys,
 }
 
 /// (setting, label, current value, enabled) — disabled rows render dimmed and
@@ -357,7 +358,8 @@ impl App {
         if on == self.merged() || self.other_exe.is_none() {
             return;
         }
-        self.sidebar_state = sidebar::State { merged: on, active: MY_VIEW };
+        self.sidebar_state =
+            sidebar::State { merged: on, active: MY_VIEW, ..self.sidebar_state };
         sidebar::save_state(self.sidebar_state);
         self.apply_identity();
         if on {
@@ -445,7 +447,9 @@ impl App {
             return None;
         }
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Some(Exit::Quit),
+            KeyCode::Char('q') => return Some(Exit::Quit),
+            // Esc never quits the sidebar — it closes the preview instead.
+            KeyCode::Esc => self.close_preview(),
             KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
             KeyCode::PageUp => self.move_by(-(self.page as isize)),
@@ -768,6 +772,12 @@ impl App {
                 if self.tree.show_hidden { "shown" } else { "hidden" }.to_string(),
                 true,
             ),
+            (
+                Setting::Hotkeys,
+                "Footer hotkeys",
+                if self.show_hotkeys() { "shown" } else { "hidden" }.to_string(),
+                true,
+            ),
         ]
     }
 
@@ -790,18 +800,25 @@ impl App {
                 self.tree.show_hidden = !self.tree.show_hidden;
                 self.rebuild();
             }
+            Setting::Hotkeys => {
+                self.sidebar_state.show_hotkeys = !self.sidebar_state.show_hotkeys;
+                sidebar::save_state(self.sidebar_state);
+            }
         }
     }
 
     /// Render the centered Settings popup and remember its rect for clicks.
     fn draw_settings(&mut self, frame: &mut Frame) {
         let rows = self.settings_rows();
+        // The hotkey reference lives here now; the footer chips are opt-in.
+        let hint_lines = wrap_hints(&self.hints(), 28, 0);
         let Some(Overlay::Settings { selected, rect }) = self.overlay.as_mut() else {
             return;
         };
         let area = frame.area();
         let width = 30.min(area.width);
-        let height = (rows.len() as u16 + 3).min(area.height);
+        let height =
+            (rows.len() as u16 + 5 + hint_lines.len() as u16).min(area.height);
         let popup = Rect::new(
             (area.width.saturating_sub(width)) / 2,
             (area.height.saturating_sub(height)) / 3,
@@ -824,6 +841,9 @@ impl App {
             };
             lines.push(Line::styled(text, style));
         }
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(" Hotkeys", Style::default().bold())));
+        lines.extend(hint_lines);
         lines.push(Line::from(" click/⏎ toggle · esc close".dim()));
 
         frame.render_widget(Clear, popup);
@@ -1114,7 +1134,10 @@ impl App {
                         .unwrap_or_default();
                     vec![format!(" Delete '{name}' permanently? (y/N)").fg(Color::Red).into()]
                 }
-                _ => wrap_hints(&self.hints(), frame.area().width, 3),
+                _ if self.show_hotkeys() => {
+                    wrap_hints(&self.hints(), frame.area().width, 3)
+                }
+                _ => Vec::new(),
             }
         };
         frame.render_widget(Paragraph::new(footer_lines), footer);
@@ -1146,6 +1169,18 @@ impl App {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
+    /// The persisted "show hotkeys in the footer" setting.
+    fn show_hotkeys(&self) -> bool {
+        self.sidebar_state.show_hotkeys
+    }
+
+    /// Esc: close the preview pane beside us, if one is open.
+    fn close_preview(&mut self) {
+        if let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) {
+            herdr_aa_sidebar::viewer::close_in_tab(&pane_id);
+        }
+    }
+
     /// The hotkey hints for the current mode.
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         let mut hints = vec![
@@ -1167,8 +1202,8 @@ impl App {
     /// Rows the footer needs at `width` (the hint lines; notices and prompts
     /// always fit in one of them).
     fn footer_height(&self, width: u16) -> u16 {
-        if self.notice.is_some() || self.overlay.is_some() {
-            return 1;
+        if self.notice.is_some() || self.overlay.is_some() || !self.show_hotkeys() {
+            return 1; // notices, prompts, and the « button share one line
         }
         wrap_hints(&self.hints(), width, 3).len() as u16
     }

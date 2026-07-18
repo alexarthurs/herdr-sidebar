@@ -184,6 +184,8 @@ impl Row {
     fn height(self) -> u16 {
         match self {
             Row::Message(_) => 3,
+            // A breathing row above and below the button.
+            Row::Commit(_) => 3,
             _ => 1,
         }
     }
@@ -239,6 +241,7 @@ enum Overlay {
 enum Setting {
     UnifiedSidebar,
     IconTheme,
+    Hotkeys,
 }
 
 /// (setting, label, current value, enabled) — disabled rows render dimmed and
@@ -732,7 +735,9 @@ impl App {
 
     fn on_list_key(&mut self, key: KeyEvent) -> Option<Exit> {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Some(Exit::Quit),
+            KeyCode::Char('q') => return Some(Exit::Quit),
+            // Esc never quits the sidebar — it closes the preview instead.
+            KeyCode::Esc => self.close_preview(),
             KeyCode::Tab => self.focus = Focus::Message,
             KeyCode::BackTab => self.focus = Focus::Commit,
             KeyCode::Char('c') => self.focus = Focus::Message,
@@ -844,7 +849,12 @@ impl App {
                     }
                     self.follow_selection();
                 }
-                Row::Commit(r) => self.commit_repo(r),
+                Row::Commit(r) => {
+                    // Only the button line commits — not its padding rows.
+                    if line == 1 {
+                        self.commit_repo(r);
+                    }
+                }
                 Row::RepoHeader(r) => {
                     self.focus = Focus::List;
                     self.select(index);
@@ -1085,6 +1095,12 @@ impl App {
                 .to_string(),
                 true,
             ),
+            (
+                Setting::Hotkeys,
+                "Footer hotkeys",
+                if self.show_hotkeys() { "shown" } else { "hidden" }.to_string(),
+                true,
+            ),
         ]
     }
 
@@ -1103,18 +1119,25 @@ impl App {
                 self.set_unified(on);
             }
             Setting::IconTheme => self.theme = self.theme.toggled(),
+            Setting::Hotkeys => {
+                self.sidebar_state.show_hotkeys = !self.sidebar_state.show_hotkeys;
+                sidebar::save_state(self.sidebar_state);
+            }
         }
     }
 
     /// Render the centered Settings popup and remember its rect for clicks.
     fn draw_settings(&mut self, frame: &mut Frame) {
         let rows = self.settings_rows();
+        // The hotkey reference lives here now; the footer chips are opt-in.
+        let hint_lines = wrap_hints(&self.hints(), 28, 0);
         let Some(Overlay::Settings { selected, rect }) = self.overlay.as_mut() else {
             return;
         };
         let area = frame.area();
         let width = 30.min(area.width);
-        let height = (rows.len() as u16 + 3).min(area.height);
+        let height =
+            (rows.len() as u16 + 5 + hint_lines.len() as u16).min(area.height);
         let popup = Rect::new(
             (area.width.saturating_sub(width)) / 2,
             (area.height.saturating_sub(height)) / 3,
@@ -1137,6 +1160,9 @@ impl App {
             };
             lines.push(Line::styled(text, style));
         }
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(" Hotkeys", Style::default().bold())));
+        lines.extend(hint_lines);
         lines.push(Line::from(" click/⏎ toggle · esc close".dim()));
 
         frame.render_widget(Clear, popup);
@@ -1245,7 +1271,8 @@ impl App {
         if on == self.merged() || self.other_exe.is_none() {
             return;
         }
-        self.sidebar_state = sidebar::State { merged: on, active: MY_VIEW };
+        self.sidebar_state =
+            sidebar::State { merged: on, active: MY_VIEW, ..self.sidebar_state };
         sidebar::save_state(self.sidebar_state);
         self.apply_identity();
         if on {
@@ -1529,7 +1556,7 @@ impl App {
         // when there is something to sync (or a sync is running).
         let multi = self.multi();
         let message_height = if multi { 0 } else { 3 };
-        let button_height = u16::from(!multi);
+        let button_height = if multi { 0 } else { 3 };
         let sync_height = u16::from(!multi && self.sync_label().is_some());
         let footer_lines = self.footer_lines(area.width);
         // A breathing row above and below the icons keeps the activity bar
@@ -1693,7 +1720,8 @@ impl App {
             None => (Vec::new(), 0, String::new()),
         };
         if message.is_empty() && !focused {
-            let placeholder = format!("Message (⏎ to commit on \"{branch}\")");
+            let placeholder =
+                message_placeholder(&branch, usize::from(text_area.width));
             frame.render_widget(Paragraph::new(placeholder).dim().italic(), text_area);
             return;
         }
@@ -1718,8 +1746,14 @@ impl App {
         if focused {
             style = style.add_modifier(Modifier::BOLD);
         }
-        frame.render_widget(Paragraph::new("✓ Commit").centered().style(style), area);
-        self.zones.button = area;
+        // A breathing row above and below, like the inline variant.
+        let inner = if area.height >= 3 {
+            Rect::new(area.x, area.y + 1, area.width, 1)
+        } else {
+            area
+        };
+        frame.render_widget(Paragraph::new("✓ Commit").centered().style(style), inner);
+        self.zones.button = inner;
     }
 
     /// The Sync Changes label, or `None` while there is nothing to sync
@@ -1869,6 +1903,14 @@ impl App {
                 Style::default().fg(color),
             )];
         }
+        if !self.show_hotkeys() {
+            return Vec::new();
+        }
+        wrap_hints(&self.hints(), width, 0)
+    }
+
+    /// The hotkey hints, shown in Settings (and optionally the footer).
+    fn hints(&self) -> Vec<(&'static str, &'static str)> {
         let mut hints: Vec<(&'static str, &'static str)> = vec![
             ("⏎", "stage"),
             ("a", "all"),
@@ -1884,7 +1926,19 @@ impl App {
         if self.merged() {
             hints.extend([("1", "files"), ("2", "git")]);
         }
-        wrap_hints(&hints, width, 0)
+        hints
+    }
+
+    /// The persisted "show hotkeys in the footer" setting.
+    fn show_hotkeys(&self) -> bool {
+        self.sidebar_state.show_hotkeys
+    }
+
+    /// Esc: close the preview pane beside us, if one is open.
+    fn close_preview(&mut self) {
+        if let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) {
+            herdr_aa_sidebar::viewer::close_in_tab(&pane_id);
+        }
     }
 
     /// Render the context-menu popup near its anchor, clamped inside the pane,
@@ -1987,6 +2041,21 @@ fn inline_field_width(pane_width: u16) -> u16 {
     pane_width.saturating_sub(2 + 3)
 }
 
+/// Width-aware commit placeholder: drop detail rather than clipping
+/// mid-word when the pane is narrow.
+fn message_placeholder(branch: &str, width: usize) -> String {
+    for text in [
+        format!("Message (⏎ to commit on \"{branch}\")"),
+        "Message (⏎ to commit)".to_string(),
+        "Message".to_string(),
+    ] {
+        if Span::raw(text.as_str()).width() <= width {
+            return text;
+        }
+    }
+    String::new()
+}
+
 /// A repo's inline message box, VS Code style: a 3-line bordered input with
 /// the ✧ suggest button at its right end.
 fn message_box_item(
@@ -2004,10 +2073,7 @@ fn message_box_item(
     let field = usize::from(inline_field_width(width as u16));
 
     let content: Span = if repo.message.is_empty() && !focused {
-        let placeholder = truncate_to(
-            format!("Message (⏎ to commit on \"{}\")", repo.status.branch),
-            field,
-        );
+        let placeholder = message_placeholder(&repo.status.branch, field);
         Span::styled(placeholder, Style::default().dim().italic())
     } else {
         let start = repo.cursor.saturating_sub(field.saturating_sub(1));
@@ -2045,13 +2111,17 @@ fn commit_button_item(active: bool, focused: bool, width: usize) -> ListItem<'st
     if focused {
         style = style.add_modifier(Modifier::BOLD);
     }
-    ListItem::new(Line::from(vec![
-        Span::styled(
-            format!("{}{label}{}", " ".repeat(left_pad), " ".repeat(right_pad)),
-            style,
-        ),
-        Span::styled("│∨", style.dim()),
-    ]))
+    ListItem::new(vec![
+        Line::default(),
+        Line::from(vec![
+            Span::styled(
+                format!("{}{label}{}", " ".repeat(left_pad), " ".repeat(right_pad)),
+                style,
+            ),
+            Span::styled("│∨", style.dim()),
+        ]),
+        Line::default(),
+    ])
 }
 
 /// A collapsible section header; `count` renders as a right-aligned badge

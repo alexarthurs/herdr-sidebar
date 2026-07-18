@@ -107,11 +107,14 @@ impl View {
 pub struct State {
     pub merged: bool,
     pub active: View,
+    /// Show the hotkey chips at the bottom of the sidebar (they always
+    /// live in the ⚙ Settings modal; the footer copy is opt-in).
+    pub show_hotkeys: bool,
 }
 
 impl Default for State {
     fn default() -> Self {
-        Self { merged: false, active: View::Explorer }
+        Self { merged: false, active: View::Explorer, show_hotkeys: false }
     }
 }
 
@@ -142,9 +145,10 @@ pub fn save_state(state: State) {
         let _ = std::fs::create_dir_all(dir);
     }
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\"}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{}}}",
         state.merged,
-        state.active.state_name()
+        state.active.state_name(),
+        state.show_hotkeys
     );
     let _ = std::fs::write(path, json);
 }
@@ -164,6 +168,10 @@ pub fn parse_state(json: &str) -> State {
             .and_then(|v| v.as_str())
             .and_then(View::from_state_name)
             .unwrap_or(default.active),
+        show_hotkeys: value
+            .get("hotkeys")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.show_hotkeys),
     }
 }
 
@@ -173,8 +181,10 @@ mod tests {
 
     #[test]
     fn state_roundtrip_and_forgiving_parse() {
-        let state = State { merged: true, active: View::SourceControl };
-        let json = "{\"merged\":true,\"active\":\"source-control\"}";
+        let state =
+            State { merged: true, active: View::SourceControl, show_hotkeys: true };
+        let json =
+            "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         assert_eq!(parse_state("garbage"), State::default());
