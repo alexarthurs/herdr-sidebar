@@ -141,6 +141,53 @@ enum DrawerRef {
 }
 
 /// Parse the actionable reference out of one drawer line.
+/// Display form of a `git worktree list` line: the folder NAME plus its
+/// branch — the raw absolute path clipped uselessly in a narrow pane.
+fn pretty_worktree_line(raw: &str) -> String {
+    let path = raw.split_whitespace().next().unwrap_or("");
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    if let (Some(start), Some(end)) = (raw.find('['), raw.rfind(']'))
+        && start < end
+    {
+        return format!("{name}  ⎇ {}", &raw[start + 1..end]);
+    }
+    if raw.contains("(bare)") {
+        return format!("{name}  (bare)");
+    }
+    if raw.contains("detached") {
+        return format!("{name}  (detached)");
+    }
+    name.to_string()
+}
+
+/// Display form of a remote line: `name  owner/repo` for hosted URLs (the
+/// interesting part), the folder name for local-path remotes.
+fn pretty_remote_line(raw: &str) -> String {
+    let mut it = raw.split_whitespace();
+    match (it.next(), it.next()) {
+        (Some(name), Some(url)) => format!("{name}  {}", pretty_remote_url(url)),
+        _ => raw.to_string(),
+    }
+}
+
+fn pretty_remote_url(url: &str) -> String {
+    let trimmed = url.trim_end_matches('/').trim_end_matches(".git");
+    let hosted = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .or_else(|| trimmed.strip_prefix("git@"));
+    if let Some(rest) = hosted {
+        // git@host:owner/repo and host/owner/repo both → owner/repo.
+        let rest = rest.replace(':', "/");
+        return match rest.split_once('/') {
+            Some((_host, path)) if !path.is_empty() => path.to_string(),
+            _ => rest,
+        };
+    }
+    // A local-path remote: its folder name is the recognizable bit.
+    trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed).to_string()
+}
+
 fn parse_drawer_ref(kind: Drawer, line: &str) -> DrawerRef {
     match kind {
         Drawer::Graph | Drawer::Commits | Drawer::FileHistory => line
@@ -723,6 +770,15 @@ impl App {
             };
             let panel = &mut self.drawers[kind.index()];
             panel.refs = panel.lines.iter().map(|l| parse_drawer_ref(kind, l)).collect();
+            match kind {
+                Drawer::Worktrees => {
+                    panel.lines = panel.lines.iter().map(|l| pretty_worktree_line(l)).collect();
+                }
+                Drawer::Remotes => {
+                    panel.lines = panel.lines.iter().map(|l| pretty_remote_line(l)).collect();
+                }
+                _ => {}
+            }
         }
     }
 
@@ -2860,6 +2916,32 @@ mod tests {
             DrawerRef::Worktree("C:/Users/x/proj".into())
         );
         assert_eq!(parse_drawer_ref(Drawer::Worktrees, "(none)"), DrawerRef::None);
+    }
+
+    #[test]
+    fn drawer_lines_prettify_for_display() {
+        assert_eq!(
+            pretty_worktree_line("C:/Users/x/Projects/herdr  7c12b6d [main]"),
+            "herdr  ⎇ main"
+        );
+        assert_eq!(
+            pretty_worktree_line("C:/x/wt-fix  1a2b3c4 (detached HEAD)"),
+            "wt-fix  (detached)"
+        );
+        assert_eq!(pretty_worktree_line("(none)"), "(none)");
+        assert_eq!(
+            pretty_remote_line("origin  https://github.com/alexarthurs/herdr-aa-sidebar.git"),
+            "origin  alexarthurs/herdr-aa-sidebar"
+        );
+        assert_eq!(
+            pretty_remote_line("up  git@github.com:me/repo.git"),
+            "up  me/repo"
+        );
+        assert_eq!(
+            pretty_remote_line("origin  C:/Users/x/Projects/.demo-origin.git"),
+            "origin  .demo-origin"
+        );
+        assert_eq!(pretty_remote_line("(none)"), "(none)");
     }
 
     #[test]

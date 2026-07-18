@@ -328,6 +328,15 @@ Hard-won capture gotchas:
   timeout, and fall back to `resize_wt_async.ps1` (`SetWindowPos` with SWP_ASYNCWINDOWPOS)
   if MoveWindow wedges.
 
+## SCM playground repo
+
+`C:/Users/Alex/Projects/scm-playground` is a PERSISTENT sandbox for exercising the Source
+Control view without touching real repos: branches, a second worktree
+(`scm-playground-search`), two stashes, two tags, a local bare `origin`
+(`.scm-playground-origin.git`, main 1 ahead) plus a `github` remote URL, and a
+staged/modified/untracked spread. Rebuild it any time with `tools/setup-playground.sh`
+(destructive: wipes and recreates all three directories).
+
 ## Herdr workspace
 
 `herdr-layout.yaml` at the repo root describes the workspace (Coordinator tab running claude,
