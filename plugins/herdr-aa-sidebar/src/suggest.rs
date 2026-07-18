@@ -57,7 +57,7 @@ fn ask_claude(diff: &str) -> Option<String> {
 
     for program in candidates {
         let spawned = std::process::Command::new(program)
-            .args(["-p", "--model", "haiku", PROMPT])
+            .args(["-p", "--model", "haiku", "--strict-mcp-config", PROMPT])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -100,13 +100,18 @@ fn wait_with_timeout(mut child: std::process::Child) -> Option<String> {
     clean_reply(&out)
 }
 
-/// First non-empty line, stripped of the quoting/fencing chat models sometimes
-/// add despite instructions; `None` when nothing usable came back.
+/// The reply line, stripped of the quoting/fencing chat models sometimes add
+/// despite instructions; `None` when nothing usable came back. Startup log
+/// noise (MCP warnings and the like) can precede the reply on stdout, so this
+/// takes the LAST usable line and drops warning-looking lines outright.
 fn clean_reply(raw: &str) -> Option<String> {
-    let line = raw
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with("```"))?;
+    let line = raw.lines().map(str::trim).rfind(|l| {
+        let lower = l.to_lowercase();
+        !l.is_empty()
+            && !l.starts_with("```")
+            && !lower.contains("warn")
+            && !lower.contains("error")
+    })?;
     let line = line.trim_matches(['"', '\'', '`']).trim_end_matches('.').trim();
     (!line.is_empty()).then(|| line.to_string())
 }
@@ -136,6 +141,12 @@ mod tests {
             Some("Refactor launch flow".into())
         );
         assert_eq!(clean_reply("   \n\n"), None);
+        // Log noise before (or instead of) the reply must never win.
+        assert_eq!(
+            clean_reply("RendererWarning resource UID duplicate\nAdd auth docs\n"),
+            Some("Add auth docs".into())
+        );
+        assert_eq!(clean_reply("[WARN] something\nERROR: nope\n"), None);
     }
 
     #[test]

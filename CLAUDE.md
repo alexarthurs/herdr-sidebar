@@ -262,6 +262,53 @@ capture with `pane read <id> --source visible`, and confirm side effects with pl
 commands in the scratch repo. Close the pane when done. Cheap, and it catches layout
 truncation bugs unit tests can't.
 
+## README screenshots (how-to)
+
+The framed screenshots in `plugins/herdr-aa-sidebar/docs/media/` are produced with the
+scripts in `tools/screenshots/` (capture → crop → frame). Full reshoot procedure, verified
+end-to-end twice:
+
+1. **Window**: `resize_wt.ps1 1760 996` (note the size it prints as "was" and RESTORE it
+   afterwards — the user's own size drifts between shoots). All shots assume 1760×996;
+   the crop for it is `crop.ps1 <raw> <out> 8 48 1744 940` (keeps herdr's full chrome —
+   tab strip + spaces/agents sidebar — and drops the WT titlebar).
+2. **Demo repo**: `setup_demo.sh` rebuilds `C:/Users/Alex/Projects/acme-app` (staged
+   docs/auth.md, modified routes.rs, dirty `acme-sdk` child repo, 1 commit ahead of a bare
+   `.acme-origin.git`) — multi-repo + sync + diff all have something to show.
+3. **Stage**: new tab in this workspace with `--cwd` = acme-app, `herdr tab focus` it,
+   invoke `herdr-aa-sidebar.open-sidebar-windows`, close the tab's shell pane.
+4. **Shots** (drive via `pane send-keys`, capture via `capture.ps1 <raw.png>`):
+   *preview* — explorer view, expand src/api (`Down Down Enter`, `Down Enter`), select
+   routes.rs, Enter opens the preview pane. *scm* — `2`, Down×4 to routes.rs, `o` opens
+   the diff. *separated* — `s`, Enter toggles unified off (capture, then toggle back).
+   *hero* — explorer view, Esc closes the preview, split a 2×2 agent grid to the right
+   (0.25 sidebar split, then 0.5, then two down-splits), `claude` + `codex --model gpt-5.5`
+   workers with prompts, fresh `claude` and `codex` for the spawn banners. *settings* —
+   `s` over the hero layout.
+5. **Frame**: `python tools/screenshots/frame_all.py <dir with crop-*.png>` writes the
+   framed set straight into docs/media (gradient backdrop + macOS-style titlebar).
+6. **Teardown**: close the tab, PEB-scan-kill any process whose cwd is under acme-app
+   (see the feature-worktree skill for the snippet), delete acme-app + .acme-origin.git,
+   restore the window size.
+
+Hard-won capture gotchas:
+
+- `capture.ps1` is a **screen-space** copy of the WT window rect: whatever overlays that
+  region wins the pixels. A fullscreen game on the same monitor, or WT itself hung
+  ("Not Responding" — happened during a GPU/TDR wedge), silently yields garbage frames;
+  **verify every capture by actually viewing it** before shipping.
+- The visible tab is whatever the WT window shows — `herdr tab focus <staging tab>` first,
+  and re-check before each capture; pane closes/spawns can bounce focus to another tab.
+- Claude's welcome banner is width-dependent: ≲60 cols renders the compact box (no email),
+  wider panes render the two-column banner **including the user's email** — keep agent
+  panes narrow (even 2×2 columns) or blur with `blur_region.py <img> <x> <y> <w> <h>`.
+- Codex: `pane run` delivers the prompt via bracketed paste — send a separate
+  `pane send-keys <pane> Enter` to submit. Capture fresh codex panes quickly; an
+  intermittent MCP 401 warning can appear ~8s after spawn.
+- WT resize calls block while WT's UI thread is busy (modal loops, drags, hangs) — use a
+  timeout, and fall back to `resize_wt_async.ps1` (`SetWindowPos` with SWP_ASYNCWINDOWPOS)
+  if MoveWindow wedges.
+
 ## Herdr workspace
 
 `herdr-layout.yaml` at the repo root describes the workspace (Coordinator tab running claude,

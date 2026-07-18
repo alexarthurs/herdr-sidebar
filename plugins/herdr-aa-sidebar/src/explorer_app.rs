@@ -363,7 +363,13 @@ impl App {
         sidebar::save_state(self.sidebar_state);
         self.apply_identity();
         if on {
+            // Mirror the detach growth: absorbing the sibling leaves the
+            // survivor at roughly double width — shrink back to one panel.
+            let width = self.last_width;
             self.close_other_standalone_pane();
+            if let Some(ctl) = &self.pane_ctl {
+                ctl.resize_to(width.saturating_mul(2).saturating_add(1), width);
+            }
         } else {
             self.spawn_other_pane();
         }

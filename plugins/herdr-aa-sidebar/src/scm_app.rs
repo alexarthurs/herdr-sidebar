@@ -180,16 +180,6 @@ impl Row {
         }
     }
 
-    /// Screen lines this row occupies (the inline message box is bordered).
-    fn height(self) -> u16 {
-        match self {
-            Row::Message(_) => 3,
-            // A breathing row above and below the button.
-            Row::Commit(_) => 3,
-            _ => 1,
-        }
-    }
-
     /// Keyboard navigation (j/k, wheel) skips widget rows — they are clicked,
     /// like VS Code's inputs, not list entries.
     fn selectable(self) -> bool {
@@ -1276,7 +1266,13 @@ impl App {
         sidebar::save_state(self.sidebar_state);
         self.apply_identity();
         if on {
+            // Mirror the detach growth: absorbing the sibling leaves the
+            // survivor at roughly double width — shrink back to one panel.
+            let width = self.last_width;
             self.close_other_standalone_pane();
+            if let Some(ctl) = &self.pane_ctl {
+                ctl.resize_to(width.saturating_mul(2).saturating_add(1), width);
+            }
         } else {
             self.spawn_other_pane();
         }
@@ -1501,15 +1497,43 @@ impl App {
         self.refresh();
     }
 
+    /// Screen lines a row occupies; the inline message boxes grow with
+    /// their (wrapped) message, up to [`MESSAGE_MAX_ROWS`] content rows.
+    fn row_height(&self, row: Row) -> u16 {
+        match row {
+            Row::Message(r) => 2 + self.message_rows_inline(r) as u16,
+            // A breathing row above and below the button.
+            Row::Commit(_) => 3,
+            _ => 1,
+        }
+    }
+
+    /// Content rows repo `r`'s inline message box shows right now.
+    fn message_rows_inline(&self, r: usize) -> usize {
+        let Some(repo) = self.repos.get(r) else { return 1 };
+        let field = usize::from(inline_field_width(self.last_width));
+        wrap_message(&repo.message, repo.cursor, field).0.len().min(MESSAGE_MAX_ROWS)
+    }
+
+    /// Content rows the single-repo message box shows at `width`.
+    fn single_message_rows(&self, width: u16) -> usize {
+        let sparkle_w = Span::raw(sparkle_icon(self.theme)).width() + 1;
+        let field = usize::from(width).saturating_sub(2 + sparkle_w).max(1);
+        match self.active_repo() {
+            Some(r) => wrap_message(&r.message, r.cursor, field).0.len().min(MESSAGE_MAX_ROWS),
+            None => 1,
+        }
+    }
+
     /// The visible row at a pane-local mouse row plus the line within it
-    /// (rows vary in height: the inline message boxes are 3 lines tall).
+    /// (rows vary in height: message boxes and buttons span several lines).
     fn row_hit(&self, mouse_row: u16) -> Option<(usize, u16)> {
         if mouse_row < self.body.top || mouse_row >= self.body.top + self.body.height {
             return None;
         }
         let mut y = self.body.top;
         for index in self.body.offset..self.rows.len() {
-            let h = self.rows[index].height();
+            let h = self.row_height(self.rows[index]);
             if mouse_row < y + h {
                 return Some((index, mouse_row - y));
             }
@@ -1530,7 +1554,7 @@ impl App {
             if i == index {
                 return (y < self.body.top + self.body.height).then_some(y);
             }
-            y += self.rows[i].height();
+            y += self.row_height(self.rows[i]);
         }
         None
     }
@@ -1555,7 +1579,8 @@ impl App {
         // view keeps them fixed at the top. The Sync Changes row only appears
         // when there is something to sync (or a sync is running).
         let multi = self.multi();
-        let message_height = if multi { 0 } else { 3 };
+        let message_height =
+            if multi { 0 } else { 2 + self.single_message_rows(area.width) as u16 };
         let button_height = if multi { 0 } else { 3 };
         let sync_height = u16::from(!multi && self.sync_label().is_some());
         let footer_lines = self.footer_lines(area.width);
@@ -1709,7 +1734,9 @@ impl App {
         // material theme) in the normal foreground, never the colored emoji.
         let sparkle_glyph =
             if self.suggesting.is_some() { "…" } else { sparkle_icon(self.theme) };
-        let sparkle_w = Span::raw(sparkle_glyph).width() as u16 + 1;
+        // The icon's width even while the "…" spinner shows, so the box
+        // height computed in draw() always matches.
+        let sparkle_w = Span::raw(sparkle_icon(self.theme)).width() as u16 + 1;
         let [text_area, sparkle_area] =
             Layout::horizontal([Constraint::Min(0), Constraint::Length(sparkle_w)]).areas(inner);
         frame.render_widget(Paragraph::new(sparkle_glyph), sparkle_area);
@@ -1726,15 +1753,22 @@ impl App {
             return;
         }
 
-        // Single-line input with horizontal scroll keeping the cursor visible.
-        let width = text_area.width.saturating_sub(1) as usize;
-        let start = cursor.saturating_sub(width);
-        let visible: String = message.iter().skip(start).take(width.max(1)).collect();
-        frame.render_widget(Paragraph::new(visible), text_area);
+        // Wrapped input: the box grows with the message (draw() sizes it) up
+        // to MESSAGE_MAX_ROWS rows, then scrolls to keep the cursor visible.
+        let field = text_area.width.max(1) as usize;
+        let (rows, cursor_row, cursor_col) = wrap_message(&message, cursor, field);
+        let (top, visible) = message_window(rows.len(), cursor_row, focused);
+        let text: Vec<Line> = rows
+            .iter()
+            .skip(top)
+            .take(visible)
+            .map(|row| Line::from(row.clone()))
+            .collect();
+        frame.render_widget(Paragraph::new(text), text_area);
         if focused {
             frame.set_cursor_position(Position::new(
-                text_area.x + (cursor - start) as u16,
-                text_area.y,
+                text_area.x + cursor_col as u16,
+                text_area.y + (cursor_row - top) as u16,
             ));
         }
     }
@@ -1877,11 +1911,16 @@ impl App {
                 && let Some(repo) = self.active_repo()
             {
                 let field = usize::from(inline_field_width(self.last_width));
-                let start = repo.cursor.saturating_sub(field.saturating_sub(1));
-                frame.set_cursor_position(Position::new(
-                    area.x + 1 + (repo.cursor - start) as u16,
-                    y + 1,
-                ));
+                let (rows, cursor_row, cursor_col) =
+                    wrap_message(&repo.message, repo.cursor, field);
+                let (top, _) = message_window(rows.len(), cursor_row, true);
+                let cy = y + 1 + (cursor_row - top) as u16;
+                if cy + 1 < area.y + area.height {
+                    frame.set_cursor_position(Position::new(
+                        area.x + 1 + cursor_col as u16,
+                        cy,
+                    ));
+                }
             }
         }
     }
@@ -2056,8 +2095,34 @@ fn message_placeholder(branch: &str, width: usize) -> String {
     String::new()
 }
 
-/// A repo's inline message box, VS Code style: a 3-line bordered input with
-/// the ✧ suggest button at its right end.
+/// Most content rows a message box shows before it scrolls instead.
+const MESSAGE_MAX_ROWS: usize = 4;
+
+/// Wrap `message` into `field`-wide rows plus the cursor's (row, col). The
+/// cursor may sit one past the end, opening a fresh row when that lands on a
+/// wrap boundary.
+fn wrap_message(message: &[char], cursor: usize, field: usize) -> (Vec<String>, usize, usize) {
+    let field = field.max(1);
+    let mut rows: Vec<String> = message.chunks(field).map(|c| c.iter().collect()).collect();
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    if !message.is_empty() && message.len().is_multiple_of(field) && cursor == message.len() {
+        rows.push(String::new());
+    }
+    (rows, cursor / field, cursor % field)
+}
+
+/// The `(top, count)` window of wrapped rows to show: everything when it
+/// fits, else the slice keeping the cursor visible (or the start, unfocused).
+fn message_window(rows: usize, cursor_row: usize, focused: bool) -> (usize, usize) {
+    let visible = rows.min(MESSAGE_MAX_ROWS);
+    let top = if focused { (cursor_row + 1).saturating_sub(visible) } else { 0 };
+    (top, visible)
+}
+
+/// A repo's inline message box, VS Code style: a bordered input that grows
+/// with its wrapped message, with the ✧ suggest button at its right end.
 fn message_box_item(
     repo: &Repo,
     focused: bool,
@@ -2072,27 +2137,39 @@ fn message_box_item(
     let horizontal = "─".repeat(width.saturating_sub(2));
     let field = usize::from(inline_field_width(width as u16));
 
-    let content: Span = if repo.message.is_empty() && !focused {
+    let mut lines = vec![Line::from(Span::styled(format!("┌{horizontal}┐"), border))];
+    if repo.message.is_empty() && !focused {
         let placeholder = message_placeholder(&repo.status.branch, field);
-        Span::styled(placeholder, Style::default().dim().italic())
+        let pad = field.saturating_sub(Span::raw(placeholder.as_str()).width());
+        lines.push(Line::from(vec![
+            Span::styled("│", border),
+            Span::styled(placeholder, Style::default().dim().italic()),
+            Span::raw(" ".repeat(pad)),
+            Span::raw(format!("{} ", sparkle_icon(theme))),
+            Span::styled("│", border),
+        ]));
     } else {
-        let start = repo.cursor.saturating_sub(field.saturating_sub(1));
-        let visible: String = repo.message.iter().skip(start).take(field.max(1)).collect();
-        Span::raw(visible)
-    };
-    let pad = field.saturating_sub(content.width());
-    let middle = Line::from(vec![
-        Span::styled("│", border),
-        content,
-        Span::raw(" ".repeat(pad)),
-        Span::raw(format!("{} ", sparkle_icon(theme))),
-        Span::styled("│", border),
-    ]);
-    ListItem::new(vec![
-        Line::from(Span::styled(format!("┌{horizontal}┐"), border)),
-        middle,
-        Line::from(Span::styled(format!("└{horizontal}┘"), border)),
-    ])
+        let (rows, cursor_row, _) = wrap_message(&repo.message, repo.cursor, field);
+        let (top, visible) = message_window(rows.len(), cursor_row, focused);
+        for (i, row) in rows.iter().skip(top).take(visible).enumerate() {
+            let pad = field.saturating_sub(Span::raw(row.as_str()).width());
+            // The ✧ button owns the 3-column tail of the FIRST line only.
+            let tail = if i == 0 {
+                Span::raw(format!("{} ", sparkle_icon(theme)))
+            } else {
+                Span::raw("   ".to_string())
+            };
+            lines.push(Line::from(vec![
+                Span::styled("│", border),
+                Span::raw(row.clone()),
+                Span::raw(" ".repeat(pad)),
+                tail,
+                Span::styled("│", border),
+            ]));
+        }
+    }
+    lines.push(Line::from(Span::styled(format!("└{horizontal}┘"), border)));
+    ListItem::new(lines)
 }
 
 /// A repo's inline ✓ Commit button with the VS Code dropdown chevron at its
