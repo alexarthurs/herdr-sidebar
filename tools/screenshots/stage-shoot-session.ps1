@@ -113,7 +113,7 @@ herdr workspace focus $wsIds['acme-app'] | Out-Null
 $title = "herdr-$Session"
 $probe = & "$Tools\resize_titled.ps1" $title 1760 996 2>$null
 if (-not $probe) {
-    Start-Process wt.exe -ArgumentList '-w', 'new', 'nt', '--title', $title, 'powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$Tools\attach_shoot.ps1"
+    Start-Process wt.exe -ArgumentList '-w', 'new', 'nt', '--title', $title, 'powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$Tools\attach_shoot.ps1", $Session
     Start-Sleep -Seconds 8
     & "$Tools\resize_titled.ps1" $title 1760 996
 } else { Write-Output $probe }
