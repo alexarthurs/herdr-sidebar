@@ -18,11 +18,13 @@ pub enum IconTheme {
 }
 
 impl IconTheme {
-    /// Initial theme from `HERDR_AA_FILETREE_ICONS` (`material`/`nerd` → Material).
+    /// Initial theme from `HERDR_AA_FILETREE_ICONS`. Material (the Atom
+    /// Material look) is the default — set `emoji` if the terminal font has no
+    /// Nerd Font glyphs (or just press `i`).
     pub fn from_env(value: Option<&str>) -> Self {
         match value.map(|v| v.trim().to_lowercase()).as_deref() {
-            Some("material") | Some("nerd") => Self::Material,
-            _ => Self::Emoji,
+            Some("emoji") => Self::Emoji,
+            _ => Self::Material,
         }
     }
 
@@ -320,10 +322,9 @@ mod tests {
 
     #[test]
     fn theme_selection_from_env_and_toggle() {
-        assert_eq!(IconTheme::from_env(None), IconTheme::Emoji);
+        assert_eq!(IconTheme::from_env(None), IconTheme::Material);
         assert_eq!(IconTheme::from_env(Some("material")), IconTheme::Material);
-        assert_eq!(IconTheme::from_env(Some(" NERD ")), IconTheme::Material);
-        assert_eq!(IconTheme::from_env(Some("emoji")), IconTheme::Emoji);
+        assert_eq!(IconTheme::from_env(Some(" EMOJI ")), IconTheme::Emoji);
         assert_eq!(IconTheme::Emoji.toggled(), IconTheme::Material);
         assert_eq!(IconTheme::Material.toggled(), IconTheme::Emoji);
     }

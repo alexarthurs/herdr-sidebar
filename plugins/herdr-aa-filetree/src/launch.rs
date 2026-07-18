@@ -54,6 +54,8 @@ struct Layout {
     panes: Vec<LayoutPane>,
     #[serde(default)]
     splits: Vec<LayoutSplit>,
+    area: Option<Rect>,
+    tab_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +76,8 @@ struct Rect {
     x: i64,
     y: i64,
     width: i64,
+    #[serde(default)]
+    height: i64,
 }
 
 /// Windows PowerShell 5.1 prepends a UTF-8 BOM when piping into a native
@@ -207,6 +211,51 @@ pub fn split_pane_id(response_json: &str) -> Option<String> {
         .pane?
         .pane_id
         .filter(|id| is_flag_safe(id))
+}
+
+/// One step of the full-height repair: `below` (a pane under the explorer,
+/// truncating its column) should be re-parented as a down-split of `right`
+/// (the pane beside the explorer) in `tab`.
+pub struct RepairStep {
+    pub below: String,
+    pub right: String,
+    pub tab: String,
+}
+
+/// When `pane_id` is not a full-height column of its tab, find the pane
+/// directly below it and the pane directly to its right — moving the former
+/// under the latter (via a bounce through a temp tab; herdr no-ops same-tab
+/// moves) grows the explorer to full height. `None` when already full height
+/// or the layout doesn't match. Called in a loop: each step removes one pane
+/// from under the explorer.
+pub fn repair_step(layout_json: &str, pane_id: &str) -> Option<RepairStep> {
+    let msg = serde_json::from_str::<LayoutMsg>(strip_bom(layout_json)).ok()?;
+    let layout = &msg.result.layout;
+    let area = layout.area.as_ref()?;
+    let tab = layout.tab_id.as_deref().filter(|t| is_flag_safe(t))?;
+    let me = layout
+        .panes
+        .iter()
+        .find(|p| p.pane_id.as_deref() == Some(pane_id))?
+        .rect
+        .as_ref()?;
+    if me.height >= area.height {
+        return None;
+    }
+    let find = |pred: &dyn Fn(&Rect) -> bool| -> Option<String> {
+        layout
+            .panes
+            .iter()
+            .filter(|p| p.pane_id.as_deref() != Some(pane_id))
+            .filter_map(|p| Some((p.pane_id.as_deref()?, p.rect.as_ref()?)))
+            .find(|(id, rect)| is_flag_safe(id) && pred(rect))
+            .map(|(id, _)| id.to_string())
+    };
+    let below = find(&|r: &Rect| {
+        r.y == me.y + me.height && r.x <= me.x && me.x < r.x + r.width
+    })?;
+    let right = find(&|r: &Rect| r.x == me.x + me.width && r.y == me.y)?;
+    Some(RepairStep { below, right, tab: tab.to_string() })
 }
 
 /// One `herdr pane resize` invocation: which way to move our right edge and by
@@ -400,6 +449,36 @@ mod tests {
         format!(
             r#"{{"id":"cli:pane:layout","result":{{"layout":{{"panes":[{panes}],"splits":[{splits}]}}}}}}"#
         )
+    }
+
+    fn layout_with_area(panes: &str) -> String {
+        format!(
+            r#"{{"id":"x","result":{{"layout":{{"area":{{"x":0,"y":0,"width":180,"height":50}},"tab_id":"w1:t1","panes":[{panes}]}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn repair_step_finds_below_and_right_panes() {
+        // Explorer truncated to the top-left; p7 spans below it, p1 beside it.
+        let json = layout_with_area(
+            r#"{"pane_id":"e","rect":{"x":0,"y":0,"width":32,"height":25}},
+               {"pane_id":"p1","rect":{"x":32,"y":0,"width":58,"height":25}},
+               {"pane_id":"p7","rect":{"x":0,"y":25,"width":90,"height":25}},
+               {"pane_id":"p4","rect":{"x":90,"y":0,"width":90,"height":50}}"#,
+        );
+        let step = repair_step(&json, "e").unwrap();
+        assert_eq!((step.below.as_str(), step.right.as_str(), step.tab.as_str()), ("p7", "p1", "w1:t1"));
+    }
+
+    #[test]
+    fn repair_step_none_when_full_height_or_unmatched() {
+        let full = layout_with_area(
+            r#"{"pane_id":"e","rect":{"x":0,"y":0,"width":32,"height":50}},
+               {"pane_id":"p1","rect":{"x":32,"y":0,"width":148,"height":50}}"#,
+        );
+        assert!(repair_step(&full, "e").is_none());
+        assert!(repair_step(&full, "missing").is_none());
+        assert!(repair_step("not json", "e").is_none());
     }
 
     #[test]

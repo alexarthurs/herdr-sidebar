@@ -62,12 +62,13 @@ sliver can actually get.
 
 ## Icon themes
 
-- **emoji** (default): colored emoji per file type, works in any font.
-- **material**: Nerd Font glyphs tinted like VS Code's *Atom Material Icons*
-  theme. Requires herdr's terminal font to be Nerd-Font-patched — if you see
-  blanks or boxes, press `i` to go back to emoji.
+- **material** (default): Nerd Font glyphs tinted like VS Code's *Atom
+  Material Icons* theme. Requires the hosting terminal's font to be
+  Nerd-Font-patched (e.g. CaskaydiaCove Nerd Font Mono) — if you see blanks or
+  boxes, press `i` to switch to emoji.
+- **emoji**: colored emoji per file type, works in any font.
 
-Set `HERDR_AA_FILETREE_ICONS=material` to start in material mode.
+Set `HERDR_AA_FILETREE_ICONS=emoji` to start in emoji mode.
 
 ## Why per-tab panes, not one real sidebar?
 

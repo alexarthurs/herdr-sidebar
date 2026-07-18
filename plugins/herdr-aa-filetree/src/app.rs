@@ -382,11 +382,15 @@ mod tests {
     }
 
     #[test]
-    fn sliver_has_expand_button_then_braille_and_truncates() {
+    fn sliver_has_expand_button_then_block_art_and_truncates() {
         let lines = sliver_lines(20);
         let chars: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert_eq!(chars[0], "»");
-        assert!(chars[2].chars().all(|c| ('\u{2800}'..='\u{28ff}').contains(&c)));
+        assert!(
+            chars[2]
+                .chars()
+                .all(|c| c == ' ' || ('\u{2580}'..='\u{259f}').contains(&c))
+        );
         assert_eq!(sliver_lines(5).len(), 5, "never exceeds the pane height");
     }
 }

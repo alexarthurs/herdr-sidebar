@@ -164,6 +164,7 @@ fn open(panes_json: &str, focus_new: bool) -> std::io::Result<()> {
         "pane.rename",
         serde_json::json!({ "pane_id": new_pane, "label": launch::PANE_LABEL }),
     )?;
+    full_height_repair(&new_pane);
 
     if focus_new {
         focus(&new_pane)?;
@@ -174,6 +175,49 @@ fn open(panes_json: &str, focus_new: bool) -> std::io::Result<()> {
         focus(fid)?;
     }
     Ok(())
+}
+
+/// Grow the freshly-opened explorer into a full-height left column. When the
+/// tab's left area was already split vertically, the explorer only gets the
+/// top slot; each repair step re-parents the pane below it as a down-split of
+/// the pane beside it. herdr no-ops same-tab moves, so each step bounces the
+/// pane through a temporary tab (herdr auto-closes it once emptied).
+/// Best-effort: any miss just leaves the layout as it was.
+fn full_height_repair(pane_id: &str) {
+    for _ in 0..4 {
+        let Ok(layout) =
+            ipc::call_text("pane.layout", serde_json::json!({ "pane_id": pane_id }))
+        else {
+            return;
+        };
+        let Some(step) = launch::repair_step(&layout, pane_id) else {
+            return;
+        };
+        let bounced = ipc::call_text(
+            "pane.move",
+            serde_json::json!({
+                "pane_id": step.below,
+                "destination": { "type": "new_tab" },
+                "focus": false,
+            }),
+        );
+        if bounced.is_err() {
+            return;
+        }
+        let _ = ipc::call_text(
+            "pane.move",
+            serde_json::json!({
+                "pane_id": step.below,
+                "destination": {
+                    "type": "tab",
+                    "tab_id": step.tab,
+                    "target_pane_id": step.right,
+                    "split": "down",
+                },
+                "focus": false,
+            }),
+        );
+    }
 }
 
 /// The shell command that starts the Explorer TUI in the new pane: the sibling
