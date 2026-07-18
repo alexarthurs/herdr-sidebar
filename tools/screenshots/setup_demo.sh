@@ -1,8 +1,8 @@
 #!/bin/bash
 # Recreate the acme-app demo repo used for screenshots.
 set -e
-APP=/c/Users/Alex/Projects/acme-app
-ORIGIN=/c/Users/Alex/Projects/.acme-origin.git
+APP=$HOME/Projects/acme-app
+ORIGIN=$HOME/Projects/.acme-origin.git
 rm -rf "$APP" "$ORIGIN"
 mkdir -p "$APP/src/api" "$APP/docs"
 cd "$APP"

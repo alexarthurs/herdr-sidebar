@@ -2,9 +2,9 @@
 # A persistent playground repo exercising every Source Control feature:
 # branches, a worktree, stashes, tags, two remotes, staged/unstaged/untracked.
 set -e
-APP=/c/Users/Alex/Projects/scm-playground
-WT=/c/Users/Alex/Projects/scm-playground-search
-ORIGIN=/c/Users/Alex/Projects/.scm-playground-origin.git
+APP=$HOME/Projects/scm-playground
+WT=$HOME/Projects/scm-playground-search
+ORIGIN=$HOME/Projects/.scm-playground-origin.git
 G="git -c user.name=Alex_Arthurs -c user.email=alex@example.com"
 rm -rf "$APP" "$WT" "$ORIGIN"
 mkdir -p "$APP/src" "$APP/docs"
