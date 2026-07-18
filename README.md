@@ -15,13 +15,15 @@ everywhere, AI-drafted commit messages, and a file preview that opens right besi
 
 <br><br>
 
-<img src="plugins/herdr-aa-sidebar/docs/media/hero.png" alt="The sidebar: explorer view with a live file preview beside it" width="920">
+<img src="plugins/herdr-aa-sidebar/docs/media/hero.png" alt="The sidebar docked beside a 2x2 fleet of Claude agents" width="920">
 
 </div>
 
-If you've ever alt-tabbed out of your terminal just to *look* at something — the tree, the
-diff, what's staged — this closes that loop. The sidebar docks on the left of every herdr
-tab, restores itself on focus, and is driven entirely by click or keystroke.
+That's the sidebar on the left and a 2×2 fleet of Claude agents at work beside it — the
+workflow herdr is built for. If you've ever alt-tabbed out of your terminal just to *look*
+at something — the tree, the diff, what's staged — this closes that loop. The sidebar docks
+on the left of every herdr tab, restores itself on focus, and is driven entirely by click
+or keystroke.
 
 ```
 herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-aa-sidebar
@@ -38,6 +40,10 @@ views ship in one small Rust binary.
 ### 🗂 The Explorer
 
 A real tree, not a directory dump:
+
+<div align="center">
+<img src="plugins/herdr-aa-sidebar/docs/media/preview.png" alt="Explorer view with a live file preview open beside the tree" width="920">
+</div>
 
 - Disclosure chevrons, nested indentation, and **two icon themes** — colored Nerd Font
   glyphs (Atom-Material style) or emoji, toggled live.
