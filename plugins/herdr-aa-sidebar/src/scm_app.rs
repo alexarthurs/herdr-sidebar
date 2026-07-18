@@ -286,6 +286,30 @@ impl PaneCtl {
         );
     }
 
+    /// Resize our pane to `target` terminal columns over the socket API
+    /// (`pane.resize` takes a split-RATIO delta; the plan converts columns).
+    fn resize_to(&self, current: u16, target: u16) {
+        let Ok(layout) = herdr_aa_sidebar::ipc::call_text(
+            "pane.layout",
+            serde_json::json!({ "pane_id": self.pane_id }),
+        ) else {
+            return;
+        };
+        let Some(step) =
+            herdr_aa_sidebar::launch::resize_plan(&layout, &self.pane_id, current, target)
+        else {
+            return;
+        };
+        let _ = herdr_aa_sidebar::ipc::call_text(
+            "pane.resize",
+            serde_json::json!({
+                "pane_id": self.pane_id,
+                "direction": step.direction,
+                "amount": step.amount,
+            }),
+        );
+    }
+
     /// Report identity tokens: always our own; in merged mode also the other
     /// view's (one Sidebar pane satisfies both plugins' launchers), otherwise
     /// clear the other view's token.
@@ -1172,6 +1196,9 @@ impl App {
     /// Open the other view in a fresh pane beside this one (detach).
     fn spawn_other_pane(&self) {
         let (Some(ctl), Some(exe)) = (&self.pane_ctl, &self.other_exe) else { return };
+        // Grow to double width FIRST, then split 50/50 — each separated panel
+        // keeps the width the unified sidebar had, instead of halving.
+        ctl.resize_to(self.last_width, self.last_width.saturating_mul(2).saturating_add(1));
         let response = herdr_aa_sidebar::ipc::call_text(
             "pane.split",
             serde_json::json!({

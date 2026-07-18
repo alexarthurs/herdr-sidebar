@@ -436,6 +436,9 @@ impl App {
     /// Open the other view in a fresh pane beside this one (detach).
     fn spawn_other_pane(&self) {
         let (Some(ctl), Some(exe)) = (&self.pane_ctl, &self.other_exe) else { return };
+        // Grow to double width FIRST, then split 50/50 — each separated panel
+        // keeps the width the unified sidebar had, instead of halving.
+        ctl.resize_to(self.last_width, self.last_width.saturating_mul(2).saturating_add(1));
         let response = herdr_aa_sidebar::ipc::call_text(
             "pane.split",
             serde_json::json!({
