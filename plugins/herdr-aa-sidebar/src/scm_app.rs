@@ -27,7 +27,7 @@ use herdr_aa_sidebar::state::{self as sidebar, View};
 use herdr_aa_sidebar::state::Exit;
 use herdr_aa_sidebar::ui::{
     activity_icons, branch_icon, gear_icon, hits, hits_collapse_button, sibling_panes_of,
-    sliver_lines, sliver_view_at, sparkle_icon, truncate_to, within, wrap_hints,
+    sparkle_icon, truncate_to, within, wrap_hints,
 };
 use herdr_aa_sidebar::actions::{copy_to_clipboard, reveal};
 use herdr_aa_sidebar::suggest;
@@ -535,11 +535,6 @@ pub struct App {
     page: usize,
     last_width: u16,
     last_height: u16,
-    /// Width to restore on expand, remembered at collapse time.
-    expanded_width: u16,
-    /// Explicitly collapsed via the «/b — width alone can't tell on large
-    /// windows (herdr's 0.1 minimum split ratio).
-    collapsed: bool,
     // Merged-sidebar state.
     sidebar_state: sidebar::State,
     other_exe: Option<PathBuf>,
@@ -553,12 +548,6 @@ pub struct App {
 
 const MY_VIEW: View = View::SourceControl;
 
-/// Below this pane width the view renders as the collapsed sliver.
-const SLIVER_THRESHOLD: u16 = 14;
-/// Width to request when collapsing (herdr's 0.1 ratio floor may leave more).
-const SLIVER_TARGET: u16 = 5;
-/// Fallback width to restore on expand.
-const DEFAULT_EXPANDED_WIDTH: u16 = 40;
 
 impl App {
     pub fn new(cwd: PathBuf) -> Self {
@@ -599,8 +588,6 @@ impl App {
             page: 20,
             last_width: 40,
             last_height: 24,
-            expanded_width: DEFAULT_EXPANDED_WIDTH,
-            collapsed: false,
             sidebar_state,
             other_exe,
             pane_ctl,
@@ -635,41 +622,25 @@ impl App {
     fn apply_identity(&self) {
         let Some(ctl) = &self.pane_ctl else { return };
         let label = if self.merged() { sidebar::SIDEBAR_LABEL } else { MY_VIEW.label() };
-        if !self.collapsed {
-            ctl.set_label(Some(label));
-        }
+        ctl.set_label(Some(label));
         ctl.report_tokens(MY_VIEW, self.merged());
     }
 
-    /// Collapsed by the button, or manually dragged down to a sliver.
-    fn collapsed(&self) -> bool {
-        self.collapsed || self.last_width < SLIVER_THRESHOLD
-    }
-
-    fn collapse(&mut self) {
-        if self.collapsed() {
-            return;
+    /// Hide the sidebar: snooze this tab (so the quiet ensure hook doesn't
+    /// immediately re-dock a fresh one) and close our own pane. The herdr
+    /// prefix+b keybinding (→ the toggle action) brings it back.
+    fn hide(&mut self) {
+        let Some(ctl) = &self.pane_ctl else { return };
+        if let Ok(json) =
+            herdr_aa_sidebar::ipc::call_text("pane.list", serde_json::json!({}))
+        {
+            let tab = herdr_aa_sidebar::launch::tab_of(&json, &ctl.pane_id);
+            herdr_aa_sidebar::snooze::set(&herdr_aa_sidebar::snooze::dir(), &tab);
         }
-        self.expanded_width = self.last_width;
-        self.collapsed = true;
-        if let Some(ctl) = &self.pane_ctl {
-            ctl.set_label(None);
-            ctl.resize_to(self.last_width, SLIVER_TARGET);
-        }
-    }
-
-    fn expand(&mut self) {
-        if !self.collapsed() {
-            return;
-        }
-        self.collapsed = false;
-        self.apply_identity();
-        if let Some(ctl) = &self.pane_ctl {
-            ctl.resize_to(
-                self.last_width,
-                self.expanded_width.max(DEFAULT_EXPANDED_WIDTH),
-            );
-        }
+        let _ = herdr_aa_sidebar::ipc::call_text(
+            "pane.close",
+            serde_json::json!({ "pane_id": ctl.pane_id }),
+        );
     }
 
     /// Re-read every repo's git status (this is the change auto-detection —
@@ -895,18 +866,6 @@ impl App {
             return None;
         }
         self.flash = None;
-        if self.collapsed() {
-            // Sliver mode: expand, deep-link to the other view, or quit.
-            match key.code {
-                KeyCode::Char('q') => return Some(Exit::Quit),
-                KeyCode::Char('1') => {
-                    self.expand();
-                    return self.switch_to(View::Explorer);
-                }
-                _ => self.expand(),
-            }
-            return None;
-        }
         if self.overlay.is_some() {
             self.overlay_key(key);
             return None;
@@ -993,7 +952,7 @@ impl App {
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('S') => self.sync_changes(),
             KeyCode::Char('o') => self.open_selected_diff(),
-            KeyCode::Char('b') => self.collapse(),
+            KeyCode::Char('b') => self.hide(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => return self.switch_to(View::SourceControl),
             _ => {}
@@ -1003,17 +962,6 @@ impl App {
 
     /// `Some(exit)` ends the event loop, mirroring on_key.
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Exit> {
-        if self.collapsed() {
-            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                // A view icon in the sliver deep-links: expand INTO that view.
-                let target = sliver_view_at(mouse.row, MY_VIEW, self.merged());
-                self.expand();
-                if let Some(view) = target {
-                    return self.switch_to(view);
-                }
-            }
-            return None;
-        }
         if self.overlay.is_some() {
             self.overlay_mouse(mouse);
             return None;
@@ -1039,7 +987,7 @@ impl App {
     fn left_click(&mut self, mouse: MouseEvent) -> Option<Exit> {
         self.flash = None;
         if hits_collapse_button(mouse.column, mouse.row, self.last_width, self.last_height) {
-            self.collapse();
+            self.hide();
             return None;
         }
         let (x, y) = (mouse.column, mouse.row);
@@ -2129,14 +2077,6 @@ impl App {
         self.last_width = area.width;
         self.last_height = area.height;
 
-        if self.collapsed() {
-            frame.render_widget(
-                Paragraph::new(sliver_lines(self.theme, MY_VIEW, self.merged())).centered(),
-                area,
-            );
-            return;
-        }
-
         if self.repos.is_empty() {
             let text = format!(
                 "Not a git repository.\n\n{}\n\nOpen this pane inside a repo,\nor press q to quit.",
@@ -2587,7 +2527,7 @@ impl App {
             ("c", "msg"),
             ("A", "suggest"),
             ("o", "diff"),
-            ("b", "collapse"),
+            ("b", "hide"),
             ("S", "sync"),
             ("s", "settings"),
             ("r", "refresh"),

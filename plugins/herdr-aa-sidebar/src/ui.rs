@@ -58,43 +58,6 @@ pub fn hits_collapse_button(column: u16, row: u16, pane_width: u16, pane_height:
     row == pane_height.saturating_sub(1) && column >= pane_width.saturating_sub(4)
 }
 
-/// The collapsed sliver's lines: one icon per REACHABLE view (both when the
-/// sidebar is unified), monochrome — no active highlight. The row layout is
-/// fixed so [`sliver_view_at`] can route clicks to the right view.
-pub fn sliver_lines(theme: IconTheme, active: View, merged: bool) -> Vec<Line<'static>> {
-    let (explorer, git) = activity_icons(theme);
-    // Monochrome, nothing highlighted — the sliver is a doorway, not a state
-    // display; both icons render in the plain foreground.
-    let style = Style::default();
-    let mut lines = vec![Line::raw("")];
-    if merged {
-        lines.push(Line::from(Span::styled(explorer, style)));
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(git, style)));
-    } else {
-        let glyph = match active {
-            View::Explorer => explorer,
-            View::SourceControl => git,
-        };
-        lines.push(Line::from(Span::styled(glyph, style)));
-    }
-    lines
-}
-
-/// Which view's sliver icon sits on pane-local `row` (the fixed layout from
-/// [`sliver_lines`]); clicking it deep-links straight into that view.
-pub fn sliver_view_at(row: u16, active: View, merged: bool) -> Option<View> {
-    if merged {
-        match row {
-            1 => Some(View::Explorer),
-            3 => Some(View::SourceControl),
-            _ => None,
-        }
-    } else {
-        (row == 1).then_some(active)
-    }
-}
-
 /// Theme-matched activity-bar icons: (explorer, source control). Both FA
 /// glyphs render two cells wide in the non-Mono Nerd Font — chips reserve
 /// the second cell (see the activity-bar renderer).

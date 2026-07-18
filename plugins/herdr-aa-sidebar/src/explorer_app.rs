@@ -16,8 +16,7 @@ use herdr_aa_sidebar::actions::{self, MenuAction, MenuEntry};
 use herdr_aa_sidebar::icons::{IconTheme, icon};
 use herdr_aa_sidebar::state::{self as sidebar, View};
 use herdr_aa_sidebar::ui::{
-    activity_icons, gear_icon, hits_collapse_button, sibling_panes_of, sliver_lines,
-    sliver_view_at, wrap_hints,
+    activity_icons, gear_icon, hits_collapse_button, sibling_panes_of, wrap_hints,
 };
 use herdr_aa_sidebar::tree::{Row, Tree};
 
@@ -25,11 +24,6 @@ use herdr_aa_sidebar::state::Exit;
 
 const MY_VIEW: View = View::Explorer;
 
-/// Below this pane width the explorer renders as the collapsed sliver.
-const SLIVER_THRESHOLD: u16 = 14;
-/// Width we ask herdr for when collapsing (herdr's 0.1 min split ratio may keep
-/// the pane a little wider — the sliver rendering adapts to whatever we get).
-const SLIVER_TARGET: u16 = 5;
 /// Expanded width to restore when nothing better is known.
 const DEFAULT_EXPANDED_WIDTH: u16 = 32;
 
@@ -186,12 +180,6 @@ pub struct App {
     last_width: u16,
     last_height: u16,
     page: usize,
-    /// Width to restore on expand, remembered at collapse time.
-    expanded_width: u16,
-    /// Explicitly collapsed via the button/key. Herdr's 0.1 minimum split
-    /// ratio can leave the collapsed pane wider than the sliver threshold on
-    /// large windows, so collapse state can't be inferred from width alone.
-    collapsed: bool,
     /// Row index under the mouse cursor, for the hover highlight.
     hovered: Option<usize>,
     body: BodyGeom,
@@ -256,8 +244,6 @@ impl App {
             last_width: DEFAULT_EXPANDED_WIDTH,
             last_height: 24,
             page: 20,
-            expanded_width: DEFAULT_EXPANDED_WIDTH,
-            collapsed: false,
             hovered: None,
             body: BodyGeom::default(),
             overlay: None,
@@ -304,15 +290,8 @@ impl App {
     /// Push our label + metadata tokens to herdr for the current mode.
     fn apply_identity(&self) {
         let Some(ctl) = &self.pane_ctl else { return };
-        if !self.collapsed {
-            ctl.set_label(Some(self.pane_label()));
-        }
+        ctl.set_label(Some(self.pane_label()));
         ctl.report_tokens(MY_VIEW, self.merged());
-    }
-
-    /// Collapsed by the button, or manually dragged down to a sliver.
-    fn collapsed(&self) -> bool {
-        self.collapsed || self.last_width < SLIVER_THRESHOLD
     }
 
     /// Open a file in the preview pane BESIDE the sidebar (the tree stays
@@ -333,30 +312,21 @@ impl App {
         }
     }
 
-    fn collapse(&mut self) {
-        if self.collapsed() {
-            return;
+    /// Hide the sidebar: snooze this tab (so the quiet ensure hook doesn't
+    /// immediately re-dock a fresh one) and close our own pane. The herdr
+    /// prefix+b keybinding (→ the toggle action) brings it back.
+    fn hide(&mut self) {
+        let Some(ctl) = &self.pane_ctl else { return };
+        if let Ok(json) =
+            herdr_aa_sidebar::ipc::call_text("pane.list", serde_json::json!({}))
+        {
+            let tab = herdr_aa_sidebar::launch::tab_of(&json, &ctl.pane_id);
+            herdr_aa_sidebar::snooze::set(&herdr_aa_sidebar::snooze::dir(), &tab);
         }
-        self.expanded_width = self.last_width;
-        self.collapsed = true;
-        if let Some(ctl) = &self.pane_ctl {
-            ctl.set_label(None);
-            ctl.resize_to(self.last_width, SLIVER_TARGET);
-        }
-    }
-
-    fn expand(&mut self) {
-        if !self.collapsed() {
-            return;
-        }
-        self.collapsed = false;
-        if let Some(ctl) = &self.pane_ctl {
-            ctl.set_label(Some(self.pane_label()));
-            ctl.resize_to(
-                self.last_width,
-                self.expanded_width.max(DEFAULT_EXPANDED_WIDTH),
-            );
-        }
+        let _ = herdr_aa_sidebar::ipc::call_text(
+            "pane.close",
+            serde_json::json!({ "pane_id": ctl.pane_id }),
+        );
     }
 
     // ---- Unified-sidebar operations ----
@@ -455,18 +425,6 @@ impl App {
             self.overlay_key(key);
             return None;
         }
-        if self.collapsed() {
-            // Sliver mode: expand, deep-link to the other view, or quit.
-            match key.code {
-                KeyCode::Char('q') => return Some(Exit::Quit),
-                KeyCode::Char('2') => {
-                    self.expand();
-                    return self.switch_to(View::SourceControl);
-                }
-                _ => self.expand(),
-            }
-            return None;
-        }
         match key.code {
             KeyCode::Char('q') => return Some(Exit::Quit),
             // Esc never quits the sidebar — it closes the preview instead.
@@ -489,7 +447,7 @@ impl App {
                 self.rebuild();
             }
             KeyCode::Char('i') => self.theme = self.theme.toggled(),
-            KeyCode::Char('b') => self.collapse(),
+            KeyCode::Char('b') => self.hide(),
             KeyCode::Char('c') => self.change_folder_dialog(),
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
@@ -501,17 +459,6 @@ impl App {
 
     /// `Some(exit)` ends the event loop, mirroring on_key.
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Exit> {
-        if self.collapsed() {
-            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                // A view icon in the sliver deep-links: expand INTO that view.
-                let target = sliver_view_at(mouse.row, MY_VIEW, self.merged());
-                self.expand();
-                if let Some(view) = target {
-                    return self.switch_to(view);
-                }
-            }
-            return None;
-        }
         if self.overlay.is_some() {
             self.overlay_mouse(mouse);
             return None;
@@ -543,7 +490,7 @@ impl App {
                 }
                 if hits_collapse_button(mouse.column, mouse.row, self.last_width, self.last_height)
                 {
-                    self.collapse();
+                    self.hide();
                     return None;
                 }
                 let index = self.row_at(mouse.row)?;
@@ -1180,11 +1127,6 @@ impl App {
     pub fn draw(&mut self, frame: &mut Frame) {
         self.last_width = frame.area().width;
         self.last_height = frame.area().height;
-        if self.collapsed() {
-            self.draw_sliver(frame);
-            return;
-        }
-
         // No own border/title: herdr already frames the pane and titles it with
         // the pane label ("Explorer"/"Sidebar") — a second border read as a
         // double frame.
@@ -1334,7 +1276,7 @@ impl App {
             (".", "dotfiles"),
             ("c", "folder"),
             ("s", "settings"),
-            ("b", "collapse"),
+            ("b", "hide"),
             ("q", "quit"),
         ];
         if self.merged() {
@@ -1466,15 +1408,6 @@ impl App {
         );
     }
 
-    /// The collapsed strip: just the explorer's icon (theme-matched) — any
-    /// click or key expands, so the icon is the whole affordance.
-    fn draw_sliver(&mut self, frame: &mut Frame) {
-        frame.render_widget(
-            Paragraph::new(sliver_lines(self.theme, MY_VIEW, self.merged()))
-                .alignment(Alignment::Center),
-            frame.area(),
-        );
-    }
 }
 
 fn row_item(row: &Row, theme: IconTheme, hovered: bool) -> ListItem<'static> {
@@ -1586,26 +1519,4 @@ mod tests {
         assert_eq!(row_index_at(body, 6, 2), None, "past the last row");
     }
 
-    #[test]
-    fn sliver_shows_reachable_view_icons_and_deep_links() {
-        let solo: Vec<String> = sliver_lines(IconTheme::Material, View::Explorer, false)
-            .iter()
-            .map(|l| l.to_string())
-            .collect();
-        assert_eq!(solo, ["", "\u{f07b}"]);
-        let both: Vec<String> = sliver_lines(IconTheme::Material, View::SourceControl, true)
-            .iter()
-            .map(|l| l.to_string())
-            .collect();
-        assert_eq!(both, ["", "\u{f07b}", "", "\u{f126}"]);
-        // Clicking an icon routes to its view; blanks just expand.
-        assert_eq!(sliver_view_at(1, View::Explorer, true), Some(View::Explorer));
-        assert_eq!(sliver_view_at(3, View::Explorer, true), Some(View::SourceControl));
-        assert_eq!(sliver_view_at(2, View::Explorer, true), None);
-        assert_eq!(sliver_view_at(3, View::Explorer, false), None);
-        assert_eq!(
-            sliver_view_at(1, View::SourceControl, false),
-            Some(View::SourceControl)
-        );
-    }
 }
