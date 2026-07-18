@@ -202,7 +202,7 @@ HACKING.md — budget time for that before promising a patched build.
   (`s` key or the gear button) — never "merge"/"detach" in UI text, and the toggle is
   silent (the layout change is the feedback). Off spawns a second pane of the same binary
   pinned with `--view`, and each pane pins to its own view.
-- The sticky setting lives in `%APPDATA%\herdra-sidebar.json` (`{merged, active}`); a
+- The sticky setting lives in `%APPDATA%\herdr\aa-sidebar.json` (`{merged, active}`); a
   fresh sidebar opens on the last-active view.
 - The unified pane reports BOTH identity tokens (`herdr-aa-sidebar-explorer`,
   `herdr-aa-sidebar-git`) so either launcher decision finds it; turning unified off clears
