@@ -15,12 +15,12 @@ everywhere, AI-drafted commit messages, and a file preview that opens right besi
 
 <br><br>
 
-<img src="plugins/herdr-aa-sidebar/docs/media/hero.png" alt="The sidebar docked beside a 2x2 fleet of Claude agents" width="920">
+<img src="plugins/herdr-aa-sidebar/docs/media/hero.png" alt="The sidebar docked beside a 3x2 fleet of Claude Code and Codex agents" width="920">
 
 </div>
 
-That's the sidebar on the left and a 2×2 fleet of Claude agents at work beside it — the
-workflow herdr is built for. If you've ever alt-tabbed out of your terminal just to *look*
+That's the sidebar on the left and a 3×2 fleet of Claude Code and Codex agents beside it —
+the workflow herdr is built for. If you've ever alt-tabbed out of your terminal just to *look*
 at something — the tree, the diff, what's staged — this closes that loop. The sidebar docks
 on the left of every herdr tab, restores itself on focus, and is driven entirely by click
 or keystroke.
@@ -81,19 +81,20 @@ Everything you use VS Code's SCM view for, in a terminal pane:
 <img src="plugins/herdr-aa-sidebar/docs/media/separated.png" alt="Separated mode: Source Control and Explorer as independent panes, preview beside them" width="920">
 </div>
 
-<img src="plugins/herdr-aa-sidebar/docs/media/settings.png" alt="The settings modal" align="right" width="300">
-
 The ⚙ settings modal — mouse-toggleable like everything else — flips between:
 
 - **Unified sidebar**: both views share one pane, the activity bar switches instantly.
-- **Separated panels**: Explorer and Source Control as independent side-by-side panes.
+- **Separated panels**: Explorer and Source Control as independent side-by-side panes —
+  each keeping the full sidebar width.
+
+<div align="center">
+<img src="plugins/herdr-aa-sidebar/docs/media/settings.png" alt="The settings modal" width="920">
+</div>
 
 Icon theme and dotfile visibility live in the same modal, and every choice persists
 across restarts. However you split it, the dock takes care of itself: a focus hook
 re-docks the sidebar in any tab or workspace that's missing one — new project, new
 worktree, new window, it's just *there*.
-
-<br clear="right">
 
 ## Install
 
