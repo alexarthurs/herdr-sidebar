@@ -181,11 +181,11 @@ fn load_file(target: &Path) -> Doc {
             } else {
                 let truncated = bytes.len() > MAX_BYTES;
                 let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_BYTES)]);
-                let mut lines: Vec<Line<'static>> = text
-                    .lines()
-                    .take(MAX_LINES)
-                    .map(|l| Line::raw(l.to_string()))
-                    .collect();
+                // Syntax highlighting when a grammar matches; plain otherwise.
+                let mut lines: Vec<Line<'static>> =
+                    crate::syntax::highlight(&name, &text, MAX_LINES).unwrap_or_else(|| {
+                        text.lines().take(MAX_LINES).map(|l| Line::raw(l.to_string())).collect()
+                    });
                 if truncated || text.lines().count() > MAX_LINES {
                     lines.push(Line::raw("… (truncated)"));
                 }

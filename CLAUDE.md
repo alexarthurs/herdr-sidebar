@@ -272,6 +272,15 @@ HACKING.md — budget time for that before promising a patched build.
   pins an older ratatui — don't add it), and diffs re-run every ~2s so they live-update.
   Staged rows show `--cached`; untracked files render via `diff --no-index NUL <file>`.
 
+### Syntax highlighting (file preview)
+
+- `syntect` with `regex-fancy` (pure Rust — the default oniguruma engine needs a C build
+  that's pain on Windows). syntect's BUNDLED grammar set is Sublime's defaults and lacks
+  TypeScript, TOML, Dockerfile and friends — `two-face` supplies bat's extended set
+  (`two_face::syntax::extra_newlines()`), themes still from syntect's `ThemeSet` (theme
+  data is grammar-independent). Foreground colors only: the terminal owns the background.
+  See `src/syntax.rs`; unknown extensions fall back to plain lines.
+
 ### Verifying a plugin TUI end-to-end
 
 Drive the real binary in a throwaway herdr pane instead of unit-testing rendering:
