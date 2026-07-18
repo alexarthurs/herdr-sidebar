@@ -1,4 +1,4 @@
-# herdr plugins monorepo
+# herdr-sidebar monorepo
 
 **This file is a living doc — always capture findings.** Whenever you discover something
 non-obvious the hard way (a herdr behavior, a Windows quirk, a manifest gotcha, a build issue),

@@ -1,4 +1,4 @@
-# herdr-spreader layout for the herdr-plugins monorepo.
+# herdr-spreader layout for the herdr-sidebar monorepo.
 # Bootstraps the workspace (tabs + panes + commands) in one shot.
 #
 # Apply it (from anywhere):
@@ -6,7 +6,7 @@
 # or standalone against this file directly:
 #   & "$env:APPDATA\herdr\plugins\github\herdr-spreader-f248c87aa2e2\target\release\herdr-spreader.exe" apply --file .\herdr-layout.yaml
 workspaces:
-  - name: herdr-plugins
+  - name: herdr-sidebar
     root: C:/Users/Alex/Projects/herdr
     focus: true
     tabs:
