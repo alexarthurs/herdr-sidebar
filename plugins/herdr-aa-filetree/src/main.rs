@@ -5,9 +5,8 @@
 //! `--*` stdin→stdout modes serve `scripts/open-explorer.{sh,ps1}` — see launch.rs.
 
 mod app;
-mod icons;
-mod launch;
-mod tree;
+
+use herdr_aa_filetree::launch;
 
 use std::io::Read;
 
@@ -28,9 +27,15 @@ fn main() -> std::io::Result<()> {
             println!("{}", launch::open_plan(&read_stdin()?));
             return Ok(());
         }
+        Some("--focused-tab") => {
+            println!("{}", launch::focused_tab(&read_stdin()?));
+            return Ok(());
+        }
         Some(other) => {
             eprintln!("herdr-aa-filetree: unknown argument `{other}`");
-            eprintln!("usage: herdr-aa-filetree [--launch-decision|--focused-pane|--open-plan]");
+            eprintln!(
+                "usage: herdr-aa-filetree [--launch-decision|--focused-pane|--open-plan|--focused-tab]"
+            );
             std::process::exit(2);
         }
         None => {}

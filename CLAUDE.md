@@ -90,6 +90,30 @@ Pane environment: `HERDR_PANE_ID` is set inside every pane's shell; `HERDR_BIN_P
 for **actions/hooks but not panes** — fall back to `herdr` on PATH. A binary started via
 `pane run` gets no `HERDR_PLUGIN_CONTEXT_JSON`; root it from its cwd (pass `--cwd` at split).
 
+Console flashes from hooks (Windows 11, verified live):
+
+- Any **console process in a hook/action chain briefly flashes a Windows Terminal window**
+  when WT is the default terminal — even though herdr spawns plugin commands with
+  CREATE_NO_WINDOW. Two hooks per tab switch made every pane-focus flash multiple windows.
+  Fix: keep the whole chain GUI-subsystem — `wscript //B scripts/x.vbs` (PATH-resolvable, no
+  console) launching a Rust sidecar built with `#![cfg_attr(windows, windows_subsystem =
+  "windows")]` that talks to the **socket API directly** and spawns nothing.
+- Hook/action commands run with **cwd = plugin root** (`runtime.rs` sets `current_dir`), so a
+  relative script **argument** (`scripts/x.vbs`) resolves — the *program* itself still cannot
+  be a relative path (resolved against herdr's own dir).
+- Rebuilds fail while any plugin exe is running; stray TUI processes can outlive their closed
+  panes — `Get-Process herdr-aa-filetree | Stop-Process` before `cargo build --release`.
+
+Socket API (what the CLI wraps; usable directly from plugins, no subprocess needed):
+
+- Windows: open `\\.\pipe\<HERDR_SOCKET_PATH>` as a plain read+write file; unix: connect to
+  `$HERDR_SOCKET_PATH` as a unix socket. One request per connection: write
+  `{"id":"…","method":"pane.split","params":{…}}\n`, read one JSON line back. Responses have
+  the same shape the CLI prints, so CLI-output parsers work unchanged.
+- The API is richer than the CLI: `pane.focus {pane_id}` focuses **by id** (the CLI only has
+  the zoom-cycle hack). `pane run` = `pane.send_input {pane_id, text, keys:["Enter"]}`.
+- Method names/params: `herdr api schema --json`, or `src/api/schema*` in the herdr source.
+
 ## Herdr workspace
 
 `herdr-layout.yaml` at the repo root describes the workspace (Coordinator tab running claude,

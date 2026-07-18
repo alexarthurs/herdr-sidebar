@@ -33,6 +33,12 @@ panes="$("$herdr_bin" pane list 2>/dev/null || true)"
 decision="$(printf '%s' "$panes" | "$bin" --launch-decision 2>/dev/null || true)"
 [ "$decision" = "OPEN" ] || exit 0
 
+# Respect a tab the user toggled closed (open-explorer.sh writes the marker) —
+# otherwise the very next focus event would reopen what they just closed.
+snooze_dir="${TMPDIR:-/tmp}/herdr-aa-filetree-snooze"
+tab="$(printf '%s' "$panes" | "$bin" --focused-tab 2>/dev/null || true)"
+[ -n "$tab" ] && [ -f "$snooze_dir/${tab//:/_}" ] && exit 0
+
 fp="$(printf '%s' "$panes" | "$bin" --focused-pane 2>/dev/null || true)"
 fid="${fp%%	*}"
 fcwd="${fp#*	}"

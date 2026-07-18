@@ -53,31 +53,27 @@ on = "workspace.focused"
 platforms = ["linux", "macos"]
 command = ["bash", "scripts/ensure-explorer.sh"]
 
+# Windows hooks go through wscript (GUI subsystem, PATH-resolvable) into the
+# GUI-subsystem ensure sidecar, which talks to herdr's socket directly. A
+# console anywhere in this chain (powershell, cmd, the herdr CLI) briefly
+# flashes a Windows Terminal window PER PROCESS on every focus event on
+# Windows 11 — even under CREATE_NO_WINDOW (verified live). Hook commands run
+# with cwd = plugin root, so the relative .vbs argument resolves.
 [[events]]
 on = "tab.focused"
 platforms = ["windows"]
-command = [
-  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-aa-filetree'}).plugin_root; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'scripts') 'ensure-explorer.ps1')''',
-]
+command = ["wscript", "//B", "scripts/launch-ensure.vbs"]
 
 [[events]]
 on = "workspace.focused"
 platforms = ["windows"]
-command = [
-  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-aa-filetree'}).plugin_root; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'scripts') 'ensure-explorer.ps1')''',
-]
+command = ["wscript", "//B", "scripts/launch-ensure.vbs"]
 
 [[actions]]
 id = "open-explorer-windows"
 platforms = ["windows"]
 title = "Toggle explorer"
 description = "Open the file explorer docked on the left (focus it if open; close it if focused)."
-# Locate the launcher by asking herdr for its own plugin root (the action's cwd is unreliable
-# on Windows), forcing UTF-8 before parsing that JSON, stripping the `\\?\` verbatim prefix
-# herdr reports, then run the .ps1 by absolute path. PowerShell 5.1: chain with `;`, never `&&`.
-command = [
-  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-aa-filetree'}).plugin_root; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'scripts') 'open-explorer.ps1')''',
-]
+# Same console-free chain as the hooks; --toggle turns the quiet ensure into
+# the open/focus/close toggle.
+command = ["wscript", "//B", "scripts/launch-ensure.vbs", "--toggle"]

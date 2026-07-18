@@ -158,6 +158,57 @@ pub fn open_plan(layout_json: &str) -> String {
     format!("{id}\t{ratio:.2}")
 }
 
+/// The focused pane's tab id from a `pane list` JSON (flag-safe, else empty).
+pub fn focused_tab(pane_list_json: &str) -> String {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return String::new();
+    };
+    msg.result
+        .panes
+        .iter()
+        .find(|p| p.focused)
+        .and_then(|p| p.tab_id.clone())
+        .filter(|t| is_flag_safe(t))
+        .unwrap_or_default()
+}
+
+/// All tab ids present in a `pane list` JSON — the live-tab set the snooze
+/// cleanup checks markers against.
+pub fn live_tabs(pane_list_json: &str) -> std::collections::BTreeSet<String> {
+    serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json))
+        .map(|msg| {
+            msg.result
+                .panes
+                .into_iter()
+                .filter_map(|p| p.tab_id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The created pane's id from a `pane.split` response
+/// (`{"result":{"pane":{"pane_id":..}}}`), validated flag-safe.
+pub fn split_pane_id(response_json: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Msg {
+        result: Res,
+    }
+    #[derive(Deserialize)]
+    struct Res {
+        pane: Option<Info>,
+    }
+    #[derive(Deserialize)]
+    struct Info {
+        pane_id: Option<String>,
+    }
+    serde_json::from_str::<Msg>(strip_bom(response_json))
+        .ok()?
+        .result
+        .pane?
+        .pane_id
+        .filter(|id| is_flag_safe(id))
+}
+
 /// One `herdr pane resize` invocation: which way to move our right edge and by
 /// how much. `amount` is a RATIO delta — herdr adds it to the nearest split's
 /// ratio (`layout.rs::resize_focused`: `current_ratio ± delta`), it is NOT
@@ -319,6 +370,30 @@ mod tests {
         assert_eq!(open_plan(&wide), "w1:p1\t0.15");
         let narrow = layout(r#"{"pane_id":"w1:p1","rect":{"x":0,"y":0,"width":40,"height":50}}"#);
         assert_eq!(open_plan(&narrow), "w1:p1\t0.50");
+    }
+
+    #[test]
+    fn focused_tab_and_live_tabs() {
+        let json = pane_list(&format!(
+            r#"{FOCUSED},{{"pane_id":"w1:p9","tab_id":"w1:t2"}}"#
+        ));
+        assert_eq!(focused_tab(&json), "w1:t1");
+        assert_eq!(
+            live_tabs(&json).into_iter().collect::<Vec<_>>(),
+            vec!["w1:t1".to_string(), "w1:t2".to_string()]
+        );
+        assert_eq!(focused_tab("not json"), "");
+        assert!(live_tabs("not json").is_empty());
+    }
+
+    #[test]
+    fn split_pane_id_extracts_and_validates() {
+        let json = r#"{"id":"x","result":{"pane":{"pane_id":"w3:p5","cwd":"C:x"},"type":"pane_info"}}"#;
+        assert_eq!(split_pane_id(json), Some("w3:p5".to_string()));
+        let evil = r#"{"id":"x","result":{"pane":{"pane_id":"--evil"},"type":"pane_info"}}"#;
+        assert_eq!(split_pane_id(evil), None);
+        assert_eq!(split_pane_id("not json"), None);
+        assert_eq!(split_pane_id(r#"{"id":"x","result":{"type":"ok"}}"#), None);
     }
 
     fn layout_with_splits(panes: &str, splits: &str) -> String {

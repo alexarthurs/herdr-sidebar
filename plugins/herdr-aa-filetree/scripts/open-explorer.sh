@@ -71,6 +71,11 @@ if [ -n "$panes" ]; then
   decision="$(printf '%s' "$panes" | "$bin" --launch-decision 2>/dev/null || echo OPEN)"
 fi
 
+# Snooze markers keep the auto-ensure hook from reopening a sidebar the user
+# toggled closed; toggling open clears the tab's marker again.
+snooze_dir="${TMPDIR:-/tmp}/herdr-aa-filetree-snooze"
+tab="$(printf '%s' "$panes" | "$bin" --focused-tab 2>/dev/null || true)"
+
 case "$decision" in
   "FOCUS "*)
     pid="${decision#FOCUS }"
@@ -79,9 +84,14 @@ case "$decision" in
     ;;
   "CLOSE "*)
     pid="${decision#CLOSE }"
+    if [ -n "$tab" ]; then
+      mkdir -p "$snooze_dir" 2>/dev/null
+      : > "$snooze_dir/${tab//:/_}"
+    fi
     exec "$herdr_bin" pane close "$pid"
     ;;
   *)
+    [ -n "$tab" ] && rm -f "$snooze_dir/${tab//:/_}" 2>/dev/null
     open_pane
     ;;
 esac

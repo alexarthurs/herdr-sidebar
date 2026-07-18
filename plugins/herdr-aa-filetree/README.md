@@ -28,8 +28,17 @@ to the right of. Concurrent focus events are serialized through an atomic
 mkdir lock, so a burst of events can't open duplicates (verified live: without
 it, one tab switch spawned four).
 
+On Windows the hooks run a **console-free chain** — `wscript` (GUI subsystem)
+→ `herdr-aa-filetree-ensure.exe` (GUI subsystem) → herdr's socket API — because
+any console process launched from a hook briefly flashes a Windows Terminal
+window on Windows 11, even under CREATE_NO_WINDOW. The sidecar never spawns a
+process: every herdr interaction is a request over the named pipe at
+`\\.\pipe\<HERDR_SOCKET_PATH>` (newline-delimited JSON).
+
 **Manual toggle:** the `open-explorer` action (`open-explorer-windows` on
-Windows) toggles: open left-docked → focus if open → close if focused.
+Windows) toggles: open left-docked → focus if open → close if focused. A tab
+you toggle closed stays closed (a per-tab snooze marker that the auto-ensure
+respects) until you toggle it open again.
 
 **Collapse:** click the `«` button (or press `b`) to shrink the explorer to a
 sliver with EXPLORER written sideways — click it (or press any key) to expand

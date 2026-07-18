@@ -12,8 +12,8 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
-use crate::icons::{IconTheme, icon};
-use crate::tree::{Row, Tree};
+use herdr_aa_filetree::icons::{IconTheme, icon};
+use herdr_aa_filetree::tree::{Row, Tree};
 
 /// Below this pane width the explorer renders as the collapsed sliver.
 const SLIVER_THRESHOLD: u16 = 14;
@@ -41,7 +41,7 @@ impl PaneCtl {
 
     /// Resize our pane to `target` terminal columns. `pane resize --amount` is
     /// a split-RATIO delta, so the exact amount comes from the live layout via
-    /// [`crate::launch::resize_plan`]. Blocking on purpose: both CLI calls are
+    /// [`herdr_aa_filetree::launch::resize_plan`]. Blocking on purpose: both CLI calls are
     /// ~instant, and waiting avoids leaving zombie children behind on unix.
     fn resize_to(&self, current: u16, target: u16) {
         let layout = std::process::Command::new(&self.herdr_bin)
@@ -50,7 +50,8 @@ impl PaneCtl {
             .output();
         let Ok(layout) = layout else { return };
         let layout_json = String::from_utf8_lossy(&layout.stdout);
-        let Some(step) = crate::launch::resize_plan(&layout_json, &self.pane_id, current, target)
+        let Some(step) =
+            herdr_aa_filetree::launch::resize_plan(&layout_json, &self.pane_id, current, target)
         else {
             return;
         };
