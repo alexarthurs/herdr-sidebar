@@ -155,7 +155,23 @@ enum Overlay {
     ConfirmDiscard {
         entry: FileEntry,
     },
+    /// The ⚙ settings modal: mouse-toggleable panel settings.
+    Settings {
+        selected: usize,
+        rect: Rect,
+    },
 }
+
+/// One row of the Settings modal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Setting {
+    UnifiedSidebar,
+    IconTheme,
+}
+
+/// (setting, label, current value, enabled) — disabled rows render dimmed and
+/// don't toggle.
+type SettingRow = (Setting, &'static str, String, bool);
 
 /// Where the list body was drawn last frame, for mouse hit-testing.
 #[derive(Clone, Copy, Default)]
@@ -165,13 +181,15 @@ struct BodyGeom {
     offset: usize,
 }
 
-/// Clickable regions of the activity bar / message box, from the last draw.
+/// Clickable regions of the activity bar / header / message box, from the
+/// last draw.
 #[derive(Clone, Copy, Default)]
 struct ClickZones {
     activity_row: u16,
     explorer: (u16, u16),
     source_control: (u16, u16),
-    detach: (u16, u16),
+    /// The ⚙ button (activity bar in unified mode, header otherwise).
+    gear: Rect,
     message: Rect,
     sparkle: Rect,
     button: Rect,
@@ -338,12 +356,12 @@ impl App {
                     self.message = message.chars().collect();
                     self.cursor = self.message.len();
                     self.focus = Focus::Message;
-                    self.flash = Some(("✨ suggestion ready — edit or ⏎ to commit".into(), false));
+                    self.flash = Some(("✧ suggestion ready — edit or ⏎ to commit".into(), false));
                     self.suggesting = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.flash = Some(("✨ generation failed".into(), true));
+                    self.flash = Some(("✧ generation failed".into(), true));
                     self.suggesting = None;
                 }
             }
@@ -510,8 +528,7 @@ impl App {
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('i') => self.theme = self.theme.toggled(),
             KeyCode::Char('A') => self.suggest_message(),
-            KeyCode::Char('m') => self.merge_on(),
-            KeyCode::Char('d') => self.detach(),
+            KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => return self.switch_to(View::SourceControl),
             _ => {}
@@ -554,10 +571,10 @@ impl App {
             if within(x, z.source_control) {
                 return self.switch_to(View::SourceControl);
             }
-            if within(x, z.detach) {
-                self.detach();
-                return None;
-            }
+        }
+        if hits(z.gear, x, y) {
+            self.open_settings();
+            return None;
         }
         if hits(z.sparkle, x, y) {
             self.suggest_message();
@@ -625,8 +642,10 @@ impl App {
             Nothing,
             Close,
             Activate,
+            ToggleSetting(usize),
             DiscardConfirmed(FileEntry),
         }
+        let row_count = self.settings_rows().len();
         let cmd = match self.overlay.as_mut() {
             Some(Overlay::Menu { entries, selected, .. }) => match key.code {
                 KeyCode::Esc => Cmd::Close,
@@ -641,6 +660,19 @@ impl App {
                 KeyCode::Enter => Cmd::Activate,
                 _ => Cmd::Nothing,
             },
+            Some(Overlay::Settings { selected, .. }) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => Cmd::Close,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *selected = selected.saturating_sub(1);
+                    Cmd::Nothing
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *selected = (*selected + 1).min(row_count.saturating_sub(1));
+                    Cmd::Nothing
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => Cmd::ToggleSetting(*selected),
+                _ => Cmd::Nothing,
+            },
             Some(Overlay::ConfirmDiscard { entry }) => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Cmd::DiscardConfirmed(entry.clone()),
                 _ => Cmd::Close,
@@ -651,6 +683,7 @@ impl App {
             Cmd::Nothing => {}
             Cmd::Close => self.overlay = None,
             Cmd::Activate => self.activate_menu_entry(),
+            Cmd::ToggleSetting(index) => self.toggle_setting(index),
             Cmd::DiscardConfirmed(entry) => {
                 self.overlay = None;
                 let result = match &self.repo {
@@ -671,9 +704,41 @@ impl App {
             Nothing,
             Close,
             Activate,
+            ToggleSetting(usize),
             Reopen(u16, u16),
         }
+        let row_count = self.settings_rows().len();
         let cmd = match self.overlay.as_mut() {
+            Some(Overlay::Settings { selected, rect }) => {
+                // Rows start just inside the top border (the title renders ON
+                // the border, not on its own line).
+                let row_at = |row: u16, col: u16| -> Option<usize> {
+                    (col > rect.x
+                        && col < rect.x + rect.width.saturating_sub(1)
+                        && row > rect.y
+                        && row < rect.y + 1 + row_count as u16)
+                        .then(|| usize::from(row - rect.y - 1))
+                };
+                match mouse.kind {
+                    MouseEventKind::Moved => {
+                        if let Some(i) = row_at(mouse.row, mouse.column) {
+                            *selected = i;
+                        }
+                        Cmd::Nothing
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        match row_at(mouse.row, mouse.column) {
+                            Some(i) => {
+                                *selected = i;
+                                Cmd::ToggleSetting(i)
+                            }
+                            None if hits(*rect, mouse.column, mouse.row) => Cmd::Nothing,
+                            None => Cmd::Close,
+                        }
+                    }
+                    _ => Cmd::Nothing,
+                }
+            }
             Some(Overlay::Menu { entries, selected, rect, .. }) => {
                 let inner = rect.inner(ratatui::layout::Margin::new(1, 1));
                 let item_at = |row: u16, col: u16| -> Option<usize> {
@@ -712,11 +777,102 @@ impl App {
             Cmd::Nothing => {}
             Cmd::Close => self.overlay = None,
             Cmd::Activate => self.activate_menu_entry(),
+            Cmd::ToggleSetting(index) => self.toggle_setting(index),
             Cmd::Reopen(x, y) => {
                 self.overlay = None;
                 self.open_context_menu(x, y);
             }
         }
+    }
+
+    // ---- Settings modal ----
+
+    fn open_settings(&mut self) {
+        self.overlay = Some(Overlay::Settings { selected: 0, rect: Rect::default() });
+    }
+
+    /// The modal's rows for the current state.
+    fn settings_rows(&self) -> Vec<SettingRow> {
+        vec![
+            (
+                Setting::UnifiedSidebar,
+                "Unified sidebar",
+                if self.merged() { "on" } else { "off" }.to_string(),
+                self.other_exe.is_some(),
+            ),
+            (
+                Setting::IconTheme,
+                "Icon theme",
+                match self.theme {
+                    IconTheme::Material => "material",
+                    IconTheme::Emoji => "emoji",
+                }
+                .to_string(),
+                true,
+            ),
+        ]
+    }
+
+    fn toggle_setting(&mut self, index: usize) {
+        let rows = self.settings_rows();
+        let Some(row) = rows.get(index) else { return };
+        let (setting, enabled) = (row.0, row.3);
+        if !enabled {
+            return;
+        }
+        match setting {
+            Setting::UnifiedSidebar => {
+                // The pane layout changes underneath the modal; close it.
+                self.overlay = None;
+                let on = !self.merged();
+                self.set_unified(on);
+            }
+            Setting::IconTheme => self.theme = self.theme.toggled(),
+        }
+    }
+
+    /// Render the centered Settings popup and remember its rect for clicks.
+    fn draw_settings(&mut self, frame: &mut Frame) {
+        let rows = self.settings_rows();
+        let Some(Overlay::Settings { selected, rect }) = self.overlay.as_mut() else {
+            return;
+        };
+        let area = frame.area();
+        let width = 30.min(area.width);
+        let height = (rows.len() as u16 + 3).min(area.height);
+        let popup = Rect::new(
+            (area.width.saturating_sub(width)) / 2,
+            (area.height.saturating_sub(height)) / 3,
+            width,
+            height,
+        );
+        *rect = popup;
+
+        let inner_w = usize::from(width.saturating_sub(2));
+        let mut lines: Vec<Line> = Vec::new();
+        for (i, (_, label, value, enabled)) in rows.iter().enumerate() {
+            let pad = inner_w.saturating_sub(label.chars().count() + value.chars().count() + 2);
+            let text = format!(" {label}{}{value} ", " ".repeat(pad.max(1)));
+            let style = if !enabled {
+                Style::default().dim()
+            } else if i == *selected {
+                Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::styled(text, style));
+        }
+        lines.push(Line::from(" click/⏎ toggle · esc close".dim()));
+
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::bordered()
+                    .title(" Settings ")
+                    .border_style(Style::default().dim()),
+            ),
+            popup,
+        );
     }
 
     fn activate_menu_entry(&mut self) {
@@ -756,35 +912,24 @@ impl App {
         }
     }
 
-    // ---- Merged-sidebar operations ----
+    // ---- Unified-sidebar operations ----
 
-    /// Turn the merged sidebar on from this panel: adopt this pane as the
-    /// Sidebar and close the other panel's standalone pane in this tab.
-    fn merge_on(&mut self) {
-        if self.merged() {
+    /// Toggle the unified sidebar. On: adopt this pane as the Sidebar and
+    /// close the other panel's standalone pane in this tab. Off: split the
+    /// other view back out into its own pane. Deliberately silent — the
+    /// layout change is its own feedback.
+    fn set_unified(&mut self, on: bool) {
+        if on == self.merged() || self.other_exe.is_none() {
             return;
         }
-        if self.other_exe.is_none() {
-            self.flash = Some(("install herdr-aa-filetree to merge".into(), true));
-            return;
-        }
-        self.sidebar_state = sidebar::State { merged: true, active: MY_VIEW };
-        sidebar::save_state(self.sidebar_state);
-        self.close_other_standalone_pane();
-        self.apply_identity();
-        self.flash = Some(("merged into Sidebar — 1/2 switch views, d detach".into(), false));
-    }
-
-    /// Split the other view back out into its own pane and leave merged mode.
-    fn detach(&mut self) {
-        if !self.merged() {
-            return;
-        }
-        self.sidebar_state = sidebar::State { merged: false, active: MY_VIEW };
+        self.sidebar_state = sidebar::State { merged: on, active: MY_VIEW };
         sidebar::save_state(self.sidebar_state);
         self.apply_identity();
-        self.spawn_other_pane();
-        self.flash = Some(("detached — panels are separate again".into(), false));
+        if on {
+            self.close_other_standalone_pane();
+        } else {
+            self.spawn_other_pane();
+        }
     }
 
     /// Hand the pane to the other view (the supervisor swaps processes).
@@ -922,7 +1067,7 @@ impl App {
             }
             Ok((diff, files)) => {
                 self.suggesting = Some(suggest::spawn(diff, files));
-                self.flash = Some(("✨ generating commit message…".into(), false));
+                self.flash = Some(("✧ generating commit message…".into(), false));
             }
             Err(e) => self.flash = Some((e, true)),
         }
@@ -997,8 +1142,10 @@ impl App {
         self.draw_list(frame, list);
         frame.render_widget(Paragraph::new(footer_lines), footer);
 
-        if matches!(self.overlay, Some(Overlay::Menu { .. })) {
-            self.draw_menu(frame);
+        match self.overlay {
+            Some(Overlay::Menu { .. }) => self.draw_menu(frame),
+            Some(Overlay::Settings { .. }) => self.draw_settings(frame),
+            _ => {}
         }
     }
 
@@ -1029,27 +1176,40 @@ impl App {
         self.zones.activity_row = area.y;
         self.zones.explorer = bounds[1];
         self.zones.source_control = bounds[3];
-        let detach = Span::styled(" ◫ ", Style::default().dim());
-        let detach_w = detach.width() as u16;
-        let detach_x = area.x + area.width.saturating_sub(detach_w);
-        self.zones.detach = (detach_x, detach_x + detach_w);
+        let gear = Span::styled(format!(" {} ", gear_icon(self.theme)), Style::default().dim());
+        let gear_w = gear.width() as u16;
+        let gear_x = area.x + area.width.saturating_sub(gear_w);
+        self.zones.gear = Rect::new(gear_x, area.y, gear_w, 1);
 
         let pad = usize::from(area.width)
-            .saturating_sub(spans.iter().map(Span::width).sum::<usize>() + usize::from(detach_w));
+            .saturating_sub(spans.iter().map(Span::width).sum::<usize>() + usize::from(gear_w));
         let mut line = spans.to_vec();
         line.push(Span::raw(" ".repeat(pad)));
-        line.push(detach);
+        line.push(gear);
         frame.render_widget(Paragraph::new(Line::from(line)), area);
     }
 
-    fn draw_header(&self, frame: &mut Frame, area: Rect) {
+    fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
         let left = Span::styled(" ▾ CHANGES", Style::default().bold());
         let branch = Span::styled(format!("{} ", self.status.branch), Style::default().dim());
+        // In unified mode the ⚙ lives in the activity bar; standalone puts it
+        // at the header's right edge.
+        let gear = if self.merged() {
+            None
+        } else {
+            Some(Span::styled(format!("{} ", gear_icon(self.theme)), Style::default().dim()))
+        };
+        let gear_w = gear.as_ref().map(Span::width).unwrap_or(0);
         let pad = (area.width as usize)
-            .saturating_sub(left.width() + branch.width())
+            .saturating_sub(left.width() + branch.width() + gear_w)
             .max(1);
-        let line = Line::from(vec![left, Span::raw(" ".repeat(pad)), branch]);
-        frame.render_widget(Paragraph::new(line), area);
+        let mut spans = vec![left, Span::raw(" ".repeat(pad)), branch];
+        if let Some(gear) = gear {
+            let gx = area.x + area.width.saturating_sub(gear_w as u16);
+            self.zones.gear = Rect::new(gx, area.y, gear_w as u16, 1);
+            spans.push(gear);
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn draw_message(&mut self, frame: &mut Frame, area: Rect) {
@@ -1064,15 +1224,13 @@ impl App {
         frame.render_widget(boxed, area);
         self.zones.message = area;
 
-        // The ✨ suggest button lives at the right end of the input line.
-        let sparkle_glyph = if self.suggesting.is_some() { "…" } else { "✨" };
+        // The ✧ suggest button lives at the right end of the input line — an
+        // outline glyph in the normal foreground, not the colored ✨ emoji.
+        let sparkle_glyph = if self.suggesting.is_some() { "…" } else { "✧" };
         let sparkle_w = Span::raw(sparkle_glyph).width() as u16 + 1;
         let [text_area, sparkle_area] =
             Layout::horizontal([Constraint::Min(0), Constraint::Length(sparkle_w)]).areas(inner);
-        frame.render_widget(
-            Paragraph::new(sparkle_glyph).style(Style::default().bold()),
-            sparkle_area,
-        );
+        frame.render_widget(Paragraph::new(sparkle_glyph), sparkle_area);
         self.zones.sparkle = sparkle_area;
 
         if self.message.is_empty() && !focused {
@@ -1194,15 +1352,13 @@ impl App {
             "a all",
             "u none",
             "c msg",
-            "A ✨msg",
-            "i icons",
+            "A ✧msg",
+            "s settings",
             "r refresh",
             "q quit",
         ];
         if self.merged() {
-            hints.extend(["1 files", "2 git", "d detach"]);
-        } else if self.other_exe.is_some() {
-            hints.push("m merge");
+            hints.extend(["1 files", "2 git"]);
         }
         wrap_hints(&hints, width, 0)
     }
@@ -1263,6 +1419,14 @@ fn activity_icons(theme: IconTheme) -> (&'static str, &'static str) {
     match theme {
         IconTheme::Material => ("\u{f07b}", "\u{e725}"),
         IconTheme::Emoji => ("📁", "🔀"),
+    }
+}
+
+/// Theme-matched ⚙ settings glyph.
+fn gear_icon(theme: IconTheme) -> &'static str {
+    match theme {
+        IconTheme::Material => "\u{f013}",
+        IconTheme::Emoji => "⚙",
     }
 }
 
