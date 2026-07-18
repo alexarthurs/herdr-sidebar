@@ -1,21 +1,101 @@
-# herdr plugins
+<div align="center">
 
-Home of **[herdr-aa-sidebar](plugins/herdr-aa-sidebar)** — VS Code's sidebar, rebuilt for the terminal as a [herdr](https://github.com/ogulcancelik/herdr) plugin.
+# Herdr Sidebar
 
-[![The sidebar in action](plugins/herdr-aa-sidebar/docs/media/hero.png)](plugins/herdr-aa-sidebar)
+### VS Code's sidebar, living in your terminal.
 
-A file explorer and a full source-control panel (staging, commits, ✧ AI-drafted commit messages, sync, multi-repo, history drawers) in one dockable pane, with an activity bar to flip between them — or split into two panes if that's your style. Mouse-first, keyboard-complete, always docked where you expect it.
+A file explorer and a full source-control panel in one dockable
+[herdr](https://github.com/ogulcancelik/herdr) pane — activity-bar switching, mouse
+everywhere, AI-drafted commit messages, and a file preview that opens right beside the tree.
 
-**→ [Read the full tour & install instructions](plugins/herdr-aa-sidebar)**
+<img alt="Rust" src="https://img.shields.io/badge/Rust-self--contained_crate-orange?logo=rust&logoColor=white">
+<img alt="herdr" src="https://img.shields.io/badge/herdr-%E2%89%A5%200.7-5865a3">
+<img alt="Platforms" src="https://img.shields.io/badge/Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-supported-2ea44f">
+<img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
+
+<br><br>
+
+<img src="plugins/herdr-aa-sidebar/docs/media/hero.png" alt="The sidebar: explorer view with a live file preview beside it" width="920">
+
+</div>
+
+If you've ever alt-tabbed out of your terminal just to *look* at something — the tree, the
+diff, what's staged — this closes that loop. The sidebar docks on the left of every herdr
+tab, restores itself on focus, and is driven entirely by click or keystroke.
 
 ```
-herdr plugin install <owner>/<repo>/plugins/herdr-aa-sidebar
+herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-aa-sidebar
 ```
 
-## Local development
+---
 
-The plugin is a **self-contained Rust crate** (own `Cargo.toml`, own `target/`) so it installs
-straight from its subdirectory:
+## One pane. Two views. Zero friction.
+
+The activity bar at the top flips between **Explorer** and **Source Control** — *in
+process*, so switching is instant: no respawn, no flicker, no lost state on the way. Both
+views ship in one small Rust binary.
+
+### 🗂 The Explorer
+
+A real tree, not a directory dump:
+
+- Disclosure chevrons, nested indentation, and **two icon themes** — colored Nerd Font
+  glyphs (Atom-Material style) or emoji, toggled live.
+- **Click a file and it opens** in a preview pane beside the sidebar (line numbers,
+  scrolling, binary-safe). Click another file — the same pane updates in place.
+- **Double-click folders** to fold, hover highlights, mouse wheel, and a
+  **Ctrl+right-click context menu**: New File, New Folder, Rename, Delete, Copy Path /
+  Relative Path, Reveal in File Explorer.
+- Dotfiles toggle, live refresh, and a collapse-to-sliver mode when you want the columns back.
+
+### 🔀 Source Control
+
+<div align="center">
+<img src="plugins/herdr-aa-sidebar/docs/media/source-control.png" alt="Source control: multi-repo staging, per-repo commit boxes, history drawers" width="920">
+</div>
+
+Everything you use VS Code's SCM view for, in a terminal pane:
+
+- **Stage, unstage, discard, commit** — by key or click, with Staged/Changes sections,
+  count badges, and status letters in VS Code's git colors.
+- **✧ AI commit messages** — the sparkle button sends the pending diff to your local
+  `claude` CLI and drops a drafted subject line into the message box. No claude? A clean
+  filename-based fallback kicks in. Never blocks the UI.
+- **Sync Changes** — a `⇅ 1↑ 2↓` button appears when you're ahead/behind upstream; one
+  press runs `pull --rebase --autostash` + `push` in the background.
+- **Multi-repo, the VS Code way** — child repositories are auto-discovered, each with its
+  own header (branch, dirty `*`, sync/commit icons), message box, and Commit button.
+- **History drawers**: GRAPH, COMMITS, FILE HISTORY (follows your selection), BRANCHES,
+  REMOTES, STASHES, TAGS.
+- **Auto-refreshing** — commits and edits made anywhere show up within seconds.
+
+## Prefer two panels? Take two panels.
+
+<div align="center">
+<img src="plugins/herdr-aa-sidebar/docs/media/separated.png" alt="Separated mode: Source Control and Explorer as independent panes, preview beside them" width="920">
+</div>
+
+<img src="plugins/herdr-aa-sidebar/docs/media/settings.png" alt="The settings modal" align="right" width="300">
+
+The ⚙ settings modal — mouse-toggleable like everything else — flips between:
+
+- **Unified sidebar**: both views share one pane, the activity bar switches instantly.
+- **Separated panels**: Explorer and Source Control as independent side-by-side panes.
+
+Icon theme and dotfile visibility live in the same modal, and every choice persists
+across restarts. However you split it, the dock takes care of itself: a focus hook
+re-docks the sidebar in any tab or workspace that's missing one — new project, new
+worktree, new window, it's just *there*.
+
+<br clear="right">
+
+## Install
+
+```
+herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-aa-sidebar
+```
+
+or from a local checkout:
 
 ```
 cd plugins/herdr-aa-sidebar
@@ -23,6 +103,54 @@ cargo build --release
 herdr plugin link .
 ```
 
-`herdr plugin action list` shows the plugin's actions; `herdr plugin log list --plugin <id>`
-shows its logs. See `CLAUDE.md` for the full dev workflow, verified herdr behavior notes, and
-Windows caveats.
+Open it with an action (or just focus a tab and let the hook dock it):
+
+```
+herdr plugin action invoke herdr-aa-sidebar.open-sidebar-windows   # windows
+herdr plugin action invoke herdr-aa-sidebar.open-sidebar           # linux / macos
+```
+
+**Requirements:** Rust to build, herdr ≥ 0.7. **Recommended:** a Nerd Font terminal face
+for the material icons (the emoji theme works in any font), and the
+[`claude` CLI](https://claude.com/claude-code) for ✧ commit messages.
+
+## Keys
+
+| Explorer | | Source Control | |
+|---|---|---|---|
+| `↑↓` / `jk` | move | `⏎` | stage / unstage |
+| `←→` / `hl` | fold / unfold | `a` / `u` | stage all / none |
+| `⏎` | toggle folder · preview file | `c` | focus message box |
+| `r` | refresh | `A` | ✧ suggest message |
+| `.` | dotfiles | `S` | sync ↑↓ |
+| `b` | collapse to sliver | `r` | refresh |
+| `s` | settings | `s` | settings |
+| `1` / `2` | switch view | `1` / `2` | switch view |
+
+…and the mouse for all of it: click, double-click, scroll, hover, Ctrl+right-click menus.
+
+## Actions
+
+| Action | What it does |
+|---|---|
+| `open-sidebar` / `open-sidebar-windows` | Toggle the sidebar: open left-docked / focus / close |
+| `open-git` / `open-git-windows` | Toggle a separate Source Control pane (separated mode) |
+| `redeploy` / `redeploy-windows` | After a rebuild: refresh every workspace onto the new build |
+
+## Under the hood
+
+- **One self-contained Rust crate** — ratatui + crossterm + serde, nothing else. Both
+  views compile into one binary; separated panes are the same binary pinned with `--view`.
+- All herdr control (docking, labels, identity tokens, pane spawning) goes over **herdr's
+  socket API directly**; the Windows focus hooks run a windowless GUI-subsystem sidecar so
+  nothing ever flashes a console window.
+- The left dock survives real layouts — split-the-leftmost + swap, full-height repair,
+  ratio-aware resizing — all unit-tested against herdr's actual JSON.
+- Windows quirks (exe locking, PowerShell 5.1 BOMs, double-width Nerd Font glyphs) are
+  handled, and the hard-won findings are documented in [`CLAUDE.md`](CLAUDE.md).
+
+---
+
+<div align="center">
+<sub>Screenshots: herdr on Windows Terminal, CaskaydiaCove Nerd Font.</sub>
+</div>
