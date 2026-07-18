@@ -2,7 +2,7 @@
 
 # Herdr Sidebar
 
-### The sidebar your terminal was missing — lovingly inspired by VS Code.
+### The sidebar your terminal was missing — inspired by VS Code.
 
 A file explorer and a full source-control panel in one dockable
 [herdr](https://github.com/ogulcancelik/herdr) pane — activity-bar switching, mouse
