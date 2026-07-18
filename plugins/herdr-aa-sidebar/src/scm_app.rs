@@ -1129,7 +1129,7 @@ impl App {
         None
     }
 
-    /// Ctrl+right-click: the VS Code / GitLens-style context menu.
+    /// Ctrl+right-click: the VS Code-style context menu.
     fn open_context_menu(&mut self, x: u16, y: u16) {
         let Some(index) = self.row_at(y) else { return };
         self.select(index);
@@ -1170,7 +1170,7 @@ impl App {
         });
     }
 
-    /// The GitLens-style menu for a commit / branch / stash / remote / tag.
+    /// The context menu for a commit / branch / stash / remote / tag.
     fn open_drawer_menu(&mut self, x: u16, y: u16, kind: Drawer, index: usize) {
         let Some(dref) = self.drawers[kind.index()].refs.get(index) else { return };
         let entries: Vec<MenuEntry> = match dref {
