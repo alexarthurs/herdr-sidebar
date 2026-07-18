@@ -126,6 +126,9 @@ enum PromptKind {
     NewFile(PathBuf),
     NewFolder(PathBuf),
     Rename(PathBuf),
+    /// Re-root the whole sidebar at a typed path (absolute, relative to the
+    /// current root, or ~-prefixed).
+    ChangeFolder,
 }
 
 /// A modal layered over the tree: the context menu, a name prompt, or a
@@ -482,6 +485,7 @@ impl App {
             }
             KeyCode::Char('i') => self.theme = self.theme.toggled(),
             KeyCode::Char('b') => self.collapse(),
+            KeyCode::Char('c') => self.change_folder_prompt(),
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => return self.switch_to(View::SourceControl),
@@ -938,11 +942,56 @@ impl App {
                 let path = target.map(|(p, _)| p).unwrap_or_else(|| self.tree.root_path());
                 actions::reveal(&path);
             }
+            MenuAction::ChangeFolder => self.change_folder_prompt(),
         }
+    }
+
+    /// `c` / the context menu: prompt for a new root folder, prefilled with
+    /// the current one so relative tweaks are quick.
+    fn change_folder_prompt(&mut self) {
+        self.overlay = Some(Overlay::Prompt {
+            title: "Folder".into(),
+            input: self.tree.root_path().display().to_string(),
+            kind: PromptKind::ChangeFolder,
+        });
+    }
+
+    /// Re-root everything at `target` (also the PROCESS cwd, so the Source
+    /// Control view follows on the next view switch).
+    fn change_folder(&mut self, raw: &str) {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            self.notice = Some("empty path".into());
+            return;
+        }
+        let expanded = match raw.strip_prefix('~') {
+            Some(rest) => {
+                let home = std::env::var("USERPROFILE")
+                    .or_else(|_| std::env::var("HOME"))
+                    .unwrap_or_default();
+                format!("{home}{rest}")
+            }
+            None => raw.to_string(),
+        };
+        let target = PathBuf::from(&expanded);
+        let target =
+            if target.is_relative() { self.tree.root_path().join(target) } else { target };
+        if !target.is_dir() || std::env::set_current_dir(&target).is_err() {
+            self.notice = Some(format!("not a folder: {raw}"));
+            return;
+        }
+        let root = std::env::current_dir().unwrap_or(target);
+        *self = App::new(root);
+        self.notice = Some(format!("folder: {}", self.tree.root_name()));
     }
 
     fn confirm_prompt(&mut self) {
         let Some(Overlay::Prompt { input, kind, .. }) = self.overlay.take() else { return };
+        // Folder changes take a full PATH — they skip the name validation.
+        if matches!(kind, PromptKind::ChangeFolder) {
+            self.change_folder(&input);
+            return;
+        }
         let Some(name) = actions::validate_name(&input) else {
             self.notice = Some("invalid name".into());
             return;
@@ -951,6 +1000,7 @@ impl App {
             PromptKind::NewFile(dir) => actions::create_file(dir, name),
             PromptKind::NewFolder(dir) => actions::create_folder(dir, name),
             PromptKind::Rename(path) => actions::rename(path, name),
+            PromptKind::ChangeFolder => unreachable!("handled above"),
         };
         match result {
             Ok(created) => {
@@ -1222,6 +1272,7 @@ impl App {
             ("⏎", "toggle"),
             ("r", "refresh"),
             (".", "dotfiles"),
+            ("c", "folder"),
             ("s", "settings"),
             ("b", "collapse"),
             ("q", "quit"),

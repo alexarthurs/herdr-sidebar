@@ -96,8 +96,13 @@ Pane geometry & CLI semantics:
   window — the floor is per-split-rect — but the sidebar's column is a root-split child.)
 - There is no focus-by-id; focusing a pane is a `pane zoom <id> --on` / `--off` cycle.
 - `pane send-keys` accepts only a limited key-name set: `Up`/`Down`/`Enter`/`Escape`/`Tab`
-  and plain characters work, but `Home` is rejected with `invalid_key`. Give TUIs
+  and plain characters work, but `Home` is rejected with `invalid_key` and
+  `PageDown`/`PgDn`/`page-down`/`pgdn` are all rejected as unsupported too. Give TUIs
   single-char fallbacks (`g`/`G` for Home/End) so they stay drivable via send-keys.
+- A `pane list` snapshot goes stale the moment you `pane close` a pane: if the closed pane
+  was the focused one, the old snapshot still reports it as focused, so deriving a
+  split/layout target from it yields `pane_not_found`. Re-run `pane list` AFTER any close
+  before computing where to open a replacement pane (bit both notes launchers' REPLACE path).
 - Panes are **tab-scoped only**. Plugin pane placements are exactly
   `overlay|popup|split|tab|zoomed` — plugins cannot add workspace-level chrome (e.g. a real
   sidebar next to herdr's own); the closest approximation is a per-tab dock via event hooks.
@@ -195,6 +200,10 @@ HACKING.md — budget time for that before promising a patched build.
   indistinguishable from plain Enter** in most Windows terminals — a "Ctrl+Enter" binding
   silently means "Enter". Design keymaps so unmodified keys suffice (the commit
   box accepts plain Enter for this reason).
+- **AltGr arrives from Windows as CONTROL|ALT on the Char event** in crossterm (no AltGr
+  normalization): a guard like `modifiers.contains(CONTROL) => shortcut, return` silently
+  swallows `@ { [ ] } \` on German/French/Nordic layouts. Treat CONTROL+ALT chars as text
+  to insert, only CONTROL-without-ALT as a shortcut.
 - Emoji with variation-selector (VS16) sequences render at inconsistent widths across
   terminal emulators and break column alignment — the shared icon map avoids them; keep it
   that way when adding icons.
@@ -208,6 +217,16 @@ HACKING.md — budget time for that before promising a patched build.
   every ~5s; launch decisions treat a stamp older than `HEARTBEAT_STALE_SECS` (20s) — or a
   "Sidebar" label with no token at all — as a corpse and return `REPLACE <id>`: close the
   pane, dock a fresh one. Ensure hook and all launcher scripts handle it.
+- **Stamp the heartbeat on EVERY event-loop iteration, not only in the poll-timeout
+  branch**: sustained input with <500ms gaps (held-key auto-repeat, a long paste) keeps
+  `event::poll` returning true, starving a timeout-branch heartbeat until the launcher
+  deems the live pane stale and REPLACE-kills it mid-edit. Same for a debounced autosave
+  flush. Both self-throttle, so calling them unconditionally each iteration is free.
+- **`pane close` kills the TUI process with no chance to flush** (no signal/console-close
+  it can catch in practice) — any debounced-autosave state inside the debounce window dies
+  with it. Toggle-off launchers should first drive a graceful save+quit via
+  `pane send-keys <id> Escape q` (design the keymap so Esc-then-q saves and quits from
+  every mode), short sleep, THEN `pane close` as the cleanup.
 
 ### Unified sidebar (see `src/state.rs`)
 
@@ -223,6 +242,9 @@ HACKING.md — budget time for that before promising a patched build.
 - The unified pane reports BOTH identity tokens (`herdr-aa-sidebar-explorer`,
   `herdr-aa-sidebar-git`) so either launcher decision finds it; turning unified off clears
   the other token (null value — report_metadata MERGES token maps).
+- `c` (or the context menu's "Change Folder…") re-roots the sidebar: a path prompt
+  (absolute, relative to the current root, or ~-prefixed) that swaps the PROCESS cwd, so
+  the other view follows on its next switch. Rejected non-folders just flash a notice.
 - Gotcha: after the ✧ suggestion lands, panel focus moves to the message box — letter keys
   then type text instead of triggering actions (Esc returns to the list).
 
