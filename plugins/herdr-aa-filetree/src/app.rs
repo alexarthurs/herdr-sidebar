@@ -206,6 +206,10 @@ pub struct App {
 /// How long two clicks on the same row still count as a double click.
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(450);
 
+/// The activity bar's strip background (a shade off the pane background so
+/// the half-block margins read as part of the bar).
+const ACTIVITY_BG: Color = Color::Rgb(0x2a, 0x2d, 0x33);
+
 /// Activity-bar click zones from the last draw: the bar's row and the column
 /// ranges of the explorer / source-control icons.
 #[derive(Clone, Copy)]
@@ -1218,22 +1222,34 @@ impl App {
     }
 
     /// The VS Code activity bar: view-switcher icons plus a detach button.
-    /// The area is three rows tall — icons on the middle one, one blank
-    /// spacer row each side.
+    /// The area is three rows tall, but the outer rows are HALF-block strip
+    /// extensions of the bar's background — a half-row margin above and
+    /// below the icons, which whole blank rows can't express.
     fn draw_activity_bar(&mut self, frame: &mut Frame, area: Rect) {
+        let strip = "▄".repeat(usize::from(area.width));
+        frame.render_widget(
+            Paragraph::new(strip).style(Style::default().fg(ACTIVITY_BG)),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        let strip = "▀".repeat(usize::from(area.width));
+        frame.render_widget(
+            Paragraph::new(strip).style(Style::default().fg(ACTIVITY_BG)),
+            Rect::new(area.x, area.y + 2, area.width, 1),
+        );
         let area = Rect::new(area.x, area.y + 1, area.width, 1);
         let (exp_icon, git_icon) = activity_icons(self.theme);
+        let base = Style::default().bg(ACTIVITY_BG);
         let active = |on: bool| {
             if on {
                 Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().dim()
+                base.dim()
             }
         };
         let spans = [
-            Span::raw(" "),
+            Span::styled(" ", base),
             Span::styled(format!(" {exp_icon} "), active(true)),
-            Span::raw(" "),
+            Span::styled(" ", base),
             Span::styled(format!(" {git_icon} "), active(false)),
         ];
         // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
@@ -1249,7 +1265,7 @@ impl App {
             explorer: bounds[1],
             source_control: bounds[3],
         };
-        let gear = Span::styled(format!(" {} ", gear_icon(self.theme)), Style::default().dim());
+        let gear = Span::styled(format!(" {} ", gear_icon(self.theme)), base.dim());
         let gear_w = gear.width() as u16;
         let gear_x = area.x + area.width.saturating_sub(gear_w);
         self.gear = Rect::new(gear_x, area.y, gear_w, 1);
@@ -1257,7 +1273,7 @@ impl App {
         let pad = usize::from(area.width)
             .saturating_sub(spans.iter().map(Span::width).sum::<usize>() + usize::from(gear_w));
         let mut line = spans.to_vec();
-        line.push(Span::raw(" ".repeat(pad)));
+        line.push(Span::styled(" ".repeat(pad), base));
         line.push(gear);
         frame.render_widget(Paragraph::new(Line::from(line)), area);
     }

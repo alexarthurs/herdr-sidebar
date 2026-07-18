@@ -39,6 +39,10 @@ const DELETED: Color = Color::Rgb(0xc7, 0x4e, 0x39);
 const CONFLICT: Color = Color::Rgb(0xe4, 0x67, 0x6b);
 const HOVER_BG: Color = Color::Rgb(48, 52, 60);
 
+/// The activity bar's strip background (a shade off the pane background so
+/// the half-block margins read as part of the bar).
+const ACTIVITY_BG: Color = Color::Rgb(0x2a, 0x2d, 0x33);
+
 /// How many log lines the history-ish drawers fetch.
 const DRAWER_LIMIT: usize = 30;
 
@@ -1470,19 +1474,32 @@ impl App {
     /// The area is three rows tall — icons on the middle one, one blank
     /// spacer row each side.
     fn draw_activity_bar(&mut self, frame: &mut Frame, area: Rect) {
+        // Half-block strips above and below give a HALF-row margin around the
+        // icons (whole blank rows read as too much).
+        let strip = "▄".repeat(usize::from(area.width));
+        frame.render_widget(
+            Paragraph::new(strip).style(Style::default().fg(ACTIVITY_BG)),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        let strip = "▀".repeat(usize::from(area.width));
+        frame.render_widget(
+            Paragraph::new(strip).style(Style::default().fg(ACTIVITY_BG)),
+            Rect::new(area.x, area.y + 2, area.width, 1),
+        );
         let area = Rect::new(area.x, area.y + 1, area.width, 1);
         let (exp_icon, git_icon) = activity_icons(self.theme);
+        let base = Style::default().bg(ACTIVITY_BG);
         let active = |on: bool| {
             if on {
                 Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().dim()
+                base.dim()
             }
         };
         let spans = [
-            Span::raw(" "),
+            Span::styled(" ", base),
             Span::styled(format!(" {exp_icon} "), active(false)),
-            Span::raw(" "),
+            Span::styled(" ", base),
             Span::styled(format!(" {git_icon} "), active(true)),
         ];
         // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
@@ -1496,7 +1513,7 @@ impl App {
         self.zones.activity_row = area.y;
         self.zones.explorer = bounds[1];
         self.zones.source_control = bounds[3];
-        let gear = Span::styled(format!(" {} ", gear_icon(self.theme)), Style::default().dim());
+        let gear = Span::styled(format!(" {} ", gear_icon(self.theme)), base.dim());
         let gear_w = gear.width() as u16;
         let gear_x = area.x + area.width.saturating_sub(gear_w);
         self.zones.gear = Rect::new(gear_x, area.y, gear_w, 1);
@@ -1504,7 +1521,7 @@ impl App {
         let pad = usize::from(area.width)
             .saturating_sub(spans.iter().map(Span::width).sum::<usize>() + usize::from(gear_w));
         let mut line = spans.to_vec();
-        line.push(Span::raw(" ".repeat(pad)));
+        line.push(Span::styled(" ".repeat(pad), base));
         line.push(gear);
         frame.render_widget(Paragraph::new(Line::from(line)), area);
     }
