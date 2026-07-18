@@ -328,6 +328,24 @@ The framed screenshots in `plugins/herdr-aa-sidebar/docs/media/` are produced wi
 scripts in `tools/screenshots/` (capture → crop → frame). Full reshoot procedure, verified
 end-to-end twice:
 
+0. **Shared backdrop (shoot session)** — shots are taken in the isolated
+   `herdr --session shoot` server so herdr's left chrome shows a DUMMY roster, kept
+   IDENTICAL to the herdr-aa-notes repo's shots (mirrored in that repo's CLAUDE.md):
+   spaces `acme-app [main ↑1]` / `acme-api [main]` / `acme-web [dev]` /
+   `billing-service [main]`; agents in acme-app's 2×2 grid: `auth-refactor` (claude),
+   `checkout-tests` (codex), `api-docs` (codex, unsubmitted composer text),
+   `rate-limiter` (claude, unsubmitted composer text); plus FAKE agent rows declared
+   via the socket's `pane.report_agent` (persists over herdr's own detection, no CLI
+   spawned): `flaky-tests` (codex, working, acme-api), `reviewer` (claude, idle,
+   acme-web), `migrations` (codex, working, billing-service). Control the session with
+   `HERDR_SOCKET_PATH` = `C:\Users\Alex\AppData\Roaming\herdr\sessions\shoot\herdr.sock`;
+   its WT window is titled `herdr-shoot` (launched via `attach_shoot.ps1`, which clears
+   inherited HERDR_* env — herdr refuses nested attach). Capture/resize with
+   `capture_titled.ps1 'herdr-shoot' <out>` / `resize_titled.ps1` — the un-titled
+   variants grab the FIRST WT window and are ambiguous with two open. Link the plugin
+   INSIDE the session (`herdr plugin link .` with the socket env set); the ensure hook
+   then docks sidebars on tab focus. Keep agent panes ≤63 cols (compact no-email
+   banner). Leave the session running for the other repo's reshoots.
 1. **Window**: `resize_wt.ps1 1760 996` (note the size it prints as "was" and RESTORE it
    afterwards — the user's own size drifts between shoots). All shots assume 1760×996;
    the crop for it is `crop.ps1 <raw> <out> 8 48 1744 940` (keeps herdr's full chrome —
