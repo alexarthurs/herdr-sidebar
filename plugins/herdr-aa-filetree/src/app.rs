@@ -1235,14 +1235,15 @@ impl App {
                 Style::default().dim()
             }
         };
-        // Material glyphs can render two cells wide; reserve the second
-        // cell inside the chip so the highlight stays centered around them.
+        // The FA folder renders two cells wide in the non-Mono Nerd Font;
+        // reserve its second cell so the highlight stays centered. The MDI
+        // branch glyph draws single-width — no slack, or it sits off center.
         let slack = if self.theme == IconTheme::Material { " " } else { "" };
         let spans = [
             Span::raw(" "),
             Span::styled(format!(" {exp_icon}{slack} "), active(true)),
             Span::raw(" "),
-            Span::styled(format!(" {git_icon}{slack} "), active(false)),
+            Span::styled(format!(" {git_icon} "), active(false)),
         ];
         // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
         let mut x = area.x;
