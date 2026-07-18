@@ -16,6 +16,10 @@ treats the subdirectory as the plugin root, and each plugin's `herdr-plugin.toml
 `./target/release/<bin>` — a shared workspace would hoist `target/` to the repo root and break
 that path. Keep every crate buildable standalone from its own directory.
 
+Consequence: the crates **cannot share code**, so common modules are copy-mirrored and must
+be kept in sync by hand — `icons.rs` (same emoji map in both) and the `launch.rs` pattern
+(stdin-mode launcher helpers). When you change one plugin's copy, check the sibling's.
+
 ## Build / test / lint
 
 Run from inside the plugin directory, not the repo root:
@@ -57,8 +61,9 @@ cargo clippy -- -D warnings
 - herdr panes on this machine run **Windows PowerShell 5.1**: chain with `;` / `if ($?)`,
   never `&&`.
 - **PS 5.1 prepends a UTF-8 BOM when piping into a native process's stdin** (`$json | my.exe`
-  delivers `EF BB BF{...}`; verified live by herdr-aa-filetree). serde_json rejects a BOM before
-  `{`, so anything parsing herdr JSON from stdin must strip a leading `\u{feff}` first.
+  delivers `EF BB BF{...}`; verified live by both plugins). serde_json rejects a BOM before
+  `{`, so anything parsing herdr JSON from stdin must strip a leading `\u{feff}` first (see
+  `strip_bom` in both plugins' `launch.rs`).
 - `cargo build --release` fails with **os error 5 (Access is denied)** while the plugin's TUI is
   running in a pane — Windows locks running exes. Close/quit the pane first, rebuild, relaunch.
 
@@ -78,6 +83,9 @@ Pane geometry & CLI semantics:
   the split's rect from `pane layout`. Ratios clamp at **0.1 minimum**, which bounds how narrow
   a pane can get.
 - There is no focus-by-id; focusing a pane is a `pane zoom <id> --on` / `--off` cycle.
+- `pane send-keys` accepts only a limited key-name set: `Up`/`Down`/`Enter`/`Escape`/`Tab`
+  and plain characters work, but `Home` is rejected with `invalid_key`. Give TUIs
+  single-char fallbacks (`g`/`G` for Home/End) so they stay drivable via send-keys.
 - Panes are **tab-scoped only**. Plugin pane placements are exactly
   `overlay|popup|split|tab|zoomed` — plugins cannot add workspace-level chrome (e.g. a real
   sidebar next to herdr's own); the closest approximation is a per-tab dock via event hooks.
@@ -162,6 +170,25 @@ Building herdr itself from source (for local patches): needs Zig ≥ 0.15.2 on P
 `ZIG=<path>` (build.rs compiles the vendored `libghostty-vt`); the 0.15.2 zig build failed on
 this machine with the known Zig-0.15-Windows linking issue mentioned in libghostty's
 HACKING.md — budget time for that before promising a patched build.
+
+### Terminal/TUI gotchas (both plugins)
+
+- Without keyboard-enhancement protocols (not enabled in herdr panes), **modifier+Enter is
+  indistinguishable from plain Enter** in most Windows terminals — a "Ctrl+Enter" binding
+  silently means "Enter". Design keymaps so unmodified keys suffice (herdr-aa-git's commit
+  box accepts plain Enter for this reason).
+- Emoji with variation-selector (VS16) sequences render at inconsistent widths across
+  terminal emulators and break column alignment — the shared icon map avoids them; keep it
+  that way when adding icons.
+
+### Verifying a plugin TUI end-to-end
+
+Drive the real binary in a throwaway herdr pane instead of unit-testing rendering:
+`pane split --current --no-focus --cwd <scratch repo>`, then `pane run <id> "& '<abs path to exe>'"`
+(PS call operator — a bare path splits on spaces), then `pane send-keys <id> Down Enter …`,
+capture with `pane read <id> --source visible`, and confirm side effects with plain `git`
+commands in the scratch repo. Close the pane when done. Cheap, and it catches layout
+truncation bugs unit tests can't.
 
 ## Herdr workspace
 
