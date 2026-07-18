@@ -21,10 +21,6 @@ treats the subdirectory as the plugin root, and each plugin's `herdr-plugin.toml
 `./target/release/<bin>` — a shared workspace would hoist `target/` to the repo root and break
 that path. Keep every crate buildable standalone from its own directory.
 
-Consequence: the crates **cannot share code**, so common modules are copy-mirrored and must
-be kept in sync by hand — `icons.rs` (same emoji map in both) and the `launch.rs` pattern
-(stdin-mode launcher helpers). When you change one plugin's copy, check the sibling's.
-
 ## Build / test / lint
 
 Run from inside the plugin directory, not the repo root:
