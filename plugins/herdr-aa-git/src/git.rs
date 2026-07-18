@@ -24,8 +24,14 @@ pub struct Status {
     pub branch: String,
     pub staged: Vec<FileEntry>,
     pub unstaged: Vec<FileEntry>,
+    /// Commits ahead of / behind the upstream, from the porcelain `##` header.
+    pub ahead: usize,
+    pub behind: usize,
+    /// The branch has an upstream at all (the header carries `...remote`).
+    pub has_upstream: bool,
 }
 
+#[derive(Clone)]
 pub struct Git {
     root: PathBuf,
 }
@@ -40,6 +46,50 @@ impl Git {
             return Err("not inside a git repository".to_string());
         }
         Ok(Git { root: PathBuf::from(root) })
+    }
+
+    /// All repositories visible from `dir`, VS Code style: the repository
+    /// containing `dir` (if any) plus child repositories up to two directory
+    /// levels down (a `.git` dir, or a `.git` FILE — worktrees/submodules).
+    /// Deduped by root; the containing repo sorts first, children by path.
+    pub fn discover_all(dir: &Path) -> Vec<Git> {
+        let mut repos: Vec<Git> = Vec::new();
+        let mut push = |git: Git| {
+            if !repos.iter().any(|r| r.root == git.root) {
+                repos.push(git);
+            }
+        };
+        if let Ok(git) = Git::discover(dir) {
+            push(git);
+        }
+        for child in child_dirs(dir, 2) {
+            if child.join(".git").exists()
+                && let Ok(git) = Git::discover(&child)
+            {
+                push(git);
+            }
+        }
+        repos
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Display name for repo headers: the root directory's name.
+    pub fn name(&self) -> String {
+        self.root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.root.display().to_string())
+    }
+
+    /// VS Code's Sync Changes: pull (rebase, autostash) then push. Returns a
+    /// short human summary; the caller runs this on a background thread.
+    pub fn sync(&self) -> Result<String, String> {
+        run_in(&self.root, &["pull", "--rebase", "--autostash"])?;
+        run_in(&self.root, &["push"])?;
+        Ok("synced with remote".to_string())
     }
 
     pub fn status(&self) -> Result<Status, String> {
@@ -207,6 +257,8 @@ pub fn parse_status(raw: &str) -> Status {
         }
         if let Some(header) = entry.strip_prefix("## ") {
             status.branch = parse_branch(header);
+            (status.ahead, status.behind) = parse_ahead_behind(header);
+            status.has_upstream = header.contains("...");
             continue;
         }
         let Some((xy, path)) = split_entry(entry) else {
@@ -274,6 +326,47 @@ fn parse_branch(header: &str) -> String {
         .to_string()
 }
 
+/// `(ahead, behind)` from the header's `[ahead 1, behind 2]` suffix (either
+/// half may be absent; `[gone]` and no-bracket headers give zeros).
+fn parse_ahead_behind(header: &str) -> (usize, usize) {
+    let Some(bracket) = header.rsplit_once('[').map(|(_, b)| b.trim_end_matches(']')) else {
+        return (0, 0);
+    };
+    let count_after = |tag: &str| {
+        bracket
+            .split(',')
+            .map(str::trim)
+            .find_map(|part| part.strip_prefix(tag))
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    (count_after("ahead "), count_after("behind "))
+}
+
+/// Directories under `dir`, `depth` levels deep, skipping build/VCS internals
+/// (the repo scan visits each).
+fn child_dirs(dir: &Path, depth: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if depth == 0 {
+        return out;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if matches!(name.as_ref(), ".git" | "target" | "node_modules" | ".claude") {
+            continue;
+        }
+        out.push(path.clone());
+        out.extend(child_dirs(&path, depth - 1));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +381,43 @@ mod tests {
         assert_eq!(parse_status("## git-panel\0").branch, "git-panel");
         assert_eq!(parse_status("## No commits yet on trunk\0").branch, "trunk");
         assert_eq!(parse_status("## HEAD (no branch)\0").branch, "HEAD (no branch)");
+    }
+
+    #[test]
+    fn parses_ahead_behind_and_upstream() {
+        let s = parse_status("## main...origin/main [ahead 3, behind 2]\0");
+        assert_eq!((s.ahead, s.behind, s.has_upstream), (3, 2, true));
+        let s = parse_status("## main...origin/main [behind 4]\0");
+        assert_eq!((s.ahead, s.behind, s.has_upstream), (0, 4, true));
+        let s = parse_status("## main...origin/main\0");
+        assert_eq!((s.ahead, s.behind, s.has_upstream), (0, 0, true));
+        let s = parse_status("## local-only\0");
+        assert_eq!((s.ahead, s.behind, s.has_upstream), (0, 0, false));
+        let s = parse_status("## main...origin/main [gone]\0");
+        assert_eq!((s.ahead, s.behind), (0, 0));
+    }
+
+    #[test]
+    fn discover_all_finds_child_repos_and_dedupes() {
+        let base = std::env::temp_dir().join(format!("aa-git-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // base is NOT a repo; two children are (one nested two levels down),
+        // and a `.git`-less child is ignored.
+        for sub in ["a", "group/b", "plain"] {
+            std::fs::create_dir_all(base.join(sub)).unwrap();
+        }
+        for repo in ["a", "group/b"] {
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(base.join(repo))
+                .output()
+                .unwrap();
+        }
+        let repos = Git::discover_all(&base);
+        let mut names: Vec<String> = repos.iter().map(|r| r.name()).collect();
+        names.sort();
+        assert_eq!(names, ["a", "b"]);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
