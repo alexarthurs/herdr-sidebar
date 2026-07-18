@@ -129,6 +129,13 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         });
     report_identity(&doc.name);
 
+    // Blank the primary screen so pane handoffs never flash the shell.
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
+        crossterm::cursor::MoveTo(0, 0),
+    );
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let mut page: usize = 20;

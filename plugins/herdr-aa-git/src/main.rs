@@ -88,6 +88,10 @@ fn main() -> std::io::Result<()> {
             }
         }
     }
+    // Safety net: switch paths deliberately skip the terminal restore (to
+    // avoid flashing the shell between processes); make every exit clean.
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    ratatui::restore();
     Ok(())
 }
 
@@ -112,11 +116,26 @@ fn run_guest() -> Option<i32> {
 /// before returning matters — a spawned guest re-initializes the same terminal.
 fn run_tui() -> std::io::Result<Exit> {
     let cwd = std::env::current_dir()?;
+    // Blank the PRIMARY screen (shell prompt + the echoed launch command)
+    // before entering the alternate screen: any instant it peeks through —
+    // process handoffs, quitting — shows an empty pane, not shell scrollback.
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
+        crossterm::cursor::MoveTo(0, 0),
+    );
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let result = run(&mut terminal, app::App::new(cwd));
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
-    ratatui::restore();
+    // On a view SWITCH, stay on the alternate screen: the old frame freezes
+    // under the guest's startup instead of flashing the shell prompt. The
+    // guest re-enters the alternate screen itself; main() has a final restore
+    // for every other path.
+    if !matches!(result, Ok(Exit::Switch)) {
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        ratatui::restore();
+    }
     result
 }
 
