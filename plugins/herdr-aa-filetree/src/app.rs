@@ -386,11 +386,11 @@ mod tests {
         let lines = sliver_lines(20);
         let chars: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert_eq!(chars[0], "»");
-        assert!(
-            chars[2]
-                .chars()
-                .all(|c| c == ' ' || ('\u{2580}'..='\u{259f}').contains(&c))
-        );
+        assert!(chars[2].chars().all(|c| {
+            c == ' '
+                || ('\u{2580}'..='\u{259f}').contains(&c)
+                || ('\u{1fb00}'..='\u{1fb3b}').contains(&c)
+        }));
         assert_eq!(sliver_lines(5).len(), 5, "never exceeds the pane height");
     }
 }
