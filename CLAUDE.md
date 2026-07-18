@@ -206,10 +206,13 @@ HACKING.md — budget time for that before promising a patched build.
 
 ### Explorer specifics (herdr-aa-filetree)
 
-- Clicking a file (or Enter on it) opens a ZOOMED preview: the pane zooms via
-  `pane.zoom {pane_id, mode:"on"|"off"}` and shows the file with line numbers; Esc/q or
-  clicking the ← header hands back and restores the label. Double-clicking a folder name
-  toggles it (450ms same-row window — crossterm has no native double-click event).
+- Clicking a file (or Enter on it) opens it in a PREVIEW PANE beside the sidebar (the
+  tree stays visible): one viewer process (`herdr-aa-filetree --preview <control-file>`)
+  per tab, found by its `herdr-aa-filetree-preview` metadata token and steered through a
+  control file it polls every 250ms — further clicks reload in place, no pane churn. The
+  pane lands between sidebar and editor via split-right-neighbor + swap; `q`/Esc/✕ closes
+  it (the viewer pane.closes itself). Double-clicking a folder name toggles it (450ms
+  same-row window — crossterm has no native double-click event).
 - The activity bar row is 3 rows tall (blank padding above/below the icons).
 
 ### Source Control panel specifics (herdr-aa-git)

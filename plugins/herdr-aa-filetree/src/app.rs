@@ -74,14 +74,6 @@ impl PaneCtl {
         );
     }
 
-    /// Zoom our own pane (the file preview fills the tab with it).
-    fn zoom(&self, on: bool) {
-        let _ = herdr_aa_filetree::ipc::call_text(
-            "pane.zoom",
-            serde_json::json!({ "pane_id": self.pane_id, "mode": if on { "on" } else { "off" } }),
-        );
-    }
-
     /// Set or clear the pane label — cleared while collapsed so the sliver has
     /// no border title (herdr shows nothing when label and metadata title are
     /// both absent).
@@ -207,58 +199,12 @@ pub struct App {
     /// The ⚙ button's rect from the last draw (activity bar in unified mode,
     /// header row otherwise).
     gear: Rect,
-    /// Zoomed file preview, replacing the tree while open.
-    preview: Option<Preview>,
     /// Last left-click (row index, when) for double-click detection.
     last_click: Option<(usize, std::time::Instant)>,
 }
 
 /// How long two clicks on the same row still count as a double click.
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(450);
-
-/// A file opened from the tree: the pane zooms and shows its contents until
-/// Esc/q (or a click on the header) hands back.
-struct Preview {
-    name: String,
-    path: PathBuf,
-    lines: Vec<String>,
-    scroll: usize,
-}
-
-/// Preview size guards: don't slurp huge files into a sidebar.
-const PREVIEW_MAX_BYTES: usize = 1024 * 1024;
-const PREVIEW_MAX_LINES: usize = 5000;
-
-impl Preview {
-    fn load(path: &Path) -> Preview {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
-        let lines = match std::fs::read(path) {
-            Err(e) => vec![format!("(unreadable: {e})")],
-            Ok(bytes) => {
-                let head = &bytes[..bytes.len().min(8192)];
-                if head.contains(&0) {
-                    vec![format!("(binary file — {} bytes)", bytes.len())]
-                } else {
-                    let truncated_bytes = bytes.len() > PREVIEW_MAX_BYTES;
-                    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(PREVIEW_MAX_BYTES)]);
-                    let mut lines: Vec<String> =
-                        text.lines().take(PREVIEW_MAX_LINES).map(str::to_string).collect();
-                    if truncated_bytes || text.lines().count() > PREVIEW_MAX_LINES {
-                        lines.push("… (truncated)".to_string());
-                    }
-                    if lines.is_empty() {
-                        lines.push("(empty file)".to_string());
-                    }
-                    lines
-                }
-            }
-        };
-        Preview { name, path: path.to_path_buf(), lines, scroll: 0 }
-    }
-}
 
 /// Activity-bar click zones from the last draw: the bar's row and the column
 /// ranges of the explorer / source-control icons.
@@ -309,7 +255,6 @@ impl App {
             other_exe,
             activity: ActivityZones::default(),
             gear: Rect::default(),
-            preview: None,
             last_click: None,
         };
         app.apply_identity();
@@ -344,64 +289,84 @@ impl App {
         self.collapsed || self.last_width < SLIVER_THRESHOLD
     }
 
-    /// Open a file preview: the pane zooms to fill the tab and shows the file
-    /// (single click on a file, like VS Code's preview open).
+    /// Open a file in the preview pane BESIDE the sidebar (the tree stays
+    /// visible, like VS Code's editor area): write the target into the
+    /// viewer's control file, reusing the running viewer pane when one is
+    /// open in this tab, otherwise spawning one next to us.
     fn open_preview(&mut self, path: &Path) {
-        self.preview = Some(Preview::load(path));
-        if let Some(ctl) = &self.pane_ctl {
-            ctl.zoom(true);
-            if let Some(preview) = &self.preview {
-                ctl.set_label(Some(&preview.name));
-            }
-        }
-    }
-
-    /// Close the preview: unzoom and restore the pane label.
-    fn close_preview(&mut self) {
-        self.preview = None;
-        if let Some(ctl) = &self.pane_ctl {
-            ctl.zoom(false);
-        }
-        // Re-assert label AFTER unzooming (pane_label borrows self).
-        let label = self.pane_label();
-        if let Some(ctl) = &self.pane_ctl {
-            ctl.set_label(Some(label));
-        }
-    }
-
-    fn preview_key(&mut self, key: KeyEvent) {
-        let page = self.page as isize;
-        let Some(preview) = self.preview.as_mut() else { return };
-        let max = preview.lines.len().saturating_sub(1);
-        let scroll = |cur: usize, delta: isize| -> usize {
-            cur.saturating_add_signed(delta).min(max)
+        let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) else {
+            self.notice = Some("preview needs a herdr pane".into());
+            return;
         };
-        match key.code {
-            KeyCode::Esc
-            | KeyCode::Char('q')
-            | KeyCode::Char('h')
-            | KeyCode::Backspace
-            | KeyCode::Left => self.close_preview(),
-            KeyCode::Up | KeyCode::Char('k') => preview.scroll = scroll(preview.scroll, -1),
-            KeyCode::Down | KeyCode::Char('j') => preview.scroll = scroll(preview.scroll, 1),
-            KeyCode::PageUp => preview.scroll = scroll(preview.scroll, -page),
-            KeyCode::PageDown => preview.scroll = scroll(preview.scroll, page),
-            KeyCode::Home | KeyCode::Char('g') => preview.scroll = 0,
-            KeyCode::End | KeyCode::Char('G') => preview.scroll = max,
-            _ => {}
+        let control = herdr_aa_filetree::viewer::control_path(&pane_id);
+        if let Err(e) = std::fs::write(&control, path.display().to_string()) {
+            self.notice = Some(format!("preview failed: {e}"));
+            return;
         }
+        // A running viewer in this tab follows the control file by itself.
+        if let Ok(json) = herdr_aa_filetree::ipc::call_text("pane.list", serde_json::json!({}))
+            && viewer_pane_in_tab(&json, &pane_id).is_some()
+        {
+            return;
+        }
+        self.spawn_viewer_pane(&pane_id, &control);
     }
 
-    fn preview_mouse(&mut self, mouse: MouseEvent) {
-        let Some(preview) = self.preview.as_mut() else { return };
-        let max = preview.lines.len().saturating_sub(1);
-        match mouse.kind {
-            MouseEventKind::ScrollUp => preview.scroll = preview.scroll.saturating_sub(3),
-            MouseEventKind::ScrollDown => preview.scroll = (preview.scroll + 3).min(max),
-            // The header line doubles as the ← back affordance.
-            MouseEventKind::Down(MouseButton::Left) if mouse.row == 0 => self.close_preview(),
-            _ => {}
+    /// Split a viewer pane directly to our right: split our right NEIGHBOR
+    /// and swap the fresh pane into its left slot (split only goes
+    /// right/down), so the layout reads sidebar | preview | rest.
+    fn spawn_viewer_pane(&mut self, pane_id: &str, control: &Path) {
+        let ipc = herdr_aa_filetree::ipc::call_text;
+        let layout = ipc("pane.layout", serde_json::json!({ "pane_id": pane_id })).ok();
+        let neighbor = layout.as_deref().and_then(|json| right_neighbor(json, pane_id));
+        // No neighbor (the sidebar is alone in the tab): split ourselves and
+        // give the viewer the lion's share.
+        let (target, ratio, needs_swap) = match &neighbor {
+            Some(id) => (id.clone(), 0.5, true),
+            None => (pane_id.to_string(), 0.3, false),
+        };
+        let response = ipc(
+            "pane.split",
+            serde_json::json!({
+                "target_pane_id": target,
+                "direction": "right",
+                "ratio": ratio,
+                "focus": false,
+                "cwd": self.tree.root_path().display().to_string(),
+            }),
+        );
+        let Some(new_pane) =
+            response.ok().and_then(|r| herdr_aa_filetree::launch::split_pane_id(&r))
+        else {
+            self.notice = Some("preview pane failed to open".into());
+            return;
+        };
+        if needs_swap {
+            let _ = ipc(
+                "pane.swap",
+                serde_json::json!({ "source_pane_id": new_pane, "target_pane_id": target }),
+            );
         }
+        let exe = std::env::current_exe().ok();
+        let exe = exe
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "herdr-aa-filetree".to_string());
+        #[cfg(windows)]
+        let command = format!("& \"{exe}\" --preview \"{}\"", control.display());
+        #[cfg(not(windows))]
+        let command = format!("exec \"{exe}\" --preview \"{}\"", control.display());
+        let _ = ipc(
+            "pane.send_input",
+            serde_json::json!({ "pane_id": new_pane, "text": command, "keys": ["Enter"] }),
+        );
+        let _ = ipc(
+            "pane.rename",
+            serde_json::json!({ "pane_id": new_pane, "label": "Preview" }),
+        );
+        // The split/swap can move focus with the slot; stay in the explorer
+        // so the user keeps clicking files.
+        let _ = ipc("pane.focus", serde_json::json!({ "pane_id": pane_id }));
     }
 
     fn collapse(&mut self) {
@@ -511,10 +476,6 @@ impl App {
             return None;
         }
         self.notice = None;
-        if self.preview.is_some() {
-            self.preview_key(key);
-            return None;
-        }
         if self.overlay.is_some() {
             self.overlay_key(key);
             return None;
@@ -558,10 +519,6 @@ impl App {
 
     /// `Some(exit)` ends the event loop, mirroring on_key.
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Exit> {
-        if self.preview.is_some() {
-            self.preview_mouse(mouse);
-            return None;
-        }
         if self.collapsed() {
             if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.expand();
@@ -1119,10 +1076,6 @@ impl App {
     pub fn draw(&mut self, frame: &mut Frame) {
         self.last_width = frame.area().width;
         self.last_height = frame.area().height;
-        if self.preview.is_some() {
-            self.draw_preview(frame);
-            return;
-        }
         if self.collapsed() {
             self.draw_sliver(frame);
             return;
@@ -1264,74 +1217,6 @@ impl App {
         wrap_hints(&self.hints(), width, 3).len() as u16
     }
 
-    /// The zoomed file preview: header (← back), numbered contents, hints.
-    fn draw_preview(&mut self, frame: &mut Frame) {
-        let area = frame.area();
-        let footer_height = wrap_hints(&preview_hints(), area.width, 0).len() as u16;
-        let [header, body, footer] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(footer_height),
-        ])
-        .areas(area);
-        self.page = body.height.saturating_sub(1).max(1) as usize;
-        let theme = self.theme;
-        let Some(preview) = self.preview.as_mut() else { return };
-        preview.scroll = preview
-            .scroll
-            .min(preview.lines.len().saturating_sub(usize::from(body.height).max(1)));
-
-        let file_icon = icon(theme, &preview.name, false, false);
-        let icon_style = match file_icon.rgb {
-            Some((r, g, b)) => Style::default().fg(Color::Rgb(r, g, b)),
-            None => Style::default(),
-        };
-        let left = vec![
-            Span::styled(" ← ", Style::default().bold().fg(Color::LightBlue)),
-            Span::styled(format!("{} ", file_icon.glyph), icon_style),
-            Span::styled(preview.name.clone(), Style::default().bold()),
-        ];
-        let used: usize = left.iter().map(Span::width).sum();
-        let path = preview.path.display().to_string();
-        let avail = usize::from(area.width).saturating_sub(used + 2);
-        let mut spans = left;
-        let shown = if path.chars().count() > avail {
-            let tail: String = path
-                .chars()
-                .skip(path.chars().count().saturating_sub(avail.saturating_sub(1)))
-                .collect();
-            format!("…{tail}")
-        } else {
-            path
-        };
-        spans.push(Span::styled(format!("  {shown}"), Style::default().dim()));
-        frame.render_widget(Paragraph::new(Line::from(spans)), header);
-
-        let number_width = preview.lines.len().to_string().len();
-        let text: Vec<Line> = preview
-            .lines
-            .iter()
-            .enumerate()
-            .skip(preview.scroll)
-            .take(usize::from(body.height))
-            .map(|(n, line)| {
-                Line::from(vec![
-                    Span::styled(
-                        format!("{:>number_width$} ", n + 1),
-                        Style::default().dim(),
-                    ),
-                    Span::raw(line.clone()),
-                ])
-            })
-            .collect();
-        frame.render_widget(Paragraph::new(text), body);
-
-        frame.render_widget(
-            Paragraph::new(wrap_hints(&preview_hints(), area.width, 0)),
-            footer,
-        );
-    }
-
     /// The VS Code activity bar: view-switcher icons plus a detach button.
     /// The area is three rows tall — icons render on the middle one.
     fn draw_activity_bar(&mut self, frame: &mut Frame, area: Rect) {
@@ -1466,9 +1351,81 @@ fn row_item(row: &Row, theme: IconTheme, hovered: bool) -> ListItem<'static> {
     }
 }
 
-/// Hotkey hints shown under a file preview.
-fn preview_hints() -> Vec<(&'static str, &'static str)> {
-    vec![("↑↓", "scroll"), ("⇞⇟", "page"), ("g G", "ends"), ("esc", "back")]
+/// The viewer pane in the same tab as `my_pane_id`, found by its metadata
+/// token, from a `pane.list` response.
+fn viewer_pane_in_tab(pane_list_json: &str, my_pane_id: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Msg {
+        result: Res,
+    }
+    #[derive(serde::Deserialize)]
+    struct Res {
+        #[serde(default)]
+        panes: Vec<Pane>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Pane {
+        pane_id: Option<String>,
+        tab_id: Option<String>,
+        #[serde(default)]
+        tokens: serde_json::Map<String, serde_json::Value>,
+    }
+    let msg: Msg = serde_json::from_str(pane_list_json.trim_start_matches('\u{feff}')).ok()?;
+    let panes = &msg.result.panes;
+    let my_tab = panes
+        .iter()
+        .find(|p| p.pane_id.as_deref() == Some(my_pane_id))?
+        .tab_id
+        .clone()?;
+    panes
+        .iter()
+        .filter(|p| p.tab_id.as_deref() == Some(my_tab.as_str()))
+        .find(|p| p.tokens.contains_key(herdr_aa_filetree::viewer::METADATA_SOURCE))
+        .and_then(|p| p.pane_id.clone())
+}
+
+/// The pane directly to the right of `pane_id` (sharing its top edge or
+/// overlapping vertically), from a `pane.layout` response.
+fn right_neighbor(layout_json: &str, pane_id: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Msg {
+        result: Res,
+    }
+    #[derive(serde::Deserialize)]
+    struct Res {
+        layout: L,
+    }
+    #[derive(serde::Deserialize)]
+    struct L {
+        #[serde(default)]
+        panes: Vec<P>,
+    }
+    #[derive(serde::Deserialize)]
+    struct P {
+        pane_id: Option<String>,
+        rect: Option<R>,
+    }
+    #[derive(serde::Deserialize)]
+    struct R {
+        x: i64,
+        y: i64,
+        width: i64,
+        height: i64,
+    }
+    let msg: Msg = serde_json::from_str(layout_json.trim_start_matches('\u{feff}')).ok()?;
+    let panes = &msg.result.layout.panes;
+    let me = panes
+        .iter()
+        .find(|p| p.pane_id.as_deref() == Some(pane_id))?
+        .rect
+        .as_ref()?;
+    let (my_right, my_top, my_bottom) = (me.x + me.width, me.y, me.y + me.height);
+    panes
+        .iter()
+        .filter(|p| p.pane_id.as_deref() != Some(pane_id))
+        .filter_map(|p| Some((p.pane_id.clone()?, p.rect.as_ref()?)))
+        .find(|(_, r)| r.x == my_right && r.y < my_bottom && r.y + r.height > my_top)
+        .map(|(id, _)| id)
 }
 
 /// Theme-matched activity-bar icons: (explorer, source control).
