@@ -91,8 +91,8 @@ Pane geometry & CLI semantics:
   a pane can get. The socket API's `layout.set_split_ratio` ({pane_id?, tab_id?, path:[bool],
   ratio}) sets a split's ratio absolutely (path [] = the tab's root split) — but it clamps to
   the SAME 0.1 floor (requested 0.04, server set exactly 0.1; verified live). There is **no way
-  to make a pane narrower than 10% of the tab** short of patching herdr — the collapsed sidebar
-  sliver is pinned at that floor. (Panes inside a NESTED split can be narrower than 10% of the
+  to make a pane narrower than 10% of the tab** short of patching herdr — which is why the
+  sidebar HIDES (closes) rather than collapsing to a sliver. (Panes inside a NESTED split can be narrower than 10% of the
   window — the floor is per-split-rect — but the sidebar's column is a root-split child.)
 - There is no focus-by-id; focusing a pane is a `pane zoom <id> --on` / `--off` cycle.
 - `pane send-keys` accepts only a limited key-name set: `Up`/`Down`/`Enter`/`Escape`/`Tab`
@@ -281,10 +281,12 @@ HACKING.md — budget time for that before promising a patched build.
   "Footer hotkeys" setting (persisted as `hotkeys` in `aa-sidebar.json`, default hidden —
   it clipped in narrow panes). The ✧ suggest button uses MDI "creation" (`\u{f0674}`,
   the outline ✨ silhouette) in the material theme.
-- Both views collapse to the icon sliver (« bottom-right / `b`); in unified mode the
-  sliver shows BOTH activity icons and clicking one (or `1`/`2`) expands DIRECTLY into
-  that view — the sliver row layout and click routing live in `ui.rs`
-  (`sliver_lines`/`sliver_view_at`), shared by both apps.
+- There is NO collapse-to-sliver mode anymore (herdr's 10% ratio floor made the sliver
+  a wide empty strip — user-rejected). « bottom-right / `b` HIDE the sidebar instead:
+  per-tab snooze marker + `pane.close` of its own pane (`hide()` in both apps,
+  `src/snooze.rs` shared with the ensure hook, `launch::tab_of`). The herdr keybinding
+  `prefix+b` (config.toml `[[keys.command]]` → the toggle action, like the other plugin
+  binds) brings it back — or hides it again when it's focused.
 - **Esc must never exit a sidebar TUI** — a stray Esc used to drop the pane back to the
   shell prompt (user-reported). Esc closes overlays, then closes the tab's preview pane
   (`viewer::close_in_tab`); only `q` quits.
