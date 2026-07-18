@@ -59,28 +59,24 @@ pub fn hits_collapse_button(column: u16, row: u16, pane_width: u16, pane_height:
 }
 
 /// The collapsed sliver's lines: one icon per REACHABLE view (both when the
-/// sidebar is unified), the active one lit and the other dim. The row layout
-/// is fixed so [`sliver_view_at`] can route clicks to the right view.
+/// sidebar is unified), monochrome — no active highlight. The row layout is
+/// fixed so [`sliver_view_at`] can route clicks to the right view.
 pub fn sliver_lines(theme: IconTheme, active: View, merged: bool) -> Vec<Line<'static>> {
     let (explorer, git) = activity_icons(theme);
-    let style = |view: View| {
-        if view == active {
-            Style::default().fg(Color::LightBlue)
-        } else {
-            Style::default().dim()
-        }
-    };
+    // Monochrome, nothing highlighted — the sliver is a doorway, not a state
+    // display; both icons render in the plain foreground.
+    let style = Style::default();
     let mut lines = vec![Line::raw("")];
     if merged {
-        lines.push(Line::from(Span::styled(explorer, style(View::Explorer))));
+        lines.push(Line::from(Span::styled(explorer, style)));
         lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(git, style(View::SourceControl))));
+        lines.push(Line::from(Span::styled(git, style)));
     } else {
         let glyph = match active {
             View::Explorer => explorer,
             View::SourceControl => git,
         };
-        lines.push(Line::from(Span::styled(glyph, style(active))));
+        lines.push(Line::from(Span::styled(glyph, style)));
     }
     lines
 }

@@ -88,7 +88,12 @@ Pane geometry & CLI semantics:
 - `pane resize --amount` is a **split-RATIO delta**, not columns (herdr `layout.rs`
   `resize_focused`: `current_ratio ± delta` on the nearest split). Convert columns to ratio via
   the split's rect from `pane layout`. Ratios clamp at **0.1 minimum**, which bounds how narrow
-  a pane can get.
+  a pane can get. The socket API's `layout.set_split_ratio` ({pane_id?, tab_id?, path:[bool],
+  ratio}) sets a split's ratio absolutely (path [] = the tab's root split) — but it clamps to
+  the SAME 0.1 floor (requested 0.04, server set exactly 0.1; verified live). There is **no way
+  to make a pane narrower than 10% of the tab** short of patching herdr — the collapsed sidebar
+  sliver is pinned at that floor. (Panes inside a NESTED split can be narrower than 10% of the
+  window — the floor is per-split-rect — but the sidebar's column is a root-split child.)
 - There is no focus-by-id; focusing a pane is a `pane zoom <id> --on` / `--off` cycle.
 - `pane send-keys` accepts only a limited key-name set: `Up`/`Down`/`Enter`/`Escape`/`Tab`
   and plain characters work, but `Home` is rejected with `invalid_key`. Give TUIs
