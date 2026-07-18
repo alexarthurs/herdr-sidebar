@@ -313,13 +313,11 @@ impl App {
         );
     }
 
-    /// The collapsed strip: `»` on top, EXPLORER rotated 90° beneath it
-    /// (braille pixel art — terminals can't rotate real glyphs).
+    /// The collapsed strip: just the explorer's icon (theme-matched) — any
+    /// click or key expands, so the icon is the whole affordance.
     fn draw_sliver(&mut self, frame: &mut Frame) {
-        let height = frame.area().height as usize;
-        let lines = sliver_lines(height);
         frame.render_widget(
-            Paragraph::new(lines).alignment(Alignment::Center),
+            Paragraph::new(sliver_lines(self.theme)).alignment(Alignment::Center),
             frame.area(),
         );
     }
@@ -356,17 +354,17 @@ fn hits_collapse_button(column: u16, row: u16, pane_width: u16) -> bool {
     row == 0 && column >= pane_width.saturating_sub(4)
 }
 
-/// The sliver's lines for a pane of the given height: expand button on top,
-/// then EXPLORER rotated 90° clockwise, truncated on tiny panes.
-fn sliver_lines(height: usize) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line> = vec![
-        Line::from("»".bold().fg(Color::LightBlue)),
+/// The sliver's content: a single folder icon in the active theme.
+fn sliver_lines(theme: IconTheme) -> Vec<Line<'static>> {
+    let icon = icon(theme, "", true, false);
+    let style = match icon.rgb {
+        Some((r, g, b)) => Style::default().fg(Color::Rgb(r, g, b)),
+        None => Style::default(),
+    };
+    vec![
         Line::raw(""),
-    ];
-    for row in herdr_aa_filetree::sideways::lines("EXPLORER", height.saturating_sub(2)) {
-        lines.push(Line::from(row.fg(Color::LightBlue)));
-    }
-    lines
+        Line::from(Span::styled(icon.glyph, style)),
+    ]
 }
 
 #[cfg(test)]
@@ -382,15 +380,16 @@ mod tests {
     }
 
     #[test]
-    fn sliver_has_expand_button_then_block_art_and_truncates() {
-        let lines = sliver_lines(20);
-        let chars: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
-        assert_eq!(chars[0], "»");
-        assert!(chars[2].chars().all(|c| {
-            c == ' '
-                || ('\u{2580}'..='\u{259f}').contains(&c)
-                || ('\u{1fb00}'..='\u{1fb3b}').contains(&c)
-        }));
-        assert_eq!(sliver_lines(5).len(), 5, "never exceeds the pane height");
+    fn sliver_is_a_single_theme_icon() {
+        let material: Vec<String> = sliver_lines(IconTheme::Material)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(material, ["", "\u{f07b}"]);
+        let emoji: Vec<String> = sliver_lines(IconTheme::Emoji)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(emoji, ["", "📁"]);
     }
 }

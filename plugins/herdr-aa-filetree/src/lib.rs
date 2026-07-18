@@ -6,5 +6,4 @@ pub mod ensure;
 pub mod icons;
 pub mod ipc;
 pub mod launch;
-pub mod sideways;
 pub mod tree;
