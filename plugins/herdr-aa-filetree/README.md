@@ -60,6 +60,14 @@ sliver can actually get.
 | `b` / click `«` | collapse to the sliver (any key or click expands) |
 | `q`/`Esc` | quit |
 
+Mouse: hover highlights the row under the cursor, left click selects (on a
+folder's chevron it also expands/collapses), the scroll wheel moves through
+the tree, and **Ctrl+right-click** opens a VS Code-style file context menu:
+New File/Folder, Copy Path / Relative Path, Rename, Delete, Reveal in File
+Explorer. Plain right-click keeps herdr's own pane menu — herdr only forwards
+modifier+right-click to pane apps, enabled via
+`[ui] right_click_passthrough_modifier = "ctrl"` in herdr's config.toml.
+
 ## Icon themes
 
 - **material** (default): Nerd Font glyphs tinted like VS Code's *Atom

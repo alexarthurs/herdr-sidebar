@@ -3,15 +3,16 @@
 //! (the `«` button, or `b`): the pane narrows to a strip with EXPLORER written
 //! sideways, resized through the herdr CLI since only the host controls pane size.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph};
 
+use herdr_aa_filetree::actions::{self, MenuAction, MenuEntry};
 use herdr_aa_filetree::icons::{IconTheme, icon};
 use herdr_aa_filetree::tree::{Row, Tree};
 
@@ -69,6 +70,38 @@ struct BodyGeom {
     offset: usize,
 }
 
+/// What a prompt's input will be used for on Enter.
+enum PromptKind {
+    NewFile(PathBuf),
+    NewFolder(PathBuf),
+    Rename(PathBuf),
+}
+
+/// A modal layered over the tree: the context menu, a name prompt, or a
+/// delete confirmation. While one is open it owns keyboard and mouse input.
+enum Overlay {
+    Menu {
+        /// Click position the popup anchors to.
+        x: u16,
+        y: u16,
+        /// Target path + is_dir; `None` targets the workspace root.
+        target: Option<(PathBuf, bool)>,
+        entries: Vec<MenuEntry>,
+        selected: usize,
+        /// Rendered rect from the last draw, for click hit-testing.
+        rect: Rect,
+    },
+    Prompt {
+        title: String,
+        input: String,
+        kind: PromptKind,
+    },
+    ConfirmDelete {
+        path: PathBuf,
+        is_dir: bool,
+    },
+}
+
 pub struct App {
     tree: Tree,
     rows: Vec<Row>,
@@ -88,6 +121,9 @@ pub struct App {
     /// Row index under the mouse cursor, for the hover highlight.
     hovered: Option<usize>,
     body: BodyGeom,
+    overlay: Option<Overlay>,
+    /// Transient status/error line shown in the footer until the next action.
+    notice: Option<String>,
 }
 
 impl App {
@@ -111,6 +147,8 @@ impl App {
             collapsed: false,
             hovered: None,
             body: BodyGeom::default(),
+            overlay: None,
+            notice: None,
         }
     }
 
@@ -146,6 +184,11 @@ impl App {
     /// Handle one key press; returns `false` when the app should exit.
     pub fn on_key(&mut self, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press {
+            return true;
+        }
+        self.notice = None;
+        if self.overlay.is_some() {
+            self.overlay_key(key);
             return true;
         }
         if self.collapsed() {
@@ -189,6 +232,10 @@ impl App {
             }
             return;
         }
+        if self.overlay.is_some() {
+            self.overlay_mouse(mouse);
+            return;
+        }
         match mouse.kind {
             MouseEventKind::Moved => {
                 self.hovered = self.row_at(mouse.row);
@@ -207,8 +254,244 @@ impl App {
                     self.toggle();
                 }
             }
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.notice = None;
+                self.open_context_menu(mouse.column, mouse.row);
+            }
             _ => {}
         }
+    }
+
+    /// Open the file context menu at the click position, targeting the row
+    /// under the cursor (or the workspace root on empty space).
+    fn open_context_menu(&mut self, x: u16, y: u16) {
+        let target = self.row_at(y).map(|index| {
+            self.select(index);
+            let row = &self.rows[index];
+            (row.path.clone(), row.is_dir)
+        });
+        let entries = actions::menu_entries(target.is_none());
+        let selected = entries
+            .iter()
+            .position(|e| matches!(e, MenuEntry::Action(..)))
+            .unwrap_or(0);
+        self.overlay = Some(Overlay::Menu {
+            x,
+            y,
+            target,
+            entries,
+            selected,
+            rect: Rect::default(),
+        });
+    }
+
+    fn overlay_key(&mut self, key: KeyEvent) {
+        enum Cmd {
+            Nothing,
+            Close,
+            Activate,
+            ConfirmPrompt,
+            DeleteConfirmed(PathBuf, bool),
+        }
+        let cmd = match self.overlay.as_mut() {
+            Some(Overlay::Menu { entries, selected, .. }) => match key.code {
+                KeyCode::Esc => Cmd::Close,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *selected = step_menu(entries, *selected, -1);
+                    Cmd::Nothing
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *selected = step_menu(entries, *selected, 1);
+                    Cmd::Nothing
+                }
+                KeyCode::Enter => Cmd::Activate,
+                _ => Cmd::Nothing,
+            },
+            Some(Overlay::Prompt { input, .. }) => match key.code {
+                KeyCode::Esc => Cmd::Close,
+                KeyCode::Backspace => {
+                    input.pop();
+                    Cmd::Nothing
+                }
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    Cmd::Nothing
+                }
+                KeyCode::Enter => Cmd::ConfirmPrompt,
+                _ => Cmd::Nothing,
+            },
+            Some(Overlay::ConfirmDelete { path, is_dir }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    Cmd::DeleteConfirmed(path.clone(), *is_dir)
+                }
+                _ => Cmd::Close,
+            },
+            None => Cmd::Nothing,
+        };
+        match cmd {
+            Cmd::Nothing => {}
+            Cmd::Close => self.overlay = None,
+            Cmd::Activate => self.activate_menu_entry(),
+            Cmd::ConfirmPrompt => self.confirm_prompt(),
+            Cmd::DeleteConfirmed(path, is_dir) => {
+                self.overlay = None;
+                match actions::delete(&path, is_dir) {
+                    Ok(()) => self.refresh_tree(),
+                    Err(err) => self.notice = Some(format!("delete failed: {err}")),
+                }
+            }
+        }
+    }
+
+    fn overlay_mouse(&mut self, mouse: MouseEvent) {
+        enum Cmd {
+            Nothing,
+            Close,
+            Activate,
+            Reopen(u16, u16),
+        }
+        let cmd = match self.overlay.as_mut() {
+            Some(Overlay::Menu { entries, selected, rect, .. }) => {
+                let inner = rect.inner(ratatui::layout::Margin::new(1, 1));
+                let item_at = |row: u16, col: u16| -> Option<usize> {
+                    (col >= inner.x
+                        && col < inner.x + inner.width
+                        && row >= inner.y
+                        && row < inner.y + inner.height)
+                        .then(|| usize::from(row - inner.y))
+                        .filter(|i| {
+                            *i < entries.len() && matches!(entries[*i], MenuEntry::Action(..))
+                        })
+                };
+                match mouse.kind {
+                    MouseEventKind::Moved => {
+                        if let Some(i) = item_at(mouse.row, mouse.column) {
+                            *selected = i;
+                        }
+                        Cmd::Nothing
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(i) = item_at(mouse.row, mouse.column) {
+                            *selected = i;
+                            Cmd::Activate
+                        } else {
+                            Cmd::Close
+                        }
+                    }
+                    MouseEventKind::Down(MouseButton::Right) => {
+                        Cmd::Reopen(mouse.column, mouse.row)
+                    }
+                    _ => Cmd::Nothing,
+                }
+            }
+            // Prompts/confirms are keyboard-driven; clicks do nothing.
+            _ => Cmd::Nothing,
+        };
+        match cmd {
+            Cmd::Nothing => {}
+            Cmd::Close => self.overlay = None,
+            Cmd::Activate => self.activate_menu_entry(),
+            Cmd::Reopen(x, y) => {
+                self.overlay = None;
+                self.open_context_menu(x, y);
+            }
+        }
+    }
+
+    fn activate_menu_entry(&mut self) {
+        let Some(Overlay::Menu { target, entries, selected, .. }) = self.overlay.take() else {
+            return;
+        };
+        let MenuEntry::Action(action, _) = entries[selected] else { return };
+        // Creation targets: the folder itself, a file's parent, or the root.
+        let create_dir = match &target {
+            Some((path, true)) => path.clone(),
+            Some((path, false)) => {
+                path.parent().map(Path::to_path_buf).unwrap_or_else(|| self.tree.root_path())
+            }
+            None => self.tree.root_path(),
+        };
+        match action {
+            MenuAction::NewFile => {
+                self.overlay = Some(Overlay::Prompt {
+                    title: "New file".into(),
+                    input: String::new(),
+                    kind: PromptKind::NewFile(create_dir),
+                });
+            }
+            MenuAction::NewFolder => {
+                self.overlay = Some(Overlay::Prompt {
+                    title: "New folder".into(),
+                    input: String::new(),
+                    kind: PromptKind::NewFolder(create_dir),
+                });
+            }
+            MenuAction::CopyPath | MenuAction::CopyRelativePath => {
+                let Some((path, _)) = &target else { return };
+                let text = if action == MenuAction::CopyPath {
+                    path.display().to_string()
+                } else {
+                    path.strip_prefix(self.tree.root_path())
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                };
+                self.notice = Some(match actions::copy_to_clipboard(&text) {
+                    Ok(()) => format!("copied: {text}"),
+                    Err(err) => format!("copy failed: {err}"),
+                });
+            }
+            MenuAction::Rename => {
+                let Some((path, _)) = target else { return };
+                let current = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.overlay = Some(Overlay::Prompt {
+                    title: "Rename".into(),
+                    input: current,
+                    kind: PromptKind::Rename(path),
+                });
+            }
+            MenuAction::Delete => {
+                let Some((path, is_dir)) = target else { return };
+                self.overlay = Some(Overlay::ConfirmDelete { path, is_dir });
+            }
+            MenuAction::Reveal => {
+                let path = target.map(|(p, _)| p).unwrap_or_else(|| self.tree.root_path());
+                actions::reveal(&path);
+            }
+        }
+    }
+
+    fn confirm_prompt(&mut self) {
+        let Some(Overlay::Prompt { input, kind, .. }) = self.overlay.take() else { return };
+        let Some(name) = actions::validate_name(&input) else {
+            self.notice = Some("invalid name".into());
+            return;
+        };
+        let result = match &kind {
+            PromptKind::NewFile(dir) => actions::create_file(dir, name),
+            PromptKind::NewFolder(dir) => actions::create_folder(dir, name),
+            PromptKind::Rename(path) => actions::rename(path, name),
+        };
+        match result {
+            Ok(created) => {
+                if let PromptKind::NewFile(dir) | PromptKind::NewFolder(dir) = &kind {
+                    self.tree.expand(dir);
+                }
+                self.refresh_tree();
+                if let Some(index) = self.rows.iter().position(|r| r.path == created) {
+                    self.select(index);
+                }
+            }
+            Err(err) => self.notice = Some(format!("failed: {err}")),
+        }
+    }
+
+    fn refresh_tree(&mut self) {
+        self.tree.refresh();
+        self.rebuild();
     }
 
     /// The visible row index at a pane-local mouse row, if it lands on one.
@@ -353,12 +636,85 @@ impl App {
             offset: self.state.offset(),
         };
 
+        let footer_line: Line = if let Some(notice) = &self.notice {
+            format!(" {notice}").fg(Color::Yellow).into()
+        } else {
+            match &self.overlay {
+                Some(Overlay::Prompt { title, input, .. }) => Line::from(vec![
+                    Span::styled(format!(" {title}: "), Style::default().bold()),
+                    Span::raw(input.clone()),
+                    Span::styled("█", Style::default().dim()),
+                    Span::styled("  (⏎ ok · esc cancel)", Style::default().dim()),
+                ]),
+                Some(Overlay::ConfirmDelete { path, .. }) => {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    format!(" Delete '{name}' permanently? (y/N)").fg(Color::Red).into()
+                }
+                _ => {
+                    " ↑↓ move  ←→ fold  ⏎ toggle  r refresh  . dotfiles  i icons  « b collapse  q quit"
+                        .dim()
+                        .into()
+                }
+            }
+        };
+        frame.render_widget(Paragraph::new(footer_line), footer);
+
+        if matches!(self.overlay, Some(Overlay::Menu { .. })) {
+            self.draw_menu(frame);
+        }
+    }
+
+    /// Render the context-menu popup near its anchor, clamped inside the pane,
+    /// and remember its rect for mouse hit-testing.
+    fn draw_menu(&mut self, frame: &mut Frame) {
+        let Some(Overlay::Menu { x, y, entries, selected, rect, .. }) = self.overlay.as_mut()
+        else {
+            return;
+        };
+        let area = frame.area();
+        let label_width = entries
+            .iter()
+            .map(|e| match e {
+                MenuEntry::Action(_, label) => label.chars().count(),
+                MenuEntry::Separator => 0,
+            })
+            .max()
+            .unwrap_or(0) as u16;
+        let width = (label_width + 4).min(area.width);
+        let height = (entries.len() as u16 + 2).min(area.height);
+        let px = (*x).min(area.width.saturating_sub(width));
+        let py = (*y + 1).min(area.height.saturating_sub(height));
+        let popup = Rect::new(px, py, width, height);
+        *rect = popup;
+
+        let items: Vec<ListItem> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| match entry {
+                MenuEntry::Separator => {
+                    ListItem::new(Line::from("─".repeat(usize::from(width - 2)).dim()))
+                }
+                MenuEntry::Action(_, label) => {
+                    let line = Line::raw(format!(" {label}"));
+                    if i == *selected {
+                        ListItem::new(line).style(
+                            Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        ListItem::new(line)
+                    }
+                }
+            })
+            .collect();
+        frame.render_widget(Clear, popup);
         frame.render_widget(
-            Paragraph::new(
-                " ↑↓ move  ←→ fold  ⏎ toggle  r refresh  . dotfiles  i icons  « b collapse  q quit"
-                    .dim(),
+            List::new(items).block(
+                ratatui::widgets::Block::bordered().border_style(Style::default().dim()),
             ),
-            footer,
+            popup,
         );
     }
 
@@ -400,6 +756,21 @@ fn row_item(row: &Row, theme: IconTheme, hovered: bool) -> ListItem<'static> {
         item.style(Style::default().bg(Color::Rgb(48, 52, 60)))
     } else {
         item
+    }
+}
+
+/// Next selectable (non-separator) menu index in `direction`, staying put at
+/// the ends.
+fn step_menu(entries: &[MenuEntry], from: usize, direction: isize) -> usize {
+    let mut index = from as isize;
+    loop {
+        index += direction;
+        if index < 0 || index >= entries.len() as isize {
+            return from;
+        }
+        if matches!(entries[index as usize], MenuEntry::Action(..)) {
+            return index as usize;
+        }
     }
 }
 
@@ -450,6 +821,21 @@ mod tests {
         assert!(hits_collapse_button(28, 0, 32));
         assert!(!hits_collapse_button(27, 0, 32), "left of the button");
         assert!(!hits_collapse_button(30, 1, 32), "tree row");
+    }
+
+    #[test]
+    fn menu_navigation_skips_separators_and_clamps() {
+        let entries = actions::menu_entries(false);
+        // First entry is an action; stepping up from it stays put.
+        assert_eq!(step_menu(&entries, 0, -1), 0);
+        // Stepping down over a separator lands on the next action.
+        let sep = entries
+            .iter()
+            .position(|e| matches!(e, MenuEntry::Separator))
+            .unwrap();
+        assert_eq!(step_menu(&entries, sep - 1, 1), sep + 1);
+        let last = entries.len() - 1;
+        assert_eq!(step_menu(&entries, last, 1), last);
     }
 
     #[test]

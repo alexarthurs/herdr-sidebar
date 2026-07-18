@@ -39,6 +39,11 @@ impl Tree {
         }
     }
 
+    /// The workspace root directory the tree is rooted at.
+    pub fn root_path(&self) -> PathBuf {
+        self.root.clone()
+    }
+
     /// Display name for the header: the folder's own name, or the full path for
     /// roots like `C:\` that have no final component.
     pub fn root_name(&self) -> String {

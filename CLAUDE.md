@@ -114,6 +114,14 @@ Socket API (what the CLI wraps; usable directly from plugins, no subprocess need
   the zoom-cycle hack). `pane run` = `pane.send_input {pane_id, text, keys:["Enter"]}`.
 - Method names/params: `herdr api schema --json`, or `src/api/schema*` in the herdr source.
 
+Mouse in plugin TUIs: herdr forwards clicks/motion/wheel to a pane app that enables mouse
+capture — but **right-click is always intercepted** for herdr's pane context menu unless the
+click carries the modifier configured in `[ui] right_click_passthrough_modifier` (config.toml;
+e.g. `"ctrl"` → Ctrl+right-click reaches the app with ctrl stripped; a modifier is required,
+plain-right-click passthrough is not supported). Same-tab `pane.move` is a deliberate no-op
+(`SameTab`) — restructure within a tab by bouncing the pane through `--new-tab` and back
+(herdr auto-closes the emptied temp tab).
+
 ## Herdr workspace
 
 `herdr-layout.yaml` at the repo root describes the workspace (Coordinator tab running claude,
