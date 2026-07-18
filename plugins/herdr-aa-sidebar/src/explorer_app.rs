@@ -46,7 +46,10 @@ impl PaneCtl {
     /// also the other view's — one Sidebar pane satisfies both plugins'
     /// launchers — otherwise clear the other view's token.
     fn report_tokens(&self, my: View, merged: bool) {
-        let mine = serde_json::json!({ my.plugin_id(): my.token() });
+        // Token value = heartbeat timestamp; launchers treat stale stamps as
+        // dead panes and replace them (see launch::HEARTBEAT_STALE_SECS).
+        let now = sidebar::unix_now().to_string();
+        let mine = serde_json::json!({ my.plugin_id(): now });
         let _ = herdr_aa_sidebar::ipc::call_text(
             "pane.report_metadata",
             serde_json::json!({ "pane_id": self.pane_id, "source": my.plugin_id(), "tokens": mine }),
@@ -55,7 +58,7 @@ impl PaneCtl {
         // Clearing needs an explicit null VALUE: report_metadata MERGES the
         // token map, so an empty map is a no-op (verified live, herdr 0.7.1).
         let other_tokens = if merged {
-            serde_json::json!({ other.plugin_id(): other.token() })
+            serde_json::json!({ other.plugin_id(): now })
         } else {
             serde_json::json!({ other.plugin_id(): serde_json::Value::Null })
         };
@@ -196,6 +199,8 @@ pub struct App {
     gear: Rect,
     /// Last left-click (row index, when) for double-click detection.
     last_click: Option<(usize, std::time::Instant)>,
+    /// Last heartbeat stamp, throttling the token refresh.
+    last_beat: std::time::Instant,
 }
 
 /// How long two clicks on the same row still count as a double click.
@@ -251,9 +256,23 @@ impl App {
             activity: ActivityZones::default(),
             gear: Rect::default(),
             last_click: None,
+            last_beat: std::time::Instant::now(),
         };
         app.apply_identity();
         app
+    }
+
+    /// Re-stamp the identity tokens so launchers know this pane is alive.
+    /// Cheap (two socket round-trips); the event loop calls this every few
+    /// seconds.
+    pub fn heartbeat(&mut self) {
+        if self.last_beat.elapsed() < std::time::Duration::from_secs(5) {
+            return;
+        }
+        self.last_beat = std::time::Instant::now();
+        if let Some(ctl) = &self.pane_ctl {
+            ctl.report_tokens(MY_VIEW, self.merged());
+        }
     }
 
     /// The merged sidebar is on and actually usable (other plugin present).
@@ -285,83 +304,21 @@ impl App {
     }
 
     /// Open a file in the preview pane BESIDE the sidebar (the tree stays
-    /// visible, like VS Code's editor area): write the target into the
-    /// viewer's control file, reusing the running viewer pane when one is
-    /// open in this tab, otherwise spawning one next to us.
+    /// visible): the shared viewer client reuses the tab's viewer pane or
+    /// spawns one next to us.
     fn open_preview(&mut self, path: &Path) {
         let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) else {
             self.notice = Some("preview needs a herdr pane".into());
             return;
         };
-        let control = herdr_aa_sidebar::viewer::control_path(&pane_id);
-        if let Err(e) = std::fs::write(&control, path.display().to_string()) {
-            self.notice = Some(format!("preview failed: {e}"));
-            return;
+        let payload = herdr_aa_sidebar::viewer::file_request(path);
+        if let Err(e) = herdr_aa_sidebar::viewer::open_in_pane(
+            &pane_id,
+            &self.tree.root_path(),
+            &payload,
+        ) {
+            self.notice = Some(e);
         }
-        // A running viewer in this tab follows the control file by itself.
-        if let Ok(json) = herdr_aa_sidebar::ipc::call_text("pane.list", serde_json::json!({}))
-            && viewer_pane_in_tab(&json, &pane_id).is_some()
-        {
-            return;
-        }
-        self.spawn_viewer_pane(&pane_id, &control);
-    }
-
-    /// Split a viewer pane directly to our right: split our right NEIGHBOR
-    /// and swap the fresh pane into its left slot (split only goes
-    /// right/down), so the layout reads sidebar | preview | rest.
-    fn spawn_viewer_pane(&mut self, pane_id: &str, control: &Path) {
-        let ipc = herdr_aa_sidebar::ipc::call_text;
-        let layout = ipc("pane.layout", serde_json::json!({ "pane_id": pane_id })).ok();
-        let neighbor = layout.as_deref().and_then(|json| right_neighbor(json, pane_id));
-        // No neighbor (the sidebar is alone in the tab): split ourselves and
-        // give the viewer the lion's share.
-        let (target, ratio, needs_swap) = match &neighbor {
-            Some(id) => (id.clone(), 0.5, true),
-            None => (pane_id.to_string(), 0.3, false),
-        };
-        let response = ipc(
-            "pane.split",
-            serde_json::json!({
-                "target_pane_id": target,
-                "direction": "right",
-                "ratio": ratio,
-                "focus": false,
-                "cwd": self.tree.root_path().display().to_string(),
-            }),
-        );
-        let Some(new_pane) =
-            response.ok().and_then(|r| herdr_aa_sidebar::launch::split_pane_id(&r))
-        else {
-            self.notice = Some("preview pane failed to open".into());
-            return;
-        };
-        if needs_swap {
-            let _ = ipc(
-                "pane.swap",
-                serde_json::json!({ "source_pane_id": new_pane, "target_pane_id": target }),
-            );
-        }
-        let exe = std::env::current_exe().ok();
-        let exe = exe
-            .as_deref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "herdr-aa-filetree".to_string());
-        #[cfg(windows)]
-        let command = format!("& \"{exe}\" --preview \"{}\"", control.display());
-        #[cfg(not(windows))]
-        let command = format!("exec \"{exe}\" --preview \"{}\"", control.display());
-        let _ = ipc(
-            "pane.send_input",
-            serde_json::json!({ "pane_id": new_pane, "text": command, "keys": ["Enter"] }),
-        );
-        let _ = ipc(
-            "pane.rename",
-            serde_json::json!({ "pane_id": new_pane, "label": "Preview" }),
-        );
-        // The split/swap can move focus with the slot; stay in the explorer
-        // so the user keeps clicking files.
-        let _ = ipc("pane.focus", serde_json::json!({ "pane_id": pane_id }));
     }
 
     fn collapse(&mut self) {
@@ -1367,83 +1324,6 @@ fn row_item(row: &Row, theme: IconTheme, hovered: bool) -> ListItem<'static> {
     } else {
         item
     }
-}
-
-/// The viewer pane in the same tab as `my_pane_id`, found by its metadata
-/// token, from a `pane.list` response.
-fn viewer_pane_in_tab(pane_list_json: &str, my_pane_id: &str) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct Msg {
-        result: Res,
-    }
-    #[derive(serde::Deserialize)]
-    struct Res {
-        #[serde(default)]
-        panes: Vec<Pane>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Pane {
-        pane_id: Option<String>,
-        tab_id: Option<String>,
-        #[serde(default)]
-        tokens: serde_json::Map<String, serde_json::Value>,
-    }
-    let msg: Msg = serde_json::from_str(pane_list_json.trim_start_matches('\u{feff}')).ok()?;
-    let panes = &msg.result.panes;
-    let my_tab = panes
-        .iter()
-        .find(|p| p.pane_id.as_deref() == Some(my_pane_id))?
-        .tab_id
-        .clone()?;
-    panes
-        .iter()
-        .filter(|p| p.tab_id.as_deref() == Some(my_tab.as_str()))
-        .find(|p| p.tokens.contains_key(herdr_aa_sidebar::viewer::METADATA_SOURCE))
-        .and_then(|p| p.pane_id.clone())
-}
-
-/// The pane directly to the right of `pane_id` (sharing its top edge or
-/// overlapping vertically), from a `pane.layout` response.
-fn right_neighbor(layout_json: &str, pane_id: &str) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct Msg {
-        result: Res,
-    }
-    #[derive(serde::Deserialize)]
-    struct Res {
-        layout: L,
-    }
-    #[derive(serde::Deserialize)]
-    struct L {
-        #[serde(default)]
-        panes: Vec<P>,
-    }
-    #[derive(serde::Deserialize)]
-    struct P {
-        pane_id: Option<String>,
-        rect: Option<R>,
-    }
-    #[derive(serde::Deserialize)]
-    struct R {
-        x: i64,
-        y: i64,
-        width: i64,
-        height: i64,
-    }
-    let msg: Msg = serde_json::from_str(layout_json.trim_start_matches('\u{feff}')).ok()?;
-    let panes = &msg.result.layout.panes;
-    let me = panes
-        .iter()
-        .find(|p| p.pane_id.as_deref() == Some(pane_id))?
-        .rect
-        .as_ref()?;
-    let (my_right, my_top, my_bottom) = (me.x + me.width, me.y, me.y + me.height);
-    panes
-        .iter()
-        .filter(|p| p.pane_id.as_deref() != Some(pane_id))
-        .filter_map(|p| Some((p.pane_id.clone()?, p.rect.as_ref()?)))
-        .find(|(_, r)| r.x == my_right && r.y < my_bottom && r.y + r.height > my_top)
-        .map(|(id, _)| id)
 }
 
 /// Next selectable (non-separator) menu index in `direction`, staying put at

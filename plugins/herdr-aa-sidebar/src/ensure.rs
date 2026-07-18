@@ -93,7 +93,8 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
     let tab = launch::focused_tab(&panes);
     let snooze_dir = snooze::dir();
     snooze::sweep(&snooze_dir, &launch::live_tabs(&panes));
-    match launch::launch_decision(&panes).split_once(' ') {
+    let now = crate::state::unix_now();
+    match launch::launch_decision(&panes, now).split_once(' ') {
         Some(("FOCUS", id)) => {
             if toggle {
                 focus(id)?;
@@ -104,6 +105,12 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
                 ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }))?;
                 snooze::set(&snooze_dir, &tab);
             }
+        }
+        Some(("REPLACE", id)) => {
+            // A dead pane (stale heartbeat): close it and dock a fresh one,
+            // quiet or toggle alike — a corpse should never block the dock.
+            ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }))?;
+            open(&panes, toggle)?;
         }
         _ => {
             if toggle {

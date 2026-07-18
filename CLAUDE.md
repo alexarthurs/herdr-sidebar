@@ -153,7 +153,8 @@ Pane identity & titles:
   sidebar TUI tags its pane this way so its detection works while the label is cleared.
 - `report_metadata` **MERGES** the token map: sending `tokens: {}` is a no-op, it does NOT
   clear previously-reported tokens. To remove a token, report it with an explicit **null
-  value** (`tokens: {name: null}`) — verified live. A `source` can also report tokens whose
+  value** (`tokens: {name: null}`) — verified live. Token values must be **strings** —
+  numbers are rejected with `invalid_request` (and a `let _ =` swallows it silently). A `source` can also report tokens whose
   keys belong to another plugin's namespace (the merged Sidebar pane reports both plugins'
   identity tokens so both launchers recognize the one pane).
 - Pane border titles come from `border_label`: metadata title → manual label (`pane rename`)
@@ -193,6 +194,16 @@ HACKING.md — budget time for that before promising a patched build.
   terminal emulators and break column alignment — the shared icon map avoids them; keep it
   that way when adding icons.
 
+### Pane liveness (heartbeat tokens)
+
+- **You cannot detect a dead TUI from outside**: `pane.process_info` shows only the shell
+  in the foreground group whether the TUI child is alive or not (verified live), and a dead
+  pane keeps its label AND metadata tokens — which used to block the ensure hook's re-dock
+  forever. The fix: every TUI **re-stamps its identity token with the unix time** (string!)
+  every ~5s; launch decisions treat a stamp older than `HEARTBEAT_STALE_SECS` (20s) — or a
+  "Sidebar" label with no token at all — as a corpse and return `REPLACE <id>`: close the
+  pane, dock a fresh one. Ensure hook and all launcher scripts handle it.
+
 ### Unified sidebar (see `src/state.rs`)
 
 - Both views ship in ONE binary: the activity bar switches them **in process** (instant,
@@ -226,6 +237,15 @@ HACKING.md — budget time for that before promising a patched build.
   from the porcelain `## branch...upstream [ahead N, behind M]` header.
 - Footer hotkeys render as keycap chips (`wrap_hints` takes `(key, label)` pairs, shared in `ui.rs`). The ✧ suggest button uses MDI "creation" (`\u{f0674}`,
   the outline ✨ silhouette) in the material theme.
+
+### Diff preview
+
+- Clicking a changed file in Source Control (or `o`, or the context menu's Open Diff)
+  shows its colored `git diff` in the SAME preview pane the explorer uses: the control
+  file carries typed requests (`file/<path>` / `diff/<root>/<rel>/<kind>`, tab-separated),
+  the viewer parses git's ANSI output with the in-crate `ansi.rs` SGR parser (ansi-to-tui
+  pins an older ratatui — don't add it), and diffs re-run every ~2s so they live-update.
+  Staged rows show `--cached`; untracked files render via `diff --no-index NUL <file>`.
 
 ### Verifying a plugin TUI end-to-end
 

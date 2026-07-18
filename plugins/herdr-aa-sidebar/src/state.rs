@@ -16,6 +16,14 @@ use std::path::PathBuf;
 /// Pane label (and metadata identity) of the unified pane.
 pub const SIDEBAR_LABEL: &str = "Sidebar";
 
+/// Unix seconds now — the heartbeat clock for pane identity tokens.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Why a view's event loop ended; main.rs acts on it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Exit {

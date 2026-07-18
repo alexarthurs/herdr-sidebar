@@ -4,6 +4,7 @@
 //! sidecar (`herdr-aa-sidebar-ensure`).
 
 pub mod actions;
+pub mod ansi;
 pub mod ensure;
 pub mod git;
 pub mod icons;

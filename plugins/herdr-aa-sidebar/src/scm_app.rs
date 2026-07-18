@@ -198,6 +198,7 @@ impl Row {
 /// Context-menu actions for a staged/unstaged file row.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuAction {
+    OpenDiff,
     StageOrUnstage,
     Discard,
     CopyPath,
@@ -314,7 +315,10 @@ impl PaneCtl {
     /// view's (one Sidebar pane satisfies both plugins' launchers), otherwise
     /// clear the other view's token.
     fn report_tokens(&self, my: View, merged: bool) {
-        let mine = serde_json::json!({ my.plugin_id(): my.token() });
+        // Token value = heartbeat timestamp; launchers treat stale stamps as
+        // dead panes and replace them (see launch::HEARTBEAT_STALE_SECS).
+        let now = sidebar::unix_now().to_string();
+        let mine = serde_json::json!({ my.plugin_id(): now });
         let _ = herdr_aa_sidebar::ipc::call_text(
             "pane.report_metadata",
             serde_json::json!({ "pane_id": self.pane_id, "source": my.plugin_id(), "tokens": mine }),
@@ -323,7 +327,7 @@ impl PaneCtl {
         // Clearing needs an explicit null VALUE: report_metadata MERGES the
         // token map, so an empty map is a no-op (verified live, herdr 0.7.1).
         let other_tokens = if merged {
-            serde_json::json!({ other.plugin_id(): other.token() })
+            serde_json::json!({ other.plugin_id(): now })
         } else {
             serde_json::json!({ other.plugin_id(): serde_json::Value::Null })
         };
@@ -371,6 +375,8 @@ pub struct App {
     sidebar_state: sidebar::State,
     other_exe: Option<PathBuf>,
     pane_ctl: Option<PaneCtl>,
+    /// Last heartbeat stamp, throttling the token refresh.
+    last_beat: std::time::Instant,
 }
 
 const MY_VIEW: View = View::SourceControl;
@@ -416,6 +422,7 @@ impl App {
             sidebar_state,
             other_exe,
             pane_ctl,
+            last_beat: std::time::Instant::now(),
         };
         app.apply_identity();
         app.refresh();
@@ -465,6 +472,17 @@ impl App {
         }
         self.reload_expanded_drawers();
         self.rebuild();
+    }
+
+    /// Re-stamp the identity tokens so launchers know this pane is alive.
+    pub fn heartbeat(&mut self) {
+        if self.last_beat.elapsed() < std::time::Duration::from_secs(5) {
+            return;
+        }
+        self.last_beat = std::time::Instant::now();
+        if let Some(ctl) = &self.pane_ctl {
+            ctl.report_tokens(MY_VIEW, self.merged());
+        }
     }
 
     /// Periodic timer tick: retry repo discovery if we started outside one,
@@ -732,6 +750,7 @@ impl App {
             KeyCode::Char('A') => self.suggest_message(),
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('S') => self.sync_changes(),
+            KeyCode::Char('o') => self.open_selected_diff(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => return self.switch_to(View::SourceControl),
             _ => {}
@@ -797,7 +816,23 @@ impl App {
             return None;
         }
         if let Some((index, line)) = self.row_hit(y) {
+            let _ = line;
             match self.rows[index] {
+                // Clicking a changed file shows its diff, like VS Code.
+                Row::Staged(r, i) => {
+                    self.focus = Focus::List;
+                    self.select(index);
+                    if let Some(entry) = self.repos[r].status.staged.get(i).cloned() {
+                        self.open_diff(r, &entry, true);
+                    }
+                }
+                Row::Unstaged(r, i) => {
+                    self.focus = Focus::List;
+                    self.select(index);
+                    if let Some(entry) = self.repos[r].status.unstaged.get(i).cloned() {
+                        self.open_diff(r, &entry, false);
+                    }
+                }
                 // The inline widgets: click focuses/acts without selecting.
                 Row::Message(r) => {
                     self.active = r;
@@ -848,10 +883,13 @@ impl App {
             _ => return, // headers and drawer lines have no menu
         };
         let Some(entry) = entry.cloned() else { return };
-        let mut entries = vec![MenuEntry::Action(
-            MenuAction::StageOrUnstage,
-            if staged { "Unstage Changes" } else { "Stage Changes" },
-        )];
+        let mut entries = vec![
+            MenuEntry::Action(MenuAction::OpenDiff, "Open Diff"),
+            MenuEntry::Action(
+                MenuAction::StageOrUnstage,
+                if staged { "Unstage Changes" } else { "Stage Changes" },
+            ),
+        ];
         if !staged {
             entries.push(MenuEntry::Action(MenuAction::Discard, "Discard Changes…"));
         }
@@ -1131,6 +1169,7 @@ impl App {
                 }
                 self.refresh();
             }
+            MenuAction::OpenDiff => self.open_diff(repo, &entry, staged),
             MenuAction::Discard => self.overlay = Some(Overlay::ConfirmDiscard { repo, entry }),
             MenuAction::CopyPath | MenuAction::CopyRelativePath => {
                 let rel = entry.path.replace('/', std::path::MAIN_SEPARATOR_STR);
@@ -1149,6 +1188,50 @@ impl App {
                 let path = repo_root.unwrap_or_else(|| self.cwd.clone()).join(rel);
                 reveal(&path);
             }
+        }
+    }
+
+    /// Show a file's diff in the preview pane beside the sidebar. Staged
+    /// rows show the staged diff; untracked files render as one addition.
+    fn open_diff(&mut self, repo: usize, entry: &FileEntry, staged: bool) {
+        let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) else {
+            self.flash = Some(("diff preview needs a herdr pane".into(), true));
+            return;
+        };
+        let Some(repo) = self.repos.get(repo) else { return };
+        let kind = if staged {
+            "staged"
+        } else if entry.letter == 'U' {
+            "untracked"
+        } else {
+            "worktree"
+        };
+        let payload =
+            herdr_aa_sidebar::viewer::diff_request(repo.git.root(), &entry.path, kind);
+        if let Err(e) =
+            herdr_aa_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &payload)
+        {
+            self.flash = Some((e, true));
+        }
+    }
+
+    /// `o`: open the diff for the currently selected file row.
+    fn open_selected_diff(&mut self) {
+        let Some(&row) = self.list.selected().and_then(|i| self.rows.get(i)) else {
+            return;
+        };
+        match row {
+            Row::Staged(r, i) => {
+                if let Some(entry) = self.repos[r].status.staged.get(i).cloned() {
+                    self.open_diff(r, &entry, true);
+                }
+            }
+            Row::Unstaged(r, i) => {
+                if let Some(entry) = self.repos[r].status.unstaged.get(i).cloned() {
+                    self.open_diff(r, &entry, false);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1792,6 +1875,7 @@ impl App {
             ("u", "none"),
             ("c", "msg"),
             ("A", "suggest"),
+            ("o", "diff"),
             ("S", "sync"),
             ("s", "settings"),
             ("r", "refresh"),
