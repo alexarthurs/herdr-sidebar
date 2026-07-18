@@ -1254,15 +1254,16 @@ impl App {
             explorer: bounds[1],
             source_control: bounds[3],
         };
-        // The active chip's half-block caps (chip bg color on default bg).
+        // The active chip's cap rows are SOLID: the button spans all three
+        // rows, flush against the pane border above and the header below.
         let (chip_start, chip_end) = bounds[1];
         let chip_w = chip_end.saturating_sub(chip_start);
-        let cap = |glyph: &str| {
-            Paragraph::new(glyph.repeat(usize::from(chip_w)))
-                .style(Style::default().fg(Color::DarkGray))
+        let cap = || {
+            Paragraph::new(" ".repeat(usize::from(chip_w)))
+                .style(Style::default().bg(Color::DarkGray))
         };
-        frame.render_widget(cap("▄"), Rect::new(chip_start, outer_top, chip_w, 1));
-        frame.render_widget(cap("▀"), Rect::new(chip_start, outer_bottom, chip_w, 1));
+        frame.render_widget(cap(), Rect::new(chip_start, outer_top, chip_w, 1));
+        frame.render_widget(cap(), Rect::new(chip_start, outer_bottom, chip_w, 1));
         let gear = Span::styled(format!(" {} ", gear_icon(self.theme)), Style::default().dim());
         let gear_w = gear.width() as u16;
         let gear_x = area.x + area.width.saturating_sub(gear_w);
