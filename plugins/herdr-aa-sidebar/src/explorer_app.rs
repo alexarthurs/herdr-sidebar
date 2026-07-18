@@ -168,6 +168,7 @@ enum Setting {
     IconTheme,
     HiddenFiles,
     Hotkeys,
+    Folder,
 }
 
 /// (setting, label, current value, enabled) — disabled rows render dimmed and
@@ -208,6 +209,9 @@ pub struct App {
     last_click: Option<(usize, std::time::Instant)>,
     /// Last heartbeat stamp, throttling the token refresh.
     last_beat: std::time::Instant,
+    /// A native folder picker running on a background thread; its result
+    /// arrives here (None = cancelled).
+    picking: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
 }
 
 /// How long two clicks on the same row still count as a double click.
@@ -264,6 +268,7 @@ impl App {
             gear: Rect::default(),
             last_click: None,
             last_beat: std::time::Instant::now(),
+            picking: None,
         };
         app.apply_identity();
         app
@@ -485,7 +490,7 @@ impl App {
             }
             KeyCode::Char('i') => self.theme = self.theme.toggled(),
             KeyCode::Char('b') => self.collapse(),
-            KeyCode::Char('c') => self.change_folder_prompt(),
+            KeyCode::Char('c') => self.change_folder_dialog(),
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => return self.switch_to(View::SourceControl),
@@ -800,6 +805,12 @@ impl App {
                 if self.show_hotkeys() { "shown" } else { "hidden" }.to_string(),
                 true,
             ),
+            (
+                Setting::Folder,
+                "Change folder…",
+                self.tree.root_name(),
+                true,
+            ),
         ]
     }
 
@@ -825,6 +836,10 @@ impl App {
             Setting::Hotkeys => {
                 self.sidebar_state.show_hotkeys = !self.sidebar_state.show_hotkeys;
                 sidebar::save_state(self.sidebar_state);
+            }
+            Setting::Folder => {
+                self.overlay = None;
+                self.change_folder_dialog();
             }
         }
     }
@@ -942,7 +957,52 @@ impl App {
                 let path = target.map(|(p, _)| p).unwrap_or_else(|| self.tree.root_path());
                 actions::reveal(&path);
             }
-            MenuAction::ChangeFolder => self.change_folder_prompt(),
+            MenuAction::ChangeFolder => self.change_folder_dialog(),
+            MenuAction::ChangeFolderTyped => self.change_folder_prompt(),
+        }
+    }
+
+    /// `c` / the context menu: the NATIVE folder picker, on a background
+    /// thread so the pane's liveness heartbeat keeps beating while the
+    /// dialog is open (a frozen TUI would read as a corpse after 20s).
+    #[cfg(any(windows, target_os = "macos"))]
+    fn change_folder_dialog(&mut self) {
+        if self.picking.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let start = self.tree.root_path();
+        std::thread::spawn(move || {
+            let picked = rfd::FileDialog::new()
+                .set_title("Open Folder")
+                .set_directory(&start)
+                .pick_folder();
+            let _ = tx.send(picked);
+        });
+        self.picking = Some(rx);
+        self.notice = Some("folder picker open… (check your other windows)".into());
+    }
+
+    /// No native dialogs here — fall back to the typed prompt.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn change_folder_dialog(&mut self) {
+        self.change_folder_prompt();
+    }
+
+    /// Collect a finished folder pick, if any (called from the poll loop).
+    pub fn poll_picker(&mut self) {
+        let Some(rx) = &self.picking else { return };
+        match rx.try_recv() {
+            Ok(Some(path)) => {
+                self.picking = None;
+                self.change_folder(&path.display().to_string());
+            }
+            Ok(None) => {
+                self.picking = None;
+                self.notice = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(_) => self.picking = None,
         }
     }
 

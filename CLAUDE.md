@@ -242,9 +242,13 @@ HACKING.md — budget time for that before promising a patched build.
 - The unified pane reports BOTH identity tokens (`herdr-aa-sidebar-explorer`,
   `herdr-aa-sidebar-git`) so either launcher decision finds it; turning unified off clears
   the other token (null value — report_metadata MERGES token maps).
-- `c` (or the context menu's "Change Folder…") re-roots the sidebar: a path prompt
-  (absolute, relative to the current root, or ~-prefixed) that swaps the PROCESS cwd, so
-  the other view follows on its next switch. Rejected non-folders just flash a notice.
+- `c` (or "Change Folder…" in the context menu / both ⚙ Settings modals) re-roots the
+  sidebar via the NATIVE OS folder picker (`rfd`, Windows IFileDialog / macOS NSOpenPanel;
+  verified live on Windows). The dialog runs on a BACKGROUND thread polled from the event
+  loop — a blocking call would freeze the TUI and the liveness heartbeat would declare the
+  pane a corpse after 20s. "Change Folder (Type Path)…" keeps the typed prompt (absolute,
+  relative, or ~-prefixed); either path swaps the PROCESS cwd, so the other view follows
+  on its next switch.
 - Gotcha: after the ✧ suggestion lands, panel focus moves to the message box — letter keys
   then type text instead of triggering actions (Esc returns to the list).
 

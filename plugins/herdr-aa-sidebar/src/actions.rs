@@ -15,6 +15,7 @@ pub enum MenuAction {
     Delete,
     Reveal,
     ChangeFolder,
+    ChangeFolderTyped,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -45,6 +46,7 @@ pub fn menu_entries(is_root: bool) -> Vec<MenuEntry> {
         MenuEntry::Action(MenuAction::Reveal, "Reveal in File Explorer"),
         MenuEntry::Separator,
         MenuEntry::Action(MenuAction::ChangeFolder, "Change Folder…"),
+        MenuEntry::Action(MenuAction::ChangeFolderTyped, "Change Folder (Type Path)…"),
     ]);
     entries
 }

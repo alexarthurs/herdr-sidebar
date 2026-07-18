@@ -121,7 +121,9 @@ fn run_explorer(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<Exit
     let mut app = explorer_app::App::new(root);
     loop {
         terminal.draw(|frame| app.draw(frame))?;
-        if event::poll(Duration::from_millis(2000))? {
+        // 500ms: quick enough that a finished folder pick lands promptly,
+        // still cheap for the heartbeat.
+        if event::poll(Duration::from_millis(500))? {
             let exit = match event::read()? {
                 Event::Key(key) => app.on_key(key),
                 Event::Mouse(mouse) => app.on_mouse(mouse),
@@ -132,6 +134,7 @@ fn run_explorer(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<Exit
             }
         } else {
             app.heartbeat();
+            app.poll_picker();
         }
     }
 }
@@ -154,6 +157,7 @@ fn run_scm(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<Exit> {
             }
         } else {
             app.heartbeat();
+            app.poll_picker();
             app.tick();
         }
     }

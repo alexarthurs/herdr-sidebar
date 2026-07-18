@@ -398,6 +398,7 @@ enum Setting {
     UnifiedSidebar,
     IconTheme,
     Hotkeys,
+    Folder,
 }
 
 /// (setting, label, current value, enabled) — disabled rows render dimmed and
@@ -545,6 +546,9 @@ pub struct App {
     pane_ctl: Option<PaneCtl>,
     /// Last heartbeat stamp, throttling the token refresh.
     last_beat: std::time::Instant,
+    /// A native folder picker running on a background thread; its result
+    /// arrives here (None = cancelled).
+    picking: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
 }
 
 const MY_VIEW: View = View::SourceControl;
@@ -601,6 +605,7 @@ impl App {
             other_exe,
             pane_ctl,
             last_beat: std::time::Instant::now(),
+            picking: None,
         };
         app.apply_identity();
         app.refresh();
@@ -1474,6 +1479,15 @@ impl App {
                 if self.show_hotkeys() { "shown" } else { "hidden" }.to_string(),
                 true,
             ),
+            (
+                Setting::Folder,
+                "Change folder…",
+                self.cwd
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| self.cwd.display().to_string()),
+                true,
+            ),
         ]
     }
 
@@ -1496,6 +1510,57 @@ impl App {
                 self.sidebar_state.show_hotkeys = !self.sidebar_state.show_hotkeys;
                 sidebar::save_state(self.sidebar_state);
             }
+            Setting::Folder => {
+                self.overlay = None;
+                self.change_folder_dialog();
+            }
+        }
+    }
+
+    /// The NATIVE folder picker on a background thread (the pane's liveness
+    /// heartbeat must keep beating while the dialog is open).
+    #[cfg(any(windows, target_os = "macos"))]
+    fn change_folder_dialog(&mut self) {
+        if self.picking.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let start = self.cwd.clone();
+        std::thread::spawn(move || {
+            let picked = rfd::FileDialog::new()
+                .set_title("Open Folder")
+                .set_directory(&start)
+                .pick_folder();
+            let _ = tx.send(picked);
+        });
+        self.picking = Some(rx);
+        self.flash = Some(("folder picker open… (check your other windows)".into(), false));
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn change_folder_dialog(&mut self) {
+        self.flash = Some(("no native picker here — use c in the Files view".into(), true));
+    }
+
+    /// Collect a finished folder pick, if any (called from the tick loop).
+    pub fn poll_picker(&mut self) {
+        let Some(rx) = &self.picking else { return };
+        match rx.try_recv() {
+            Ok(Some(path)) => {
+                self.picking = None;
+                if std::env::set_current_dir(&path).is_ok() {
+                    let root = std::env::current_dir().unwrap_or(path);
+                    *self = App::new(root);
+                } else {
+                    self.flash = Some((format!("cannot open {}", path.display()), true));
+                }
+            }
+            Ok(None) => {
+                self.picking = None;
+                self.flash = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(_) => self.picking = None,
         }
     }
 
