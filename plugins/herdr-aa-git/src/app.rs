@@ -1429,7 +1429,7 @@ impl App {
         let footer_lines = self.footer_lines(area.width);
         // A breathing row above and below the icons keeps the activity bar
         // from crowding the pane border.
-        let activity_height = if self.merged() { 3 } else { 0 };
+        let activity_height = if self.merged() { 2 } else { 0 };
         let [activity, header, message, button, sync, list, footer] = Layout::vertical([
             Constraint::Length(activity_height),
             Constraint::Length(1),
@@ -1815,7 +1815,7 @@ impl App {
 /// Theme-matched activity-bar icons: (explorer, source control).
 fn activity_icons(theme: IconTheme) -> (&'static str, &'static str) {
     match theme {
-        IconTheme::Material => ("\u{f07b}", "\u{e725}"),
+        IconTheme::Material => ("\u{ea7b}", "\u{e725}"),
         IconTheme::Emoji => ("📁", "🔀"),
     }
 }
