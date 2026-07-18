@@ -14,6 +14,10 @@ use serde::Deserialize;
 /// The pane label the launcher assigns (`pane rename`) and later looks for.
 pub const PANE_LABEL: &str = "Explorer";
 
+/// Source id for `pane.report_metadata`; its token marks a pane as the
+/// Explorer independently of the (cosmetic, clearable) label.
+pub const METADATA_SOURCE: &str = "herdr-aa-filetree";
+
 /// Preferred explorer width in columns; the ratio is derived from the target pane.
 const TARGET_COLS: f64 = 32.0;
 
@@ -36,6 +40,20 @@ struct Pane {
     #[serde(default)]
     focused: bool,
     tab_id: Option<String>,
+    /// Metadata tokens reported via `pane.report_metadata`; shape of the
+    /// values is host-defined, only key presence matters here.
+    #[serde(default)]
+    tokens: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Pane {
+    /// An Explorer is recognized by its metadata token (reported by the TUI at
+    /// startup — survives the label being cleared while collapsed) or by the
+    /// "Explorer" label (present from the moment the launcher renames the
+    /// fresh pane, before the TUI has reported its token).
+    fn is_explorer(&self) -> bool {
+        self.tokens.contains_key(METADATA_SOURCE) || self.label.as_deref() == Some(PANE_LABEL)
+    }
 }
 
 #[derive(Deserialize)]
@@ -97,9 +115,9 @@ pub fn launch_decision(pane_list_json: &str) -> String {
     let Some(focused) = panes.iter().find(|p| p.focused) else {
         return "OPEN".to_string();
     };
-    let explorer = panes.iter().find(|p| {
-        p.label.as_deref() == Some(PANE_LABEL) && p.tab_id.as_deref() == focused.tab_id.as_deref()
-    });
+    let explorer = panes
+        .iter()
+        .find(|p| p.is_explorer() && p.tab_id.as_deref() == focused.tab_id.as_deref());
     let Some(id) = explorer.and_then(|p| p.pane_id.as_deref()).filter(|id| is_flag_safe(id))
     else {
         return "OPEN".to_string();
@@ -362,6 +380,15 @@ mod tests {
             r#"{"pane_id":"w1:p2","label":"Explorer","tab_id":"w1:t1","focused":true}"#,
         );
         assert_eq!(launch_decision(&json), "CLOSE w1:p2");
+    }
+
+    #[test]
+    fn decision_recognizes_explorer_by_metadata_token_without_label() {
+        // A collapsed explorer has its label cleared but keeps its token.
+        let json = pane_list(&format!(
+            r#"{FOCUSED},{{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-aa-filetree":{{"value":"explorer"}}}}}}"#
+        ));
+        assert_eq!(launch_decision(&json), "FOCUS w1:p2");
     }
 
     #[test]

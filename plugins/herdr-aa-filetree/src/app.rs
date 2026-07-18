@@ -35,6 +35,30 @@ impl PaneCtl {
         Some(Self { pane_id })
     }
 
+    /// Tag our pane with the Explorer metadata token so the ensure logic can
+    /// recognize it even while the (cosmetic) label is cleared.
+    fn report_identity(&self) {
+        let _ = herdr_aa_filetree::ipc::call_text(
+            "pane.report_metadata",
+            serde_json::json!({
+                "pane_id": self.pane_id,
+                "source": herdr_aa_filetree::launch::METADATA_SOURCE,
+                "tokens": { herdr_aa_filetree::launch::METADATA_SOURCE: "explorer" },
+            }),
+        );
+    }
+
+    /// Set or clear the pane label — cleared while collapsed so the sliver has
+    /// no border title (herdr shows nothing when label and metadata title are
+    /// both absent).
+    fn set_label(&self, label: Option<&str>) {
+        let mut params = serde_json::json!({ "pane_id": self.pane_id });
+        if let Some(label) = label {
+            params["label"] = serde_json::Value::String(label.to_string());
+        }
+        let _ = herdr_aa_filetree::ipc::call_text("pane.rename", params);
+    }
+
     /// Resize our pane to `target` terminal columns over the socket API.
     /// `pane.resize`'s amount is a split-RATIO delta, so the exact amount comes
     /// from the live layout via [`herdr_aa_filetree::launch::resize_plan`].
@@ -111,6 +135,7 @@ pub struct App {
     /// Pane size from the last draw; sizing decisions and PageUp/PageDown
     /// strides are based on what was actually rendered.
     last_width: u16,
+    last_height: u16,
     page: usize,
     /// Width to restore on expand, remembered at collapse time.
     expanded_width: u16,
@@ -135,13 +160,18 @@ impl App {
             state.select(Some(0));
         }
         let theme = IconTheme::from_env(std::env::var("HERDR_AA_FILETREE_ICONS").ok().as_deref());
+        let pane_ctl = PaneCtl::from_env();
+        if let Some(ctl) = &pane_ctl {
+            ctl.report_identity();
+        }
         Self {
             tree,
             rows,
             state,
             theme,
-            pane_ctl: PaneCtl::from_env(),
+            pane_ctl,
             last_width: DEFAULT_EXPANDED_WIDTH,
+            last_height: 24,
             page: 20,
             expanded_width: DEFAULT_EXPANDED_WIDTH,
             collapsed: false,
@@ -164,6 +194,7 @@ impl App {
         self.expanded_width = self.last_width;
         self.collapsed = true;
         if let Some(ctl) = &self.pane_ctl {
+            ctl.set_label(None);
             ctl.resize_to(self.last_width, SLIVER_TARGET);
         }
     }
@@ -174,6 +205,7 @@ impl App {
         }
         self.collapsed = false;
         if let Some(ctl) = &self.pane_ctl {
+            ctl.set_label(Some(herdr_aa_filetree::launch::PANE_LABEL));
             ctl.resize_to(
                 self.last_width,
                 self.expanded_width.max(DEFAULT_EXPANDED_WIDTH),
@@ -243,7 +275,8 @@ impl App {
             MouseEventKind::ScrollUp => self.move_by(-3),
             MouseEventKind::ScrollDown => self.move_by(3),
             MouseEventKind::Down(MouseButton::Left) => {
-                if hits_collapse_button(mouse.column, mouse.row, self.last_width) {
+                if hits_collapse_button(mouse.column, mouse.row, self.last_width, self.last_height)
+                {
                     self.collapse();
                     return;
                 }
@@ -590,6 +623,7 @@ impl App {
 
     pub fn draw(&mut self, frame: &mut Frame) {
         self.last_width = frame.area().width;
+        self.last_height = frame.area().height;
         if self.collapsed() {
             self.draw_sliver(frame);
             return;
@@ -602,15 +636,8 @@ impl App {
                 .areas(frame.area());
         self.page = body.height.saturating_sub(1).max(1) as usize;
 
-        // Root name on the left, the collapse button on the right.
-        let [root_area, button_area] =
-            Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(header);
-        let root_label = format!(" 🗂  {}", self.tree.root_name().to_uppercase());
-        frame.render_widget(Paragraph::new(root_label.bold().fg(Color::LightBlue)), root_area);
-        frame.render_widget(
-            Paragraph::new("«".bold().fg(Color::LightBlue)).alignment(Alignment::Center),
-            button_area,
-        );
+        let root_label = format!(" {}", self.tree.root_name().to_uppercase());
+        frame.render_widget(Paragraph::new(root_label.bold().fg(Color::LightBlue)), header);
 
         if self.rows.is_empty() {
             frame.render_widget(Paragraph::new("  (empty)".dim().italic()), body);
@@ -636,6 +663,14 @@ impl App {
             offset: self.state.offset(),
         };
 
+        // Collapse button at the bottom-right, mirroring herdr's own sidebar.
+        let [footer_left, footer_button] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(footer);
+        frame.render_widget(
+            Paragraph::new("«".bold().fg(Color::LightBlue)).alignment(Alignment::Center),
+            footer_button,
+        );
+        let footer = footer_left;
         let footer_line: Line = if let Some(notice) = &self.notice {
             format!(" {notice}").fg(Color::Yellow).into()
         } else {
@@ -792,10 +827,10 @@ fn row_index_at(body: BodyGeom, row_count: usize, mouse_row: u16) -> Option<usiz
 }
 
 /// True when a click at pane-local (column, row) lands on the `«` button: the
-/// 3-cell region at the right end of the header line (row 0 — the TUI draws no
-/// border of its own).
-fn hits_collapse_button(column: u16, row: u16, pane_width: u16) -> bool {
-    row == 0 && column >= pane_width.saturating_sub(4)
+/// 3-cell region at the right end of the footer (bottom) line, mirroring
+/// herdr's own sidebar collapse control.
+fn hits_collapse_button(column: u16, row: u16, pane_width: u16, pane_height: u16) -> bool {
+    row == pane_height.saturating_sub(1) && column >= pane_width.saturating_sub(4)
 }
 
 /// The sliver's content: a single folder icon in the active theme.
@@ -817,10 +852,11 @@ mod tests {
 
     #[test]
     fn collapse_button_hit_region_is_header_right_edge() {
-        assert!(hits_collapse_button(30, 0, 32));
-        assert!(hits_collapse_button(28, 0, 32));
-        assert!(!hits_collapse_button(27, 0, 32), "left of the button");
-        assert!(!hits_collapse_button(30, 1, 32), "tree row");
+        assert!(hits_collapse_button(30, 49, 32, 50), "footer right edge");
+        assert!(hits_collapse_button(28, 49, 32, 50));
+        assert!(!hits_collapse_button(27, 49, 32, 50), "left of the button");
+        assert!(!hits_collapse_button(30, 0, 32, 50), "header row");
+        assert!(!hits_collapse_button(30, 48, 32, 50), "tree row");
     }
 
     #[test]
