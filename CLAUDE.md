@@ -47,6 +47,29 @@ cargo clippy -- -D warnings
   the Windows variants and gate both with the item-level `platforms` key.
 - herdr panes on this machine run **Windows PowerShell 5.1**: chain with `;` / `if ($?)`,
   never `&&`.
+- PowerShell 5.1 **prepends a UTF-8 BOM when piping into a native process's stdin** — strip
+  `\u{feff}` before JSON-parsing anything piped from a `.ps1` launcher (see `strip_bom` in
+  both plugins' `launch.rs`).
+
+### Herdr behavior (verified live against herdr 0.7.1, both platforms)
+
+- `pane split --ratio` is the **original** pane's share, not the new pane's. `pane split`
+  only goes right/down; a left dock = split the leftmost pane + `pane swap` the new pane
+  into the left slot. After a swap, **focus stays with the slot, not the pane**.
+- There is no focus-by-id command; a `pane zoom <id> --on` / `--off` cycle focuses a pane
+  deterministically.
+- `pane send-keys` accepts only a limited key-name set: `Up`/`Down`/`Enter`/`Escape`/`Tab`
+  and plain characters work, but `Home` is rejected with `invalid_key`. Give TUIs
+  single-char fallbacks (`g`/`G` for Home/End) so they stay drivable via send-keys.
+
+### Verifying a plugin TUI end-to-end
+
+Drive the real binary in a throwaway herdr pane instead of unit-testing rendering:
+`pane split --current --no-focus --cwd <scratch repo>`, then `pane run <id> "& '<abs path to exe>'"`
+(PS call operator — a bare path splits on spaces), then `pane send-keys <id> Down Enter …`,
+capture with `pane read <id> --source visible`, and confirm side effects with plain `git`
+commands in the scratch repo. Close the pane when done. Cheap, and it catches layout
+truncation bugs unit tests can't.
 
 ## Herdr workspace
 
