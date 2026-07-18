@@ -40,4 +40,4 @@ two-face = { version = "0.4", default-features = false, features = ["syntect-fan
 # Native folder picker for "Change Folder" (Windows IFileDialog / macOS
 # NSOpenPanel); other platforms keep the typed-path prompt.
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
-rfd = { version = "0.15", default-features = false }
+rfd = { version = "0.17", default-features = false }
