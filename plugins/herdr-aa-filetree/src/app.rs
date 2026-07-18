@@ -1088,7 +1088,7 @@ impl App {
         let footer_height = self.footer_height(frame.area().width);
         // A breathing row above and below the icons keeps the activity bar
         // from crowding the pane border.
-        let activity_height = if self.merged() { 2 } else { 0 };
+        let activity_height = if self.merged() { 3 } else { 0 };
         let [activity, header, body, footer] = Layout::vertical([
             Constraint::Length(activity_height),
             Constraint::Length(1),
@@ -1224,8 +1224,9 @@ impl App {
     /// them by a half block — a tall button with built-in breathing room,
     /// no strip container.
     fn draw_activity_bar(&mut self, frame: &mut Frame, area: Rect) {
-        let outer_bottom = area.y + 1;
-        let area = Rect::new(area.x, area.y, area.width, 1);
+        let outer_top = area.y;
+        let outer_bottom = area.y + 2;
+        let area = Rect::new(area.x, area.y + 1, area.width, 1);
         let (exp_icon, git_icon) = activity_icons(self.theme);
         let active = |on: bool| {
             if on {
@@ -1256,13 +1257,16 @@ impl App {
             explorer: bounds[1],
             source_control: bounds[3],
         };
-        // The active chip gets a half-block bottom cap: a 1½-cell button,
-        // flush under the pane border, half a row of air before the header.
+        // Symmetric half-block caps: a 2-cell button with the icon in its
+        // vertical center.
         let (chip_start, chip_end) = bounds[1];
         let chip_w = chip_end.saturating_sub(chip_start);
-        let cap = Paragraph::new("▀".repeat(usize::from(chip_w)))
-            .style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(cap, Rect::new(chip_start, outer_bottom, chip_w, 1));
+        let cap = |glyph: &str| {
+            Paragraph::new(glyph.repeat(usize::from(chip_w)))
+                .style(Style::default().fg(Color::DarkGray))
+        };
+        frame.render_widget(cap("▄"), Rect::new(chip_start, outer_top, chip_w, 1));
+        frame.render_widget(cap("▀"), Rect::new(chip_start, outer_bottom, chip_w, 1));
         let gear = Span::styled(format!(" {} ", gear_icon(self.theme)), Style::default().dim());
         let gear_w = gear.width() as u16;
         let gear_x = area.x + area.width.saturating_sub(gear_w);
