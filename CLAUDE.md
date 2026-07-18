@@ -204,6 +204,14 @@ HACKING.md — budget time for that before promising a patched build.
 - Gotcha: after the ✨ suggestion lands, panel focus moves to the message box — letter keys
   then type text instead of triggering actions (Esc returns to the list).
 
+### Explorer specifics (herdr-aa-filetree)
+
+- Clicking a file (or Enter on it) opens a ZOOMED preview: the pane zooms via
+  `pane.zoom {pane_id, mode:"on"|"off"}` and shows the file with line numbers; Esc/q or
+  clicking the ← header hands back and restores the label. Double-clicking a folder name
+  toggles it (450ms same-row window — crossterm has no native double-click event).
+- The activity bar row is 3 rows tall (blank padding above/below the icons).
+
 ### Source Control panel specifics (herdr-aa-git)
 
 - **Multi-repo**: `Git::discover_all` lists the repo containing the cwd plus child repos two

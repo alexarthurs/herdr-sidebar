@@ -74,6 +74,14 @@ impl PaneCtl {
         );
     }
 
+    /// Zoom our own pane (the file preview fills the tab with it).
+    fn zoom(&self, on: bool) {
+        let _ = herdr_aa_filetree::ipc::call_text(
+            "pane.zoom",
+            serde_json::json!({ "pane_id": self.pane_id, "mode": if on { "on" } else { "off" } }),
+        );
+    }
+
     /// Set or clear the pane label — cleared while collapsed so the sliver has
     /// no border title (herdr shows nothing when label and metadata title are
     /// both absent).
@@ -199,6 +207,57 @@ pub struct App {
     /// The ⚙ button's rect from the last draw (activity bar in unified mode,
     /// header row otherwise).
     gear: Rect,
+    /// Zoomed file preview, replacing the tree while open.
+    preview: Option<Preview>,
+    /// Last left-click (row index, when) for double-click detection.
+    last_click: Option<(usize, std::time::Instant)>,
+}
+
+/// How long two clicks on the same row still count as a double click.
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(450);
+
+/// A file opened from the tree: the pane zooms and shows its contents until
+/// Esc/q (or a click on the header) hands back.
+struct Preview {
+    name: String,
+    path: PathBuf,
+    lines: Vec<String>,
+    scroll: usize,
+}
+
+/// Preview size guards: don't slurp huge files into a sidebar.
+const PREVIEW_MAX_BYTES: usize = 1024 * 1024;
+const PREVIEW_MAX_LINES: usize = 5000;
+
+impl Preview {
+    fn load(path: &Path) -> Preview {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let lines = match std::fs::read(path) {
+            Err(e) => vec![format!("(unreadable: {e})")],
+            Ok(bytes) => {
+                let head = &bytes[..bytes.len().min(8192)];
+                if head.contains(&0) {
+                    vec![format!("(binary file — {} bytes)", bytes.len())]
+                } else {
+                    let truncated_bytes = bytes.len() > PREVIEW_MAX_BYTES;
+                    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(PREVIEW_MAX_BYTES)]);
+                    let mut lines: Vec<String> =
+                        text.lines().take(PREVIEW_MAX_LINES).map(str::to_string).collect();
+                    if truncated_bytes || text.lines().count() > PREVIEW_MAX_LINES {
+                        lines.push("… (truncated)".to_string());
+                    }
+                    if lines.is_empty() {
+                        lines.push("(empty file)".to_string());
+                    }
+                    lines
+                }
+            }
+        };
+        Preview { name, path: path.to_path_buf(), lines, scroll: 0 }
+    }
 }
 
 /// Activity-bar click zones from the last draw: the bar's row and the column
@@ -250,6 +309,8 @@ impl App {
             other_exe,
             activity: ActivityZones::default(),
             gear: Rect::default(),
+            preview: None,
+            last_click: None,
         };
         app.apply_identity();
         app
@@ -281,6 +342,66 @@ impl App {
     /// Collapsed by the button, or manually dragged down to a sliver.
     fn collapsed(&self) -> bool {
         self.collapsed || self.last_width < SLIVER_THRESHOLD
+    }
+
+    /// Open a file preview: the pane zooms to fill the tab and shows the file
+    /// (single click on a file, like VS Code's preview open).
+    fn open_preview(&mut self, path: &Path) {
+        self.preview = Some(Preview::load(path));
+        if let Some(ctl) = &self.pane_ctl {
+            ctl.zoom(true);
+            if let Some(preview) = &self.preview {
+                ctl.set_label(Some(&preview.name));
+            }
+        }
+    }
+
+    /// Close the preview: unzoom and restore the pane label.
+    fn close_preview(&mut self) {
+        self.preview = None;
+        if let Some(ctl) = &self.pane_ctl {
+            ctl.zoom(false);
+        }
+        // Re-assert label AFTER unzooming (pane_label borrows self).
+        let label = self.pane_label();
+        if let Some(ctl) = &self.pane_ctl {
+            ctl.set_label(Some(label));
+        }
+    }
+
+    fn preview_key(&mut self, key: KeyEvent) {
+        let page = self.page as isize;
+        let Some(preview) = self.preview.as_mut() else { return };
+        let max = preview.lines.len().saturating_sub(1);
+        let scroll = |cur: usize, delta: isize| -> usize {
+            cur.saturating_add_signed(delta).min(max)
+        };
+        match key.code {
+            KeyCode::Esc
+            | KeyCode::Char('q')
+            | KeyCode::Char('h')
+            | KeyCode::Backspace
+            | KeyCode::Left => self.close_preview(),
+            KeyCode::Up | KeyCode::Char('k') => preview.scroll = scroll(preview.scroll, -1),
+            KeyCode::Down | KeyCode::Char('j') => preview.scroll = scroll(preview.scroll, 1),
+            KeyCode::PageUp => preview.scroll = scroll(preview.scroll, -page),
+            KeyCode::PageDown => preview.scroll = scroll(preview.scroll, page),
+            KeyCode::Home | KeyCode::Char('g') => preview.scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => preview.scroll = max,
+            _ => {}
+        }
+    }
+
+    fn preview_mouse(&mut self, mouse: MouseEvent) {
+        let Some(preview) = self.preview.as_mut() else { return };
+        let max = preview.lines.len().saturating_sub(1);
+        match mouse.kind {
+            MouseEventKind::ScrollUp => preview.scroll = preview.scroll.saturating_sub(3),
+            MouseEventKind::ScrollDown => preview.scroll = (preview.scroll + 3).min(max),
+            // The header line doubles as the ← back affordance.
+            MouseEventKind::Down(MouseButton::Left) if mouse.row == 0 => self.close_preview(),
+            _ => {}
+        }
     }
 
     fn collapse(&mut self) {
@@ -390,6 +511,10 @@ impl App {
             return None;
         }
         self.notice = None;
+        if self.preview.is_some() {
+            self.preview_key(key);
+            return None;
+        }
         if self.overlay.is_some() {
             self.overlay_key(key);
             return None;
@@ -433,6 +558,10 @@ impl App {
 
     /// `Some(exit)` ends the event loop, mirroring on_key.
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Exit> {
+        if self.preview.is_some() {
+            self.preview_mouse(mouse);
+            return None;
+        }
         if self.collapsed() {
             if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.expand();
@@ -476,8 +605,23 @@ impl App {
                 let index = self.row_at(mouse.row)?;
                 self.select(index);
                 let row = &self.rows[index];
-                if row.is_dir && hits_chevron(mouse.column, row.depth) {
-                    self.toggle();
+                let (is_dir, path) = (row.is_dir, row.path.clone());
+                let on_chevron = is_dir && hits_chevron(mouse.column, row.depth);
+                // Double click = second click on the same row inside the window.
+                let now = std::time::Instant::now();
+                let double = self
+                    .last_click
+                    .take()
+                    .is_some_and(|(i, at)| i == index && now.duration_since(at) < DOUBLE_CLICK);
+                self.last_click = Some((index, now));
+                if is_dir {
+                    // Chevron always toggles; the name toggles on double click.
+                    if on_chevron || double {
+                        self.toggle();
+                    }
+                } else {
+                    // A click on a file zooms the pane into its preview.
+                    self.open_preview(&path);
                 }
             }
             MouseEventKind::Down(MouseButton::Right) => {
@@ -941,10 +1085,12 @@ impl App {
 
     fn toggle(&mut self) {
         let Some(row) = self.selected_row() else { return };
+        let path = row.path.clone();
         if !row.is_dir {
+            // Enter on a file opens the zoomed preview, like clicking it.
+            self.open_preview(&path);
             return;
         }
-        let path = row.path.clone();
         self.tree.toggle(&path);
         self.rebuild();
     }
@@ -973,6 +1119,10 @@ impl App {
     pub fn draw(&mut self, frame: &mut Frame) {
         self.last_width = frame.area().width;
         self.last_height = frame.area().height;
+        if self.preview.is_some() {
+            self.draw_preview(frame);
+            return;
+        }
         if self.collapsed() {
             self.draw_sliver(frame);
             return;
@@ -982,7 +1132,9 @@ impl App {
         // the pane label ("Explorer"/"Sidebar") — a second border read as a
         // double frame.
         let footer_height = self.footer_height(frame.area().width);
-        let activity_height = u16::from(self.merged());
+        // A breathing row above and below the icons keeps the activity bar
+        // from crowding the pane border.
+        let activity_height = if self.merged() { 3 } else { 0 };
         let [activity, header, body, footer] = Layout::vertical([
             Constraint::Length(activity_height),
             Constraint::Length(1),
@@ -1112,8 +1264,78 @@ impl App {
         wrap_hints(&self.hints(), width, 3).len() as u16
     }
 
+    /// The zoomed file preview: header (← back), numbered contents, hints.
+    fn draw_preview(&mut self, frame: &mut Frame) {
+        let area = frame.area();
+        let footer_height = wrap_hints(&preview_hints(), area.width, 0).len() as u16;
+        let [header, body, footer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(footer_height),
+        ])
+        .areas(area);
+        self.page = body.height.saturating_sub(1).max(1) as usize;
+        let theme = self.theme;
+        let Some(preview) = self.preview.as_mut() else { return };
+        preview.scroll = preview
+            .scroll
+            .min(preview.lines.len().saturating_sub(usize::from(body.height).max(1)));
+
+        let file_icon = icon(theme, &preview.name, false, false);
+        let icon_style = match file_icon.rgb {
+            Some((r, g, b)) => Style::default().fg(Color::Rgb(r, g, b)),
+            None => Style::default(),
+        };
+        let left = vec![
+            Span::styled(" ← ", Style::default().bold().fg(Color::LightBlue)),
+            Span::styled(format!("{} ", file_icon.glyph), icon_style),
+            Span::styled(preview.name.clone(), Style::default().bold()),
+        ];
+        let used: usize = left.iter().map(Span::width).sum();
+        let path = preview.path.display().to_string();
+        let avail = usize::from(area.width).saturating_sub(used + 2);
+        let mut spans = left;
+        let shown = if path.chars().count() > avail {
+            let tail: String = path
+                .chars()
+                .skip(path.chars().count().saturating_sub(avail.saturating_sub(1)))
+                .collect();
+            format!("…{tail}")
+        } else {
+            path
+        };
+        spans.push(Span::styled(format!("  {shown}"), Style::default().dim()));
+        frame.render_widget(Paragraph::new(Line::from(spans)), header);
+
+        let number_width = preview.lines.len().to_string().len();
+        let text: Vec<Line> = preview
+            .lines
+            .iter()
+            .enumerate()
+            .skip(preview.scroll)
+            .take(usize::from(body.height))
+            .map(|(n, line)| {
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:>number_width$} ", n + 1),
+                        Style::default().dim(),
+                    ),
+                    Span::raw(line.clone()),
+                ])
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(text), body);
+
+        frame.render_widget(
+            Paragraph::new(wrap_hints(&preview_hints(), area.width, 0)),
+            footer,
+        );
+    }
+
     /// The VS Code activity bar: view-switcher icons plus a detach button.
+    /// The area is three rows tall — icons render on the middle one.
     fn draw_activity_bar(&mut self, frame: &mut Frame, area: Rect) {
+        let area = Rect::new(area.x, area.y + 1, area.width, 1);
         let (exp_icon, git_icon) = activity_icons(self.theme);
         let active = |on: bool| {
             if on {
@@ -1242,6 +1464,11 @@ fn row_item(row: &Row, theme: IconTheme, hovered: bool) -> ListItem<'static> {
     } else {
         item
     }
+}
+
+/// Hotkey hints shown under a file preview.
+fn preview_hints() -> Vec<(&'static str, &'static str)> {
+    vec![("↑↓", "scroll"), ("⇞⇟", "page"), ("g G", "ends"), ("esc", "back")]
 }
 
 /// Theme-matched activity-bar icons: (explorer, source control).
