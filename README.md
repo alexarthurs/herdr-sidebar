@@ -94,8 +94,9 @@ The ⚙ settings modal — mouse-toggleable like everything else — flips betwe
 <img src="plugins/herdr-aa-sidebar/docs/media/settings.png" alt="The settings modal" width="920">
 </div>
 
-Icon theme and dotfile visibility live in the same modal, and every choice persists
-across restarts. However you split it, the dock takes care of itself: a focus hook
+Icon theme, dotfile visibility, and the full hotkey reference live in the same modal
+(with a toggle if you'd rather keep the key hints pinned to the sidebar's footer), and
+every choice persists across restarts. However you split it, the dock takes care of itself: a focus hook
 re-docks the sidebar in any tab or workspace that's missing one — new project, new
 worktree, new window, it's just *there*.
 
