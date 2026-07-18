@@ -209,8 +209,12 @@ HACKING.md — budget time for that before promising a patched build.
 - **Multi-repo**: `Git::discover_all` lists the repo containing the cwd plus child repos two
   levels down (`.git` dir or file), skipping `target`/`node_modules`/`.claude` (the agent
   worktrees under `.claude/worktrees` would otherwise show up as repos). With >1 repo the
-  list gets VS Code-style repo header rows; the commit box / ✧ suggest / Sync act on the
-  ACTIVE repo — the one the selection is in (named in the panel header).
+  layout mirrors VS Code's: each repo section carries its OWN inline message box (3-line
+  bordered list row) and ✓ Commit button, and the repo header row shows `⎇branch*` (star =
+  dirty) plus clickable ⟳ sync / ✓ commit icons in the fixed last-6 columns. List rows now
+  have VARIABLE HEIGHT — mouse hit-testing walks `Row::height()`, and j/k skip the widget
+  rows (`Row::selectable()`). The ✧ suggest / S sync keys act on the ACTIVE repo — the one
+  the selection is in (named in the panel header).
 - **Sync Changes** (`S` or the ⇅ button, shown only when ahead/behind ≠ 0): `pull --rebase
   --autostash` then `push`, on a background thread polled from tick(). Ahead/behind parse
   from the porcelain `## branch...upstream [ahead N, behind M]` header.

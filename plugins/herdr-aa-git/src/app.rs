@@ -115,7 +115,8 @@ struct DrawerPanel {
     lines: Vec<String>,
 }
 
-/// One discovered repository and its per-repo view state.
+/// One discovered repository and its per-repo view state — including its own
+/// commit message, so the multi-repo view mirrors VS Code's per-repo inputs.
 struct Repo {
     git: Git,
     name: String,
@@ -123,6 +124,8 @@ struct Repo {
     collapsed: bool,
     staged_collapsed: bool,
     changes_collapsed: bool,
+    message: Vec<char>,
+    cursor: usize,
 }
 
 impl Repo {
@@ -134,7 +137,19 @@ impl Repo {
             collapsed: false,
             staged_collapsed: false,
             changes_collapsed: false,
+            message: Vec::new(),
+            cursor: 0,
         }
+    }
+
+    /// The repo row's branch decoration: `name*` when the tree is dirty.
+    fn branch_decor(&self) -> String {
+        let dirty = if self.status.staged.is_empty() && self.status.unstaged.is_empty() {
+            ""
+        } else {
+            "*"
+        };
+        format!("{}{dirty}", self.status.branch)
     }
 }
 
@@ -143,6 +158,10 @@ impl Repo {
 enum Row {
     /// Only rendered when more than one repository is visible.
     RepoHeader(usize),
+    /// The repo's inline message box (3 screen lines) — multi-repo only.
+    Message(usize),
+    /// The repo's inline ✓ Commit button — multi-repo only.
+    Commit(usize),
     StagedHeader(usize),
     ChangesHeader(usize),
     Staged(usize, usize),
@@ -156,12 +175,28 @@ impl Row {
     fn repo(self) -> Option<usize> {
         match self {
             Row::RepoHeader(r)
+            | Row::Message(r)
+            | Row::Commit(r)
             | Row::StagedHeader(r)
             | Row::ChangesHeader(r)
             | Row::Staged(r, _)
             | Row::Unstaged(r, _) => Some(r),
             Row::DrawerHeader(_) | Row::DrawerLine(..) => None,
         }
+    }
+
+    /// Screen lines this row occupies (the inline message box is bordered).
+    fn height(self) -> u16 {
+        match self {
+            Row::Message(_) => 3,
+            _ => 1,
+        }
+    }
+
+    /// Keyboard navigation (j/k, wheel) skips widget rows — they are clicked,
+    /// like VS Code's inputs, not list entries.
+    fn selectable(self) -> bool {
+        !matches!(self, Row::Message(_) | Row::Commit(_))
     }
 }
 
@@ -298,8 +333,6 @@ pub struct App {
     list: ListState,
     focus: Focus,
     theme: IconTheme,
-    message: Vec<char>,
-    cursor: usize,
     drawers: [DrawerPanel; 7],
     /// The file the FILE HISTORY drawer follows: the last selected file row.
     history_target: Option<String>,
@@ -351,8 +384,6 @@ impl App {
             list: ListState::default(),
             focus: Focus::List,
             theme,
-            message: Vec::new(),
-            cursor: 0,
             drawers: Default::default(),
             history_target: None,
             flash: None,
@@ -375,6 +406,16 @@ impl App {
 
     fn active_repo(&self) -> Option<&Repo> {
         self.repos.get(self.active)
+    }
+
+    fn active_repo_mut(&mut self) -> Option<&mut Repo> {
+        let i = self.active;
+        self.repos.get_mut(i)
+    }
+
+    /// More than one repo: VS Code-style per-repo inline inputs in the list.
+    fn multi(&self) -> bool {
+        self.repos.len() > 1
     }
 
     /// The merged sidebar is on and actually usable (other plugin present).
@@ -420,8 +461,10 @@ impl App {
         if let Some(rx) = &self.suggesting {
             match rx.try_recv() {
                 Ok(message) => {
-                    self.message = message.chars().collect();
-                    self.cursor = self.message.len();
+                    if let Some(repo) = self.active_repo_mut() {
+                        repo.message = message.chars().collect();
+                        repo.cursor = repo.message.len();
+                    }
                     self.focus = Focus::Message;
                     self.flash = Some(("✧ suggestion ready — edit or ⏎ to commit".into(), false));
                     self.suggesting = None;
@@ -490,6 +533,10 @@ impl App {
                 if repo.collapsed {
                     continue;
                 }
+                // VS Code gives every repo its own message box and Commit
+                // button, inline in the list.
+                self.rows.push(Row::Message(r));
+                self.rows.push(Row::Commit(r));
             }
             // Like VS Code, the Staged section only exists while something is staged.
             if !repo.status.staged.is_empty() {
@@ -520,8 +567,19 @@ impl App {
             return;
         }
         let index = self.list.selected().unwrap_or(0).min(self.rows.len() - 1);
-        self.list.select(Some(index));
+        self.list.select(Some(self.nearest_selectable(index)));
         self.follow_selection();
+    }
+
+    /// The closest keyboard-selectable row to `from` (widget rows — inline
+    /// message boxes and commit buttons — are skipped).
+    fn nearest_selectable(&self, from: usize) -> usize {
+        if self.rows.get(from).is_some_and(|r| r.selectable()) {
+            return from;
+        }
+        let after = (from..self.rows.len()).find(|&i| self.rows[i].selectable());
+        let before = (0..from).rev().find(|&i| self.rows[i].selectable());
+        after.or(before).unwrap_or(0)
     }
 
     /// Keep the active repo and the FILE HISTORY drawer following the
@@ -587,33 +645,40 @@ impl App {
 
     fn on_message_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Enter => self.commit(),
+            KeyCode::Enter => {
+                self.commit();
+                return;
+            }
             KeyCode::Esc => self.focus = Focus::List,
             KeyCode::Tab => self.focus = Focus::Commit,
             KeyCode::BackTab => self.focus = Focus::List,
             KeyCode::Down => self.focus = Focus::Commit,
+            _ => {}
+        }
+        let Some(repo) = self.active_repo_mut() else { return };
+        match key.code {
             KeyCode::Backspace => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                    self.message.remove(self.cursor);
+                if repo.cursor > 0 {
+                    repo.cursor -= 1;
+                    repo.message.remove(repo.cursor);
                 }
             }
             KeyCode::Delete => {
-                if self.cursor < self.message.len() {
-                    self.message.remove(self.cursor);
+                if repo.cursor < repo.message.len() {
+                    repo.message.remove(repo.cursor);
                 }
             }
-            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Right => self.cursor = (self.cursor + 1).min(self.message.len()),
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.message.len(),
+            KeyCode::Left => repo.cursor = repo.cursor.saturating_sub(1),
+            KeyCode::Right => repo.cursor = (repo.cursor + 1).min(repo.message.len()),
+            KeyCode::Home => repo.cursor = 0,
+            KeyCode::End => repo.cursor = repo.message.len(),
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.message.clear();
-                self.cursor = 0;
+                repo.message.clear();
+                repo.cursor = 0;
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.message.insert(self.cursor, c);
-                self.cursor += 1;
+                repo.message.insert(repo.cursor, c);
+                repo.cursor += 1;
             }
             _ => {}
         }
@@ -713,18 +778,43 @@ impl App {
             self.sync_changes();
             return None;
         }
-        if let Some(index) = self.row_at(y) {
-            self.focus = Focus::List;
-            self.select(index);
-            // Single click toggles section/drawer headers, selects file rows.
-            if matches!(
-                self.rows[index],
-                Row::RepoHeader(_)
-                    | Row::StagedHeader(_)
-                    | Row::ChangesHeader(_)
-                    | Row::DrawerHeader(_)
-            ) {
-                self.activate();
+        if let Some((index, line)) = self.row_hit(y) {
+            match self.rows[index] {
+                // The inline widgets: click focuses/acts without selecting.
+                Row::Message(r) => {
+                    self.active = r;
+                    // The box's middle line holds the input and the ✧ button.
+                    if line == 1 && x >= self.last_width.saturating_sub(4) {
+                        self.suggest_message();
+                    } else {
+                        self.focus = Focus::Message;
+                    }
+                    self.follow_selection();
+                }
+                Row::Commit(r) => self.commit_repo(r),
+                Row::RepoHeader(r) => {
+                    self.focus = Focus::List;
+                    self.select(index);
+                    // Right-side action icons: ⟳ sync · ✓ commit (fixed
+                    // offsets from the right edge, see repo_header_item).
+                    let w = self.last_width;
+                    if x >= w.saturating_sub(3) && x < w {
+                        self.commit_repo(r);
+                    } else if x >= w.saturating_sub(6) && x < w.saturating_sub(3) {
+                        self.sync_repo(r);
+                    } else {
+                        self.activate();
+                    }
+                }
+                Row::StagedHeader(_) | Row::ChangesHeader(_) | Row::DrawerHeader(_) => {
+                    self.focus = Focus::List;
+                    self.select(index);
+                    self.activate();
+                }
+                _ => {
+                    self.focus = Focus::List;
+                    self.select(index);
+                }
             }
         }
         None
@@ -1125,9 +1215,24 @@ impl App {
     }
 
     fn move_by(&mut self, delta: isize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let len = self.rows.len() as isize;
         let current = self.list.selected().unwrap_or(0) as isize;
-        let next = (current + delta).clamp(0, self.rows.len().saturating_sub(1) as isize);
-        self.select(next as usize);
+        let step = if delta >= 0 { 1 } else { -1 };
+        let mut next = (current + delta).clamp(0, len - 1);
+        // Widget rows aren't keyboard stops: keep going in the same direction,
+        // falling back to the nearest stop at the ends.
+        while (0..len).contains(&next) && !self.rows[next as usize].selectable() {
+            next += step;
+        }
+        let next = if (0..len).contains(&next) {
+            next as usize
+        } else {
+            self.nearest_selectable((current + delta).clamp(0, len - 1) as usize)
+        };
+        self.select(next);
     }
 
     /// Enter/Space on the selected row: toggle a section/drawer, or move a
@@ -1137,6 +1242,8 @@ impl App {
             return;
         };
         match row {
+            // Widget rows aren't keyboard-selectable; nothing to activate.
+            Row::Message(_) | Row::Commit(_) => {}
             Row::RepoHeader(r) => {
                 self.repos[r].collapsed = !self.repos[r].collapsed;
                 self.rebuild();
@@ -1210,13 +1317,17 @@ impl App {
         }
     }
 
-    /// VS Code's Sync Changes (pull --rebase, then push) for the active repo,
-    /// on a background thread; tick() collects the outcome.
+    /// VS Code's Sync Changes (pull --rebase, then push) on a background
+    /// thread; tick() collects the outcome.
     fn sync_changes(&mut self) {
+        self.sync_repo(self.active);
+    }
+
+    fn sync_repo(&mut self, index: usize) {
         if self.syncing.is_some() {
             return;
         }
-        let Some(repo) = self.active_repo() else { return };
+        let Some(repo) = self.repos.get(index) else { return };
         if !repo.status.has_upstream {
             self.flash = Some(("no upstream to sync with".into(), true));
             return;
@@ -1230,9 +1341,14 @@ impl App {
     }
 
     fn commit(&mut self) {
-        let Some(repo) = self.active_repo() else { return };
-        let message: String = self.message.iter().collect();
+        self.commit_repo(self.active);
+    }
+
+    fn commit_repo(&mut self, index: usize) {
+        let Some(repo) = self.repos.get_mut(index) else { return };
+        let message: String = repo.message.iter().collect();
         if message.trim().is_empty() {
+            self.active = index;
             self.flash = Some(("Commit message is empty.".to_string(), true));
             self.focus = Focus::Message;
             return;
@@ -1244,8 +1360,8 @@ impl App {
         match repo.git.commit(message.trim()) {
             Ok(summary) => {
                 self.flash = Some((summary, false));
-                self.message.clear();
-                self.cursor = 0;
+                repo.message.clear();
+                repo.cursor = 0;
                 self.focus = Focus::List;
             }
             Err(e) => self.flash = Some((e, true)),
@@ -1253,13 +1369,38 @@ impl App {
         self.refresh();
     }
 
-    /// The visible row index at a pane-local mouse row, if it lands on one.
-    fn row_at(&self, mouse_row: u16) -> Option<usize> {
+    /// The visible row at a pane-local mouse row plus the line within it
+    /// (rows vary in height: the inline message boxes are 3 lines tall).
+    fn row_hit(&self, mouse_row: u16) -> Option<(usize, u16)> {
         if mouse_row < self.body.top || mouse_row >= self.body.top + self.body.height {
             return None;
         }
-        let index = self.body.offset + usize::from(mouse_row - self.body.top);
-        (index < self.rows.len()).then_some(index)
+        let mut y = self.body.top;
+        for index in self.body.offset..self.rows.len() {
+            let h = self.rows[index].height();
+            if mouse_row < y + h {
+                return Some((index, mouse_row - y));
+            }
+            y += h;
+        }
+        None
+    }
+
+    /// The visible row index at a pane-local mouse row, if it lands on one.
+    fn row_at(&self, mouse_row: u16) -> Option<usize> {
+        self.row_hit(mouse_row).map(|(index, _)| index)
+    }
+
+    /// The screen row where `index`'s first line is drawn, if visible.
+    fn row_y(&self, index: usize) -> Option<u16> {
+        let mut y = self.body.top;
+        for i in self.body.offset..self.rows.len() {
+            if i == index {
+                return (y < self.body.top + self.body.height).then_some(y);
+            }
+            y += self.rows[i].height();
+        }
+        None
     }
 
     // ---- Rendering ----
@@ -1277,16 +1418,21 @@ impl App {
             return;
         }
 
-        // The Sync Changes row only appears when there is something to sync
-        // (or a sync is running), like VS Code's SCM view.
-        let sync_height = u16::from(self.sync_label().is_some());
+        // With several repos, VS Code puts a message box + Commit button
+        // INSIDE each repo's section (rendered as list rows); the single-repo
+        // view keeps them fixed at the top. The Sync Changes row only appears
+        // when there is something to sync (or a sync is running).
+        let multi = self.multi();
+        let message_height = if multi { 0 } else { 3 };
+        let button_height = u16::from(!multi);
+        let sync_height = u16::from(!multi && self.sync_label().is_some());
         let footer_lines = self.footer_lines(area.width);
         let activity_height = u16::from(self.merged());
         let [activity, header, message, button, sync, list, footer] = Layout::vertical([
             Constraint::Length(activity_height),
             Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
+            Constraint::Length(message_height),
+            Constraint::Length(button_height),
             Constraint::Length(sync_height),
             Constraint::Min(0),
             Constraint::Length(footer_lines.len() as u16),
@@ -1298,9 +1444,16 @@ impl App {
             self.draw_activity_bar(frame, activity);
         }
         self.draw_header(frame, header);
-        self.draw_message(frame, message);
-        self.draw_button(frame, button);
-        self.draw_sync(frame, sync);
+        if !multi {
+            self.draw_message(frame, message);
+            self.draw_button(frame, button);
+            self.draw_sync(frame, sync);
+        } else {
+            self.zones.message = Rect::default();
+            self.zones.sparkle = Rect::default();
+            self.zones.button = Rect::default();
+            self.zones.sync = Rect::default();
+        }
         self.draw_list(frame, list);
         frame.render_widget(Paragraph::new(footer_lines), footer);
 
@@ -1406,8 +1559,11 @@ impl App {
         frame.render_widget(Paragraph::new(sparkle_glyph), sparkle_area);
         self.zones.sparkle = sparkle_area;
 
-        if self.message.is_empty() && !focused {
-            let branch = self.active_repo().map(|r| r.status.branch.clone()).unwrap_or_default();
+        let (message, cursor, branch) = match self.active_repo() {
+            Some(r) => (r.message.clone(), r.cursor, r.status.branch.clone()),
+            None => (Vec::new(), 0, String::new()),
+        };
+        if message.is_empty() && !focused {
             let placeholder = format!("Message (⏎ to commit on \"{branch}\")");
             frame.render_widget(Paragraph::new(placeholder).dim().italic(), text_area);
             return;
@@ -1415,12 +1571,12 @@ impl App {
 
         // Single-line input with horizontal scroll keeping the cursor visible.
         let width = text_area.width.saturating_sub(1) as usize;
-        let start = self.cursor.saturating_sub(width);
-        let visible: String = self.message.iter().skip(start).take(width.max(1)).collect();
+        let start = cursor.saturating_sub(width);
+        let visible: String = message.iter().skip(start).take(width.max(1)).collect();
         frame.render_widget(Paragraph::new(visible), text_area);
         if focused {
             frame.set_cursor_position(Position::new(
-                text_area.x + (self.cursor - start) as u16,
+                text_area.x + (cursor - start) as u16,
                 text_area.y,
             ));
         }
@@ -1477,6 +1633,17 @@ impl App {
                     Row::RepoHeader(r) => {
                         repo_header_item(&self.repos[r], r == active, theme, width)
                     }
+                    Row::Message(r) => message_box_item(
+                        &self.repos[r],
+                        r == active && self.focus == Focus::Message,
+                        theme,
+                        width,
+                    ),
+                    Row::Commit(r) => commit_button_item(
+                        r == active,
+                        r == active && self.focus == Focus::Commit,
+                        width,
+                    ),
                     Row::StagedHeader(r) => section_item(
                         "Staged Changes",
                         self.repos[r].staged_collapsed,
@@ -1534,6 +1701,26 @@ impl App {
             height: area.height,
             offset: self.list.offset(),
         };
+
+        // Terminal cursor inside the focused INLINE message box (multi-repo).
+        if self.multi() && self.focus == Focus::Message {
+            let target = self
+                .rows
+                .iter()
+                .position(|row| matches!(row, Row::Message(r) if *r == self.active));
+            if let Some(index) = target
+                && let Some(y) = self.row_y(index)
+                && y + 1 < area.y + area.height
+                && let Some(repo) = self.active_repo()
+            {
+                let field = usize::from(inline_field_width(self.last_width));
+                let start = repo.cursor.saturating_sub(field.saturating_sub(1));
+                frame.set_cursor_position(Position::new(
+                    area.x + 1 + (repo.cursor - start) as u16,
+                    y + 1,
+                ));
+            }
+        }
     }
 
     /// Footer content: a flash message, or the hotkey hints wrapped so they
@@ -1756,33 +1943,113 @@ fn step_menu(entries: &[MenuEntry], from: usize, direction: isize) -> usize {
     }
 }
 
-/// A repository row (only rendered when several repos are visible, like
-/// VS Code's Source Control Repositories list): disclosure arrow, repo icon,
-/// name, branch, and a change-count badge. The active repo (the one the
-/// commit box and sync act on) renders bold.
+/// Theme-matched branch glyph for repo rows.
+fn branch_icon(theme: IconTheme) -> &'static str {
+    match theme {
+        IconTheme::Material => "\u{e725}",
+        IconTheme::Emoji => "⎇",
+    }
+}
+
+/// A repository row, matching VS Code's multi-repo Source Control: disclosure
+/// arrow, repo icon and name on the left; branch (starred when dirty) and the
+/// ⟳ sync / ✓ commit action icons on the right. The right-edge icon columns
+/// are FIXED (last 6 cells) — left_click's hit zones rely on that.
 fn repo_header_item(repo: &Repo, active: bool, theme: IconTheme, width: usize) -> ListItem<'static> {
     let arrow = if repo.collapsed { "▸" } else { "▾" };
     let repo_icon = icon(theme, "", true, false);
     let name_style = if active { Style::default().bold() } else { Style::default().dim().bold() };
-    let mut spans = vec![
+    let left = vec![
         Span::styled(format!(" {arrow} "), Style::default().bold()),
         Span::raw(format!("{} ", repo_icon.glyph)),
         Span::styled(repo.name.clone(), name_style),
-        Span::styled(format!("  {}", repo.status.branch), Style::default().dim()),
     ];
-    let count = repo.status.staged.len() + repo.status.unstaged.len();
-    if count > 0 {
-        let badge = Span::styled(
-            format!(" {count} "),
-            Style::default().bg(BADGE_BLUE).fg(Color::White),
-        );
-        let used: usize = spans.iter().map(Span::width).sum();
-        let pad = width.saturating_sub(used + badge.width() + 1).max(1);
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(badge);
-        spans.push(Span::raw(" "));
-    }
+    let branch = Span::styled(
+        format!("{} {}", branch_icon(theme), repo.branch_decor()),
+        Style::default().dim(),
+    );
+    let icons = Span::styled(" ⟳  ✓ ", Style::default().dim());
+    let used: usize =
+        left.iter().map(Span::width).sum::<usize>() + branch.width() + icons.width();
+    let pad = width.saturating_sub(used).max(1);
+    let mut spans = left;
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(branch);
+    spans.push(icons);
     ListItem::new(Line::from(spans))
+}
+
+/// Columns the inline message box's input field spans (between the left
+/// border and the ✧ button).
+fn inline_field_width(pane_width: u16) -> u16 {
+    pane_width.saturating_sub(2 + 3)
+}
+
+/// A repo's inline message box, VS Code style: a 3-line bordered input with
+/// the ✧ suggest button at its right end.
+fn message_box_item(
+    repo: &Repo,
+    focused: bool,
+    theme: IconTheme,
+    width: usize,
+) -> ListItem<'static> {
+    let border = if focused {
+        Style::default().fg(BUTTON_BLUE)
+    } else {
+        Style::default().dim()
+    };
+    let horizontal = "─".repeat(width.saturating_sub(2));
+    let field = usize::from(inline_field_width(width as u16));
+
+    let content: Span = if repo.message.is_empty() && !focused {
+        let placeholder = truncate_to(
+            format!("Message (⏎ to commit on \"{}\")", repo.status.branch),
+            field,
+        );
+        Span::styled(placeholder, Style::default().dim().italic())
+    } else {
+        let start = repo.cursor.saturating_sub(field.saturating_sub(1));
+        let visible: String = repo.message.iter().skip(start).take(field.max(1)).collect();
+        Span::raw(visible)
+    };
+    let pad = field.saturating_sub(content.width());
+    let middle = Line::from(vec![
+        Span::styled("│", border),
+        content,
+        Span::raw(" ".repeat(pad)),
+        Span::raw(format!("{} ", sparkle_icon(theme))),
+        Span::styled("│", border),
+    ]);
+    ListItem::new(vec![
+        Line::from(Span::styled(format!("┌{horizontal}┐"), border)),
+        middle,
+        Line::from(Span::styled(format!("└{horizontal}┘"), border)),
+    ])
+}
+
+/// A repo's inline ✓ Commit button with the VS Code dropdown chevron at its
+/// right end; only the active repo's button is fully lit.
+fn commit_button_item(active: bool, focused: bool, width: usize) -> ListItem<'static> {
+    let (bg, fg) = match (active, focused) {
+        (true, true) => (BUTTON_BLUE_FOCUS, Color::White),
+        (true, false) => (BUTTON_BLUE, Color::White),
+        (false, _) => (Color::Rgb(0x24, 0x45, 0x5c), Color::Rgb(0x9a, 0xb2, 0xc2)),
+    };
+    let label = "✓ Commit";
+    let body_w = width.saturating_sub(2);
+    let left_pad = body_w.saturating_sub(label.chars().count()) / 2;
+    let right_pad = body_w.saturating_sub(left_pad + label.chars().count());
+    let mut style = Style::default().bg(bg).fg(fg);
+    if focused {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    ListItem::new(Line::from(vec![
+        Span::styled(
+            format!("{}{label}{}", " ".repeat(left_pad), " ".repeat(right_pad)),
+            style,
+        ),
+        Span::styled("│∨", style.dim()),
+    ]))
 }
 
 /// A collapsible section header; `count` renders as a right-aligned badge
