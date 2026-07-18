@@ -1628,9 +1628,9 @@ checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
 
 [[package]]
 name = "two-face"
-version = "0.4.5"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39e51b6e60e545cfdae5a4639ff423818f52372211a8d9a3e892b4b0761f76b2"
+checksum = "b285c51f8a6ade109ed4566d33ac4fb289fb5d6cf87ed70908a5eaf65e948e34"
 dependencies = [
  "serde",
  "serde_derive",
