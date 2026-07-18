@@ -2,7 +2,7 @@
 
 # Herdr Sidebar
 
-### VS Code's sidebar, living in your terminal.
+### The sidebar your terminal was missing — lovingly inspired by VS Code.
 
 A file explorer and a full source-control panel in one dockable
 [herdr](https://github.com/ogulcancelik/herdr) pane — activity-bar switching, mouse
@@ -15,18 +15,18 @@ everywhere, AI-drafted commit messages, and a file preview that opens right besi
 
 <br><br>
 
-<img src="plugins/herdr-aa-sidebar/docs/media/hero.png" alt="The sidebar docked beside a 3x2 fleet of Claude Code and Codex agents" width="920">
+<img src="plugins/herdr-aa-sidebar/docs/media/hero.png" alt="The sidebar docked beside a 2x2 fleet of Claude Code and Codex agents" width="920">
 
 </div>
 
-That's the sidebar on the left and a 3×2 fleet of Claude Code and Codex agents beside it —
+That's the sidebar on the left and a 2×2 fleet of Claude Code and Codex agents beside it —
 the workflow herdr is built for. If you've ever alt-tabbed out of your terminal just to *look*
 at something — the tree, the diff, what's staged — this closes that loop. The sidebar docks
 on the left of every herdr tab, restores itself on focus, and is driven entirely by click
 or keystroke.
 
 ```
-herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-aa-sidebar
+herdr plugin install alexarthurs/herdr-aa-sidebar/plugins/herdr-aa-sidebar
 ```
 
 ---
@@ -60,16 +60,19 @@ A real tree, not a directory dump:
 <img src="plugins/herdr-aa-sidebar/docs/media/source-control.png" alt="Source control: multi-repo staging, per-repo commit boxes, history drawers" width="920">
 </div>
 
-Everything you use VS Code's SCM view for, in a terminal pane:
+Everything you reach for in an editor's source-control panel, in a terminal pane:
 
+- **Click a change, see the diff** — every changed file opens its colored `git diff` in
+  the preview pane (staged vs working tree respected, untracked shown as additions), and
+  the diff live-updates while you edit.
 - **Stage, unstage, discard, commit** — by key or click, with Staged/Changes sections,
-  count badges, and status letters in VS Code's git colors.
+  count badges, and familiar per-file status letters.
 - **✧ AI commit messages** — the sparkle button sends the pending diff to your local
   `claude` CLI and drops a drafted subject line into the message box. No claude? A clean
   filename-based fallback kicks in. Never blocks the UI.
 - **Sync Changes** — a `⇅ 1↑ 2↓` button appears when you're ahead/behind upstream; one
   press runs `pull --rebase --autostash` + `push` in the background.
-- **Multi-repo, the VS Code way** — child repositories are auto-discovered, each with its
+- **Multi-repo** — child repositories are auto-discovered, each with its
   own header (branch, dirty `*`, sync/commit icons), message box, and Commit button.
 - **History drawers**: GRAPH, COMMITS, FILE HISTORY (follows your selection), BRANCHES,
   REMOTES, STASHES, TAGS.
@@ -99,7 +102,7 @@ worktree, new window, it's just *there*.
 ## Install
 
 ```
-herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-aa-sidebar
+herdr plugin install alexarthurs/herdr-aa-sidebar/plugins/herdr-aa-sidebar
 ```
 
 or from a local checkout:

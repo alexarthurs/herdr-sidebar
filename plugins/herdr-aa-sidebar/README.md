@@ -1,7 +1,7 @@
 # herdr-aa-sidebar
 
-**VS Code's sidebar, living in your terminal** — file explorer + source control in one
-dockable herdr pane.
+**The sidebar your terminal was missing** — a VS Code-inspired file explorer + source
+control panel in one dockable herdr pane.
 
 <img src="docs/media/hero.png" alt="The sidebar: explorer view with a live file preview beside it" width="860">
 
@@ -11,7 +11,7 @@ keys, and settings.
 ## Install
 
 ```
-herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-aa-sidebar
+herdr plugin install alexarthurs/herdr-aa-sidebar/plugins/herdr-aa-sidebar
 ```
 
 or from a local checkout:
