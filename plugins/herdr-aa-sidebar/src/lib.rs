@@ -5,6 +5,7 @@
 
 pub mod actions;
 pub mod ansi;
+pub mod diffview;
 pub mod ensure;
 pub mod git;
 pub mod icons;

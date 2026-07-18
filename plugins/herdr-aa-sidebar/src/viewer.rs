@@ -207,13 +207,9 @@ fn load_file(target: &Path) -> Doc {
 
 fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
     let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
-    let mut args: Vec<String> = vec![
-        "-c".into(),
-        "color.ui=always".into(),
-        "diff".into(),
-        "--color=always".into(),
-        "--no-ext-diff".into(),
-    ];
+    // Plain (uncolored) diff: crate::diffview parses it and renders the
+    // VS Code look — dual gutters, tinted rows, syntax-highlighted code.
+    let mut args: Vec<String> = vec!["diff".into(), "--no-ext-diff".into()];
     match kind {
         "staged" => args.push("--cached".into()),
         // An untracked file has no diff; --no-index against the null device
@@ -244,7 +240,7 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
                     vec![Line::raw(format!("({})", err.trim()))]
                 }
             } else {
-                ansi::to_lines(&text)
+                crate::diffview::render(rel, &text)
             }
         }
     };
@@ -436,7 +432,15 @@ fn draw_doc(frame: &mut Frame, doc: &mut Doc, theme: IconTheme) -> usize {
                 spans.extend(line.spans.iter().cloned());
                 Line::from(spans)
             } else {
-                line.clone()
+                let mut line = line.clone();
+                // Tinted diff rows fill the full row, like an editor.
+                if line.style.bg.is_some() {
+                    let pad = usize::from(body.width).saturating_sub(line.width());
+                    if pad > 0 {
+                        line.spans.push(Span::raw(" ".repeat(pad)));
+                    }
+                }
+                line
             }
         })
         .collect();

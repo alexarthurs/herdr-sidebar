@@ -268,8 +268,12 @@ HACKING.md — budget time for that before promising a patched build.
 - Clicking a changed file in Source Control (or `o`, or the context menu's Open Diff)
   shows its colored `git diff` in the SAME preview pane the explorer uses: the control
   file carries typed requests (`file/<path>` / `diff/<root>/<rel>/<kind>`, tab-separated),
-  the viewer parses git's ANSI output with the in-crate `ansi.rs` SGR parser (ansi-to-tui
-  pins an older ratatui — don't add it), and diffs re-run every ~2s so they live-update.
+  diffs render VS Code-style via the in-crate `diffview.rs` — OUR parse of plain
+  `git diff` (dual old/new gutters, full-width red/green row tints padded at draw time,
+  darker word-level tint on paired changed lines, syntax-highlighted code through two
+  stateful `LineHighlighter`s for old/new contexts). `ansi.rs` (SGR parser) still renders
+  `git show` output (ansi-to-tui pins an older ratatui — don't add it), and diffs re-run
+  every ~2s so they live-update.
   Staged rows show `--cached`; untracked files render via `diff --no-index NUL <file>`.
 
 ### Syntax highlighting (file preview)

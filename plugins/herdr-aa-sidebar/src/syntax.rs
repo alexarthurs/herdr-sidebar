@@ -68,6 +68,53 @@ pub fn highlight(name: &str, text: &str, max: usize) -> Option<Vec<Line<'static>
     Some(lines)
 }
 
+/// Stateful per-line highlighter (for diff rendering, where old/new file
+/// contexts advance independently). Plain spans when no grammar matches.
+pub struct LineHighlighter {
+    inner: Option<HighlightLines<'static>>,
+}
+
+impl LineHighlighter {
+    pub fn new(name: &str) -> Self {
+        let (syntaxes, theme) = assets();
+        let ext = name.rsplit('.').next().unwrap_or("");
+        let syntax = syntaxes
+            .find_syntax_by_extension(ext)
+            .or_else(|| syntaxes.find_syntax_by_extension(name));
+        Self { inner: syntax.map(|s| HighlightLines::new(s, theme)) }
+    }
+
+    /// Highlight one line (no trailing newline in, none out).
+    pub fn line(&mut self, text: &str) -> Vec<Span<'static>> {
+        let Some(hl) = self.inner.as_mut() else {
+            return vec![Span::raw(text.to_string())];
+        };
+        let (syntaxes, _) = assets();
+        let with_nl = format!("{text}\n");
+        match hl.highlight_line(&with_nl, syntaxes) {
+            Ok(regions) => regions
+                .into_iter()
+                .filter_map(|(style, chunk)| {
+                    let chunk = chunk.trim_end_matches(['\n', '\r']);
+                    if chunk.is_empty() {
+                        return None;
+                    }
+                    let fg = style.foreground;
+                    let mut out = Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b));
+                    if style.font_style.contains(FontStyle::BOLD) {
+                        out = out.add_modifier(Modifier::BOLD);
+                    }
+                    if style.font_style.contains(FontStyle::ITALIC) {
+                        out = out.add_modifier(Modifier::ITALIC);
+                    }
+                    Some(Span::styled(chunk.to_string(), out))
+                })
+                .collect(),
+            Err(_) => vec![Span::raw(text.to_string())],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
