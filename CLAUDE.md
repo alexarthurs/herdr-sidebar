@@ -1,5 +1,11 @@
 # herdr plugins monorepo
 
+**This file is a living doc — always capture findings.** Whenever you discover something
+non-obvious the hard way (a herdr behavior, a Windows quirk, a manifest gotcha, a build issue),
+record it here in the relevant section before finishing the task, the way the Windows caveats
+below were captured. If you're working in a feature worktree, commit the CLAUDE.md update on
+your branch so it lands on main with the merge.
+
 Two herdr plugins, VS Code-style panels for the terminal, each a **self-contained Rust crate**:
 
 - `plugins/herdr-aa-filetree` — file explorer (VS Code Explorer, but a ratatui TUI in a herdr pane)
