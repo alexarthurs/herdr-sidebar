@@ -1485,15 +1485,15 @@ impl App {
                 Style::default().dim()
             }
         };
-        // The FA folder renders two cells wide in the non-Mono Nerd Font;
-        // reserve its second cell so the highlight stays centered. The MDI
-        // branch glyph draws single-width — no slack, or it sits off center.
+        // Both FA glyphs (folder, code-fork) render two cells wide in the
+        // non-Mono Nerd Font; reserve the second cell in each chip so the
+        // highlights are equal-sized with centered icons.
         let slack = if self.theme == IconTheme::Material { " " } else { "" };
         let spans = [
             Span::raw(" "),
             Span::styled(format!(" {exp_icon}{slack} "), active(false)),
             Span::raw(" "),
-            Span::styled(format!(" {git_icon} "), active(true)),
+            Span::styled(format!(" {git_icon}{slack} "), active(true)),
         ];
         // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
         let mut x = area.x;
@@ -1836,7 +1836,7 @@ impl App {
 /// Theme-matched activity-bar icons: (explorer, source control).
 fn activity_icons(theme: IconTheme) -> (&'static str, &'static str) {
     match theme {
-        IconTheme::Material => ("\u{f07b}", "\u{f062c}"),
+        IconTheme::Material => ("\u{f07b}", "\u{f126}"),
         IconTheme::Emoji => ("📁", "🔀"),
     }
 }
