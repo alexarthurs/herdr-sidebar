@@ -1467,9 +1467,10 @@ impl App {
     }
 
     /// The VS Code activity bar: view-switcher icons plus a detach button.
-    /// The area is three rows tall — icons render on the middle one.
+    /// The area is two rows tall — icons on the first (the pane border
+    /// above provides the top gap), a blank spacer below.
     fn draw_activity_bar(&mut self, frame: &mut Frame, area: Rect) {
-        let area = Rect::new(area.x, area.y + 1, area.width, 1);
+        let area = Rect::new(area.x, area.y, area.width, 1);
         let (exp_icon, git_icon) = activity_icons(self.theme);
         let active = |on: bool| {
             if on {
