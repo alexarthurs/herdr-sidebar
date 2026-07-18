@@ -775,15 +775,13 @@ fn row_item(row: &Row, theme: IconTheme, hovered: bool) -> ListItem<'static> {
         Some((r, g, b)) => Style::default().fg(Color::Rgb(r, g, b)),
         None => Style::default(),
     };
-    let name_style = if row.is_dir {
-        Style::default().fg(Color::LightBlue)
-    } else {
-        Style::default()
-    };
+    // Folder and file names share the default foreground, like VS Code — the
+    // chevron and icon carry the distinction. Accent-on-gray (the old blue
+    // names) was hard to read against the selection/hover backgrounds.
     let item = ListItem::new(Line::from(vec![
         Span::styled(format!("{indent}{arrow}"), Style::default().dim()),
         Span::styled(format!("{} ", icon.glyph), icon_style),
-        Span::styled(row.name.clone(), name_style),
+        Span::raw(row.name.clone()),
     ]));
     if hovered {
         // Subtler than the DarkGray selection bg; the selection's
