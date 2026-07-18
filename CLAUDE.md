@@ -240,6 +240,10 @@ HACKING.md — budget time for that before promising a patched build.
   "Footer hotkeys" setting (persisted as `hotkeys` in `aa-sidebar.json`, default hidden —
   it clipped in narrow panes). The ✧ suggest button uses MDI "creation" (`\u{f0674}`,
   the outline ✨ silhouette) in the material theme.
+- Both views collapse to the icon sliver (« bottom-right / `b`); in unified mode the
+  sliver shows BOTH activity icons and clicking one (or `1`/`2`) expands DIRECTLY into
+  that view — the sliver row layout and click routing live in `ui.rs`
+  (`sliver_lines`/`sliver_view_at`), shared by both apps.
 - **Esc must never exit a sidebar TUI** — a stray Esc used to drop the pane back to the
   shell prompt (user-reported). Esc closes overlays, then closes the tab's preview pane
   (`viewer::close_in_tab`); only `q` quits.

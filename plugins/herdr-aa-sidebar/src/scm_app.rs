@@ -25,7 +25,10 @@ use herdr_aa_sidebar::git::{FileEntry, Git, Status};
 use herdr_aa_sidebar::icons::{IconTheme, icon};
 use herdr_aa_sidebar::state::{self as sidebar, View};
 use herdr_aa_sidebar::state::Exit;
-use herdr_aa_sidebar::ui::{activity_icons, branch_icon, gear_icon, hits, sibling_panes_of, sparkle_icon, truncate_to, within, wrap_hints};
+use herdr_aa_sidebar::ui::{
+    activity_icons, branch_icon, gear_icon, hits, hits_collapse_button, sibling_panes_of,
+    sliver_lines, sliver_view_at, sparkle_icon, truncate_to, within, wrap_hints,
+};
 use herdr_aa_sidebar::actions::{copy_to_clipboard, reveal};
 use herdr_aa_sidebar::suggest;
 
@@ -273,11 +276,14 @@ impl PaneCtl {
         Some(Self { pane_id })
     }
 
-    fn set_label(&self, label: &str) {
-        let _ = herdr_aa_sidebar::ipc::call_text(
-            "pane.rename",
-            serde_json::json!({ "pane_id": self.pane_id, "label": label }),
-        );
+    /// Set or clear the pane label — cleared while collapsed so the sliver
+    /// has no border title.
+    fn set_label(&self, label: Option<&str>) {
+        let mut params = serde_json::json!({ "pane_id": self.pane_id });
+        if let Some(label) = label {
+            params["label"] = serde_json::Value::String(label.to_string());
+        }
+        let _ = herdr_aa_sidebar::ipc::call_text("pane.rename", params);
     }
 
     /// Resize our pane to `target` terminal columns over the socket API
@@ -364,6 +370,12 @@ pub struct App {
     zones: ClickZones,
     page: usize,
     last_width: u16,
+    last_height: u16,
+    /// Width to restore on expand, remembered at collapse time.
+    expanded_width: u16,
+    /// Explicitly collapsed via the «/b — width alone can't tell on large
+    /// windows (herdr's 0.1 minimum split ratio).
+    collapsed: bool,
     // Merged-sidebar state.
     sidebar_state: sidebar::State,
     other_exe: Option<PathBuf>,
@@ -373,6 +385,13 @@ pub struct App {
 }
 
 const MY_VIEW: View = View::SourceControl;
+
+/// Below this pane width the view renders as the collapsed sliver.
+const SLIVER_THRESHOLD: u16 = 14;
+/// Width to request when collapsing (herdr's 0.1 ratio floor may leave more).
+const SLIVER_TARGET: u16 = 5;
+/// Fallback width to restore on expand.
+const DEFAULT_EXPANDED_WIDTH: u16 = 40;
 
 impl App {
     pub fn new(cwd: PathBuf) -> Self {
@@ -412,6 +431,9 @@ impl App {
             zones: ClickZones::default(),
             page: 20,
             last_width: 40,
+            last_height: 24,
+            expanded_width: DEFAULT_EXPANDED_WIDTH,
+            collapsed: false,
             sidebar_state,
             other_exe,
             pane_ctl,
@@ -445,8 +467,41 @@ impl App {
     fn apply_identity(&self) {
         let Some(ctl) = &self.pane_ctl else { return };
         let label = if self.merged() { sidebar::SIDEBAR_LABEL } else { MY_VIEW.label() };
-        ctl.set_label(label);
+        if !self.collapsed {
+            ctl.set_label(Some(label));
+        }
         ctl.report_tokens(MY_VIEW, self.merged());
+    }
+
+    /// Collapsed by the button, or manually dragged down to a sliver.
+    fn collapsed(&self) -> bool {
+        self.collapsed || self.last_width < SLIVER_THRESHOLD
+    }
+
+    fn collapse(&mut self) {
+        if self.collapsed() {
+            return;
+        }
+        self.expanded_width = self.last_width;
+        self.collapsed = true;
+        if let Some(ctl) = &self.pane_ctl {
+            ctl.set_label(None);
+            ctl.resize_to(self.last_width, SLIVER_TARGET);
+        }
+    }
+
+    fn expand(&mut self) {
+        if !self.collapsed() {
+            return;
+        }
+        self.collapsed = false;
+        self.apply_identity();
+        if let Some(ctl) = &self.pane_ctl {
+            ctl.resize_to(
+                self.last_width,
+                self.expanded_width.max(DEFAULT_EXPANDED_WIDTH),
+            );
+        }
     }
 
     /// Re-read every repo's git status (this is the change auto-detection —
@@ -660,6 +715,18 @@ impl App {
             return None;
         }
         self.flash = None;
+        if self.collapsed() {
+            // Sliver mode: expand, deep-link to the other view, or quit.
+            match key.code {
+                KeyCode::Char('q') => return Some(Exit::Quit),
+                KeyCode::Char('1') => {
+                    self.expand();
+                    return self.switch_to(View::Explorer);
+                }
+                _ => self.expand(),
+            }
+            return None;
+        }
         if self.overlay.is_some() {
             self.overlay_key(key);
             return None;
@@ -746,6 +813,7 @@ impl App {
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('S') => self.sync_changes(),
             KeyCode::Char('o') => self.open_selected_diff(),
+            KeyCode::Char('b') => self.collapse(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => return self.switch_to(View::SourceControl),
             _ => {}
@@ -755,6 +823,17 @@ impl App {
 
     /// `Some(exit)` ends the event loop, mirroring on_key.
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Exit> {
+        if self.collapsed() {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                // A view icon in the sliver deep-links: expand INTO that view.
+                let target = sliver_view_at(mouse.row, MY_VIEW, self.merged());
+                self.expand();
+                if let Some(view) = target {
+                    return self.switch_to(view);
+                }
+            }
+            return None;
+        }
         if self.overlay.is_some() {
             self.overlay_mouse(mouse);
             return None;
@@ -779,6 +858,10 @@ impl App {
 
     fn left_click(&mut self, mouse: MouseEvent) -> Option<Exit> {
         self.flash = None;
+        if hits_collapse_button(mouse.column, mouse.row, self.last_width, self.last_height) {
+            self.collapse();
+            return None;
+        }
         let (x, y) = (mouse.column, mouse.row);
         let z = self.zones;
         if self.merged() && y == z.activity_row {
@@ -1564,6 +1647,15 @@ impl App {
     pub fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
         self.last_width = area.width;
+        self.last_height = area.height;
+
+        if self.collapsed() {
+            frame.render_widget(
+                Paragraph::new(sliver_lines(self.theme, MY_VIEW, self.merged())).centered(),
+                area,
+            );
+            return;
+        }
 
         if self.repos.is_empty() {
             let text = format!(
@@ -1594,7 +1686,7 @@ impl App {
             Constraint::Length(button_height),
             Constraint::Length(sync_height),
             Constraint::Min(0),
-            Constraint::Length(footer_lines.len() as u16),
+            Constraint::Length((footer_lines.len() as u16).max(1)),
         ])
         .areas(area);
         self.page = list.height.saturating_sub(1).max(1) as usize;
@@ -1615,6 +1707,24 @@ impl App {
         }
         self.draw_list(frame, list);
         frame.render_widget(Paragraph::new(footer_lines), footer);
+        // Collapse button at the bottom-right of the last footer line,
+        // mirroring the explorer (and herdr's own sidebar).
+        let last_line = Rect::new(
+            footer.x,
+            footer.y + footer.height.saturating_sub(1),
+            footer.width,
+            1,
+        );
+        let [_, footer_button] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(last_line);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "«",
+                Style::default().bold().fg(Color::LightBlue),
+            ))
+            .centered(),
+            footer_button,
+        );
 
         match self.overlay {
             Some(Overlay::Menu { .. }) => self.draw_menu(frame),
@@ -1945,7 +2055,7 @@ impl App {
         if !self.show_hotkeys() {
             return Vec::new();
         }
-        wrap_hints(&self.hints(), width, 0)
+        wrap_hints(&self.hints(), width, 3)
     }
 
     /// The hotkey hints, shown in Settings (and optionally the footer).
@@ -1957,6 +2067,7 @@ impl App {
             ("c", "msg"),
             ("A", "suggest"),
             ("o", "diff"),
+            ("b", "collapse"),
             ("S", "sync"),
             ("s", "settings"),
             ("r", "refresh"),

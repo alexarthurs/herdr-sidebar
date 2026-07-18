@@ -15,7 +15,10 @@ use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph};
 use herdr_aa_sidebar::actions::{self, MenuAction, MenuEntry};
 use herdr_aa_sidebar::icons::{IconTheme, icon};
 use herdr_aa_sidebar::state::{self as sidebar, View};
-use herdr_aa_sidebar::ui::{activity_icons, gear_icon, sibling_panes_of, wrap_hints};
+use herdr_aa_sidebar::ui::{
+    activity_icons, gear_icon, hits_collapse_button, sibling_panes_of, sliver_lines,
+    sliver_view_at, wrap_hints,
+};
 use herdr_aa_sidebar::tree::{Row, Tree};
 
 use herdr_aa_sidebar::state::Exit;
@@ -445,9 +448,13 @@ impl App {
             return None;
         }
         if self.collapsed() {
-            // Sliver mode: only expand or quit.
+            // Sliver mode: expand, deep-link to the other view, or quit.
             match key.code {
                 KeyCode::Char('q') => return Some(Exit::Quit),
+                KeyCode::Char('2') => {
+                    self.expand();
+                    return self.switch_to(View::SourceControl);
+                }
                 _ => self.expand(),
             }
             return None;
@@ -487,7 +494,12 @@ impl App {
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Exit> {
         if self.collapsed() {
             if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                // A view icon in the sliver deep-links: expand INTO that view.
+                let target = sliver_view_at(mouse.row, MY_VIEW, self.merged());
                 self.expand();
+                if let Some(view) = target {
+                    return self.switch_to(view);
+                }
             }
             return None;
         }
@@ -1332,7 +1344,8 @@ impl App {
     /// click or key expands, so the icon is the whole affordance.
     fn draw_sliver(&mut self, frame: &mut Frame) {
         frame.render_widget(
-            Paragraph::new(sliver_lines(self.theme)).alignment(Alignment::Center),
+            Paragraph::new(sliver_lines(self.theme, MY_VIEW, self.merged()))
+                .alignment(Alignment::Center),
             frame.area(),
         );
     }
@@ -1399,26 +1412,6 @@ fn row_index_at(body: BodyGeom, row_count: usize, mouse_row: u16) -> Option<usiz
     (index < row_count).then_some(index)
 }
 
-/// True when a click at pane-local (column, row) lands on the `«` button: the
-/// 3-cell region at the right end of the footer (bottom) line, mirroring
-/// herdr's own sidebar collapse control.
-fn hits_collapse_button(column: u16, row: u16, pane_width: u16, pane_height: u16) -> bool {
-    row == pane_height.saturating_sub(1) && column >= pane_width.saturating_sub(4)
-}
-
-/// The sliver's content: a single folder icon in the active theme.
-fn sliver_lines(theme: IconTheme) -> Vec<Line<'static>> {
-    let icon = icon(theme, "", true, false);
-    let style = match icon.rgb {
-        Some((r, g, b)) => Style::default().fg(Color::Rgb(r, g, b)),
-        None => Style::default(),
-    };
-    vec![
-        Line::raw(""),
-        Line::from(Span::styled(icon.glyph, style)),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1468,16 +1461,25 @@ mod tests {
     }
 
     #[test]
-    fn sliver_is_a_single_theme_icon() {
-        let material: Vec<String> = sliver_lines(IconTheme::Material)
+    fn sliver_shows_reachable_view_icons_and_deep_links() {
+        let solo: Vec<String> = sliver_lines(IconTheme::Material, View::Explorer, false)
             .iter()
             .map(|l| l.to_string())
             .collect();
-        assert_eq!(material, ["", "\u{f07b}"]);
-        let emoji: Vec<String> = sliver_lines(IconTheme::Emoji)
+        assert_eq!(solo, ["", "\u{f07b}"]);
+        let both: Vec<String> = sliver_lines(IconTheme::Material, View::SourceControl, true)
             .iter()
             .map(|l| l.to_string())
             .collect();
-        assert_eq!(emoji, ["", "📁"]);
+        assert_eq!(both, ["", "\u{f07b}", "", "\u{f126}"]);
+        // Clicking an icon routes to its view; blanks just expand.
+        assert_eq!(sliver_view_at(1, View::Explorer, true), Some(View::Explorer));
+        assert_eq!(sliver_view_at(3, View::Explorer, true), Some(View::SourceControl));
+        assert_eq!(sliver_view_at(2, View::Explorer, true), None);
+        assert_eq!(sliver_view_at(3, View::Explorer, false), None);
+        assert_eq!(
+            sliver_view_at(1, View::SourceControl, false),
+            Some(View::SourceControl)
+        );
     }
 }
