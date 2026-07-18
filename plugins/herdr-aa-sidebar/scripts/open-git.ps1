@@ -97,6 +97,11 @@ if ($Decision -like 'FOCUS *') {
     $PaneId = $Decision.Substring(6)
     & $HerdrBin pane close $PaneId
     exit $LASTEXITCODE
+} elseif ($Decision -like 'REPLACE *') {
+    # Dead pane (stale heartbeat): close the corpse, then dock a fresh one.
+    $PaneId = $Decision.Substring(8)
+    & $HerdrBin pane close $PaneId *> $null
+    Open-Pane
 } else {
     Open-Pane
 }

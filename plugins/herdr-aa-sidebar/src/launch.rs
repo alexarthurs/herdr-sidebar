@@ -52,9 +52,22 @@ impl Pane {
     /// "Explorer" label (present from the moment the launcher renames the
     /// fresh pane, before the TUI has reported its token).
     fn is_explorer(&self) -> bool {
-        self.tokens.contains_key(METADATA_SOURCE) || self.label.as_deref() == Some(PANE_LABEL)
+        self.tokens.contains_key(METADATA_SOURCE)
+            || self.label.as_deref() == Some(PANE_LABEL)
+            || self.label.as_deref() == Some(SIDEBAR_LABEL)
+    }
+
+    /// A "Sidebar"-labeled pane with NO heartbeat token is a corpse: only the
+    /// TUI sets that label, and a live TUI always has a token. (An
+    /// "Explorer"-labeled token-less pane is just launcher-fresh — grace.)
+    fn sidebar_label_without_token(&self) -> bool {
+        self.label.as_deref() == Some(SIDEBAR_LABEL) && !self.tokens.contains_key(METADATA_SOURCE)
     }
 }
+
+/// The unified pane's label (mirrors state::SIDEBAR_LABEL; kept here so the
+/// launch module stays dependency-free for its tests).
+const SIDEBAR_LABEL: &str = "Sidebar";
 
 #[derive(Deserialize)]
 struct LayoutMsg {
@@ -104,10 +117,36 @@ fn strip_bom(input: &str) -> &str {
     input.trim_start_matches('\u{feff}')
 }
 
-/// `OPEN`, `FOCUS <id>`, or `CLOSE <id>` from a `pane list` JSON. Unparseable
-/// input, no focused pane, or an unsafe id all degrade to `OPEN` — the safe
-/// default is a fresh explorer, never acting on a pane in an unknown tab.
-pub fn launch_decision(pane_list_json: &str) -> String {
+/// A live TUI re-stamps its identity token with the unix time every few
+/// seconds; a token older than this is a DEAD pane (its process was killed
+/// out from under it) and should be replaced, not focused. process_info
+/// can't tell the difference on Windows — the TUI child never shows in the
+/// pane's foreground group (verified live).
+pub const HEARTBEAT_STALE_SECS: u64 = 20;
+
+/// True when `key` is present but its heartbeat timestamp is missing,
+/// unparsable, or older than [`HEARTBEAT_STALE_SECS`]. Absent key = false
+/// (a fresh pane the launcher labeled but whose TUI hasn't reported yet).
+fn token_stale(
+    tokens: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    now: u64,
+) -> bool {
+    let Some(value) = tokens.get(key) else { return false };
+    let ts = value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|s| s.parse().ok()));
+    match ts {
+        Some(ts) => now.saturating_sub(ts) > HEARTBEAT_STALE_SECS,
+        None => true, // pre-heartbeat token format: treat as dead once seen
+    }
+}
+
+/// `OPEN`, `FOCUS <id>`, `CLOSE <id>`, or `REPLACE <id>` (dead pane: close
+/// it, then open fresh) from a `pane list` JSON. Unparseable input, no
+/// focused pane, or an unsafe id all degrade to `OPEN` — the safe default is
+/// a fresh explorer, never acting on a pane in an unknown tab.
+pub fn launch_decision(pane_list_json: &str, now: u64) -> String {
     let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
         return "OPEN".to_string();
     };
@@ -118,10 +157,15 @@ pub fn launch_decision(pane_list_json: &str) -> String {
     let explorer = panes
         .iter()
         .find(|p| p.is_explorer() && p.tab_id.as_deref() == focused.tab_id.as_deref());
-    let Some(id) = explorer.and_then(|p| p.pane_id.as_deref()).filter(|id| is_flag_safe(id))
-    else {
+    let Some(pane) = explorer else {
         return "OPEN".to_string();
     };
+    let Some(id) = pane.pane_id.as_deref().filter(|id| is_flag_safe(id)) else {
+        return "OPEN".to_string();
+    };
+    if token_stale(&pane.tokens, METADATA_SOURCE, now) || pane.sidebar_label_without_token() {
+        return format!("REPLACE {id}");
+    }
     if Some(id) == focused.pane_id.as_deref() {
         format!("CLOSE {id}")
     } else {
@@ -129,14 +173,13 @@ pub fn launch_decision(pane_list_json: &str) -> String {
     }
 }
 
-/// `<pane_id>\t<cwd>` of the focused pane, or empty on any failure. The cwd keeps
 /// Source-control identity for the separated Source Control pane.
 pub const SC_PANE_LABEL: &str = "Source Control";
 pub const SC_METADATA_SOURCE: &str = "herdr-aa-sidebar-git";
 
 /// Like [`launch_decision`], but for the separated Source Control pane (the
 /// unified Sidebar pane carries BOTH tokens, so it satisfies this too).
-pub fn launch_decision_git(pane_list_json: &str) -> String {
+pub fn launch_decision_git(pane_list_json: &str, now: u64) -> String {
     let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
         return "OPEN".to_string();
     };
@@ -148,10 +191,15 @@ pub fn launch_decision_git(pane_list_json: &str) -> String {
         (p.tokens.contains_key(SC_METADATA_SOURCE) || p.label.as_deref() == Some(SC_PANE_LABEL))
             && p.tab_id.as_deref() == focused.tab_id.as_deref()
     });
-    let Some(id) = panel.and_then(|p| p.pane_id.as_deref()).filter(|id| is_flag_safe(id))
-    else {
+    let Some(pane) = panel else {
         return "OPEN".to_string();
     };
+    let Some(id) = pane.pane_id.as_deref().filter(|id| is_flag_safe(id)) else {
+        return "OPEN".to_string();
+    };
+    if token_stale(&pane.tokens, SC_METADATA_SOURCE, now) {
+        return format!("REPLACE {id}");
+    }
     if Some(id) == focused.pane_id.as_deref() {
         format!("CLOSE {id}")
     } else {
@@ -159,7 +207,9 @@ pub fn launch_decision_git(pane_list_json: &str) -> String {
     }
 }
 
-/// its spaces (hence the tab separator) but loses any `\\?\` verbatim prefix.
+/// `<pane_id>\t<cwd>` of the focused pane, or empty on any failure. The cwd
+/// keeps its spaces (hence the tab separator) but loses any `\\?\` verbatim
+/// prefix.
 pub fn focused_pane(pane_list_json: &str) -> String {
     let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
         return String::new();
@@ -392,7 +442,7 @@ mod tests {
         let json = pane_list(&format!(
             r#"{FOCUSED},{{"pane_id":"w1:p9","label":"Explorer","tab_id":"w1:t2"}}"#
         ));
-        assert_eq!(launch_decision(&json), "OPEN", "other-tab Explorer is ignored");
+        assert_eq!(launch_decision(&json, 100), "OPEN", "other-tab Explorer is ignored");
     }
 
     #[test]
@@ -400,7 +450,7 @@ mod tests {
         let json = pane_list(&format!(
             r#"{FOCUSED},{{"pane_id":"w1:p2","label":"Explorer","tab_id":"w1:t1"}}"#
         ));
-        assert_eq!(launch_decision(&json), "FOCUS w1:p2");
+        assert_eq!(launch_decision(&json, 100), "FOCUS w1:p2");
     }
 
     #[test]
@@ -408,32 +458,66 @@ mod tests {
         let json = pane_list(
             r#"{"pane_id":"w1:p2","label":"Explorer","tab_id":"w1:t1","focused":true}"#,
         );
-        assert_eq!(launch_decision(&json), "CLOSE w1:p2");
+        assert_eq!(launch_decision(&json, 100), "CLOSE w1:p2");
     }
 
     #[test]
     fn decision_recognizes_explorer_by_metadata_token_without_label() {
-        // A collapsed explorer has its label cleared but keeps its token.
+        // A collapsed explorer has its label cleared but keeps its token;
+        // the token value is a fresh heartbeat timestamp.
         let json = pane_list(&format!(
+            r#"{FOCUSED},{{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-aa-sidebar-explorer":95}}}}"#
+        ));
+        assert_eq!(launch_decision(&json, 100), "FOCUS w1:p2");
+    }
+
+    #[test]
+    fn decision_replaces_dead_panes() {
+        // Stale heartbeat (or a pre-heartbeat token shape) = a dead TUI whose
+        // pane must be closed and re-docked, never focused.
+        let stale = pane_list(&format!(
+            r#"{FOCUSED},{{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-aa-sidebar-explorer":40}}}}"#
+        ));
+        assert_eq!(launch_decision(&stale, 100), "REPLACE w1:p2");
+        let legacy = pane_list(&format!(
             r#"{FOCUSED},{{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-aa-sidebar-explorer":{{"value":"explorer"}}}}}}"#
         ));
-        assert_eq!(launch_decision(&json), "FOCUS w1:p2");
+        assert_eq!(launch_decision(&legacy, 100), "REPLACE w1:p2");
+        // Label-only (no token yet): freshly spawned, NOT dead.
+        let fresh = pane_list(&format!(
+            r#"{FOCUSED},{{"pane_id":"w1:p2","label":"Explorer","tab_id":"w1:t1"}}"#
+        ));
+        assert_eq!(launch_decision(&fresh, 100), "FOCUS w1:p2");
+        // But a "Sidebar" label without a token means the TUI ran and died.
+        let corpse = pane_list(&format!(
+            r#"{FOCUSED},{{"pane_id":"w1:p2","label":"Sidebar","tab_id":"w1:t1"}}"#
+        ));
+        assert_eq!(launch_decision(&corpse, 100), "REPLACE w1:p2");
+        // Same rules for the separated Source Control decision.
+        let sc_stale = pane_list(&format!(
+            r#"{FOCUSED},{{"pane_id":"w1:p3","tab_id":"w1:t1","tokens":{{"herdr-aa-sidebar-git":40}}}}"#
+        ));
+        assert_eq!(launch_decision_git(&sc_stale, 100), "REPLACE w1:p3");
+        let sc_live = pane_list(&format!(
+            r#"{FOCUSED},{{"pane_id":"w1:p3","tab_id":"w1:t1","tokens":{{"herdr-aa-sidebar-git":95}}}}"#
+        ));
+        assert_eq!(launch_decision_git(&sc_live, 100), "FOCUS w1:p3");
     }
 
     #[test]
     fn decision_degrades_to_open_on_garbage_or_unsafe_ids() {
-        assert_eq!(launch_decision("not json"), "OPEN");
-        assert_eq!(launch_decision(&pane_list(r#"{"pane_id":"w1:p1"}"#)), "OPEN");
+        assert_eq!(launch_decision("not json", 100), "OPEN");
+        assert_eq!(launch_decision(&pane_list(r#"{"pane_id":"w1:p1"}"#), 100), "OPEN");
         let json = pane_list(&format!(
             r#"{FOCUSED},{{"pane_id":"--evil","label":"Explorer","tab_id":"w1:t1"}}"#
         ));
-        assert_eq!(launch_decision(&json), "OPEN");
+        assert_eq!(launch_decision(&json, 100), "OPEN");
     }
 
     #[test]
     fn utf8_bom_from_powershell_pipe_is_stripped() {
         let json = format!("\u{feff}{}", pane_list(FOCUSED));
-        assert_eq!(launch_decision(&json), "OPEN");
+        assert_eq!(launch_decision(&json, 100), "OPEN");
         assert!(focused_pane(&json).starts_with("w1:p1\t"));
         let layout_json = format!(
             "\u{feff}{}",

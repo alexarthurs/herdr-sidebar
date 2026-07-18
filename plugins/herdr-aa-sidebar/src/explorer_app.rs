@@ -46,7 +46,10 @@ impl PaneCtl {
     /// also the other view's — one Sidebar pane satisfies both plugins'
     /// launchers — otherwise clear the other view's token.
     fn report_tokens(&self, my: View, merged: bool) {
-        let mine = serde_json::json!({ my.plugin_id(): my.token() });
+        // Token value = heartbeat timestamp; launchers treat stale stamps as
+        // dead panes and replace them (see launch::HEARTBEAT_STALE_SECS).
+        let now = sidebar::unix_now().to_string();
+        let mine = serde_json::json!({ my.plugin_id(): now });
         let _ = herdr_aa_sidebar::ipc::call_text(
             "pane.report_metadata",
             serde_json::json!({ "pane_id": self.pane_id, "source": my.plugin_id(), "tokens": mine }),
@@ -55,7 +58,7 @@ impl PaneCtl {
         // Clearing needs an explicit null VALUE: report_metadata MERGES the
         // token map, so an empty map is a no-op (verified live, herdr 0.7.1).
         let other_tokens = if merged {
-            serde_json::json!({ other.plugin_id(): other.token() })
+            serde_json::json!({ other.plugin_id(): now })
         } else {
             serde_json::json!({ other.plugin_id(): serde_json::Value::Null })
         };
@@ -196,6 +199,8 @@ pub struct App {
     gear: Rect,
     /// Last left-click (row index, when) for double-click detection.
     last_click: Option<(usize, std::time::Instant)>,
+    /// Last heartbeat stamp, throttling the token refresh.
+    last_beat: std::time::Instant,
 }
 
 /// How long two clicks on the same row still count as a double click.
@@ -251,9 +256,23 @@ impl App {
             activity: ActivityZones::default(),
             gear: Rect::default(),
             last_click: None,
+            last_beat: std::time::Instant::now(),
         };
         app.apply_identity();
         app
+    }
+
+    /// Re-stamp the identity tokens so launchers know this pane is alive.
+    /// Cheap (two socket round-trips); the event loop calls this every few
+    /// seconds.
+    pub fn heartbeat(&mut self) {
+        if self.last_beat.elapsed() < std::time::Duration::from_secs(5) {
+            return;
+        }
+        self.last_beat = std::time::Instant::now();
+        if let Some(ctl) = &self.pane_ctl {
+            ctl.report_tokens(MY_VIEW, self.merged());
+        }
     }
 
     /// The merged sidebar is on and actually usable (other plugin present).

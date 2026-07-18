@@ -26,10 +26,11 @@ fn main() -> std::io::Result<()> {
         Some("--launch-decision") => {
             // Optional second arg picks the source-control decision (the
             // open-git launcher); default is the explorer/sidebar decision.
+            let now = state::unix_now();
             let out = if std::env::args().nth(2).as_deref() == Some("git") {
-                launch::launch_decision_git(&read_stdin()?)
+                launch::launch_decision_git(&read_stdin()?, now)
             } else {
-                launch::launch_decision(&read_stdin()?)
+                launch::launch_decision(&read_stdin()?, now)
             };
             println!("{out}");
             return Ok(());
@@ -113,19 +114,24 @@ fn read_stdin() -> std::io::Result<String> {
     Ok(buf)
 }
 
-/// The explorer's event loop: blocking reads (nothing to poll for).
+/// The explorer's event loop: short poll so the liveness heartbeat keeps
+/// stamping even while idle.
 fn run_explorer(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<Exit> {
     let root = std::env::current_dir()?;
     let mut app = explorer_app::App::new(root);
     loop {
         terminal.draw(|frame| app.draw(frame))?;
-        let exit = match event::read()? {
-            Event::Key(key) => app.on_key(key),
-            Event::Mouse(mouse) => app.on_mouse(mouse),
-            _ => None, // resize, focus, … simply fall through to a redraw
-        };
-        if let Some(exit) = exit {
-            return Ok(exit);
+        if event::poll(Duration::from_millis(2000))? {
+            let exit = match event::read()? {
+                Event::Key(key) => app.on_key(key),
+                Event::Mouse(mouse) => app.on_mouse(mouse),
+                _ => None, // resize, focus, … simply fall through to a redraw
+            };
+            if let Some(exit) = exit {
+                return Ok(exit);
+            }
+        } else {
+            app.heartbeat();
         }
     }
 }
@@ -147,6 +153,7 @@ fn run_scm(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<Exit> {
                 return Ok(exit);
             }
         } else {
+            app.heartbeat();
             app.tick();
         }
     }

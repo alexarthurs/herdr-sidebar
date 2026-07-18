@@ -153,7 +153,8 @@ Pane identity & titles:
   sidebar TUI tags its pane this way so its detection works while the label is cleared.
 - `report_metadata` **MERGES** the token map: sending `tokens: {}` is a no-op, it does NOT
   clear previously-reported tokens. To remove a token, report it with an explicit **null
-  value** (`tokens: {name: null}`) — verified live. A `source` can also report tokens whose
+  value** (`tokens: {name: null}`) — verified live. Token values must be **strings** —
+  numbers are rejected with `invalid_request` (and a `let _ =` swallows it silently). A `source` can also report tokens whose
   keys belong to another plugin's namespace (the merged Sidebar pane reports both plugins'
   identity tokens so both launchers recognize the one pane).
 - Pane border titles come from `border_label`: metadata title → manual label (`pane rename`)
@@ -192,6 +193,16 @@ HACKING.md — budget time for that before promising a patched build.
 - Emoji with variation-selector (VS16) sequences render at inconsistent widths across
   terminal emulators and break column alignment — the shared icon map avoids them; keep it
   that way when adding icons.
+
+### Pane liveness (heartbeat tokens)
+
+- **You cannot detect a dead TUI from outside**: `pane.process_info` shows only the shell
+  in the foreground group whether the TUI child is alive or not (verified live), and a dead
+  pane keeps its label AND metadata tokens — which used to block the ensure hook's re-dock
+  forever. The fix: every TUI **re-stamps its identity token with the unix time** (string!)
+  every ~5s; launch decisions treat a stamp older than `HEARTBEAT_STALE_SECS` (20s) — or a
+  "Sidebar" label with no token at all — as a corpse and return `REPLACE <id>`: close the
+  pane, dock a fresh one. Ensure hook and all launcher scripts handle it.
 
 ### Unified sidebar (see `src/state.rs`)
 

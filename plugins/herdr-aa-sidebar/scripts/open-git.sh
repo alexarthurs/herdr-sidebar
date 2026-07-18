@@ -82,6 +82,12 @@ case "$decision" in
     pid="${decision#CLOSE }"
     exec "$herdr_bin" pane close "$pid"
     ;;
+  "REPLACE "*)
+    # Dead pane (stale heartbeat): close the corpse, then dock a fresh one.
+    pid="${decision#REPLACE }"
+    "$herdr_bin" pane close "$pid" >/dev/null 2>&1 || true
+    open_pane
+    ;;
   *)
     open_pane
     ;;

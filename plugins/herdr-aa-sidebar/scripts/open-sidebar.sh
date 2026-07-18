@@ -90,6 +90,12 @@ case "$decision" in
     fi
     exec "$herdr_bin" pane close "$pid"
     ;;
+  "REPLACE "*)
+    # Dead pane (stale heartbeat): close the corpse, then dock a fresh one.
+    pid="${decision#REPLACE }"
+    "$herdr_bin" pane close "$pid" >/dev/null 2>&1 || true
+    open_pane
+    ;;
   *)
     [ -n "$tab" ] && rm -f "$snooze_dir/${tab//:/_}" 2>/dev/null
     open_pane

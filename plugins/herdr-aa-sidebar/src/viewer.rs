@@ -96,7 +96,7 @@ fn report_identity(doc_name: &str) {
         serde_json::json!({
             "pane_id": pane_id,
             "source": METADATA_SOURCE,
-            "tokens": { METADATA_SOURCE: "viewer" },
+            "tokens": { METADATA_SOURCE: crate::state::unix_now().to_string() },
         }),
     );
     let _ = ipc::call_text(
@@ -139,6 +139,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let mut page: usize = 20;
+    let mut beat: u64 = 0;
     let result = loop {
         let draw = terminal.draw(|frame| page = draw_doc(frame, &mut doc, theme));
         if let Err(e) = draw {
@@ -172,7 +173,12 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 _ => {} // resize etc: redraw
             }
         } else {
-            // Idle: follow the control file so file clicks reload in place.
+            // Idle: heartbeat our token and follow the control file so file
+            // clicks reload in place.
+            beat += 1;
+            if beat.is_multiple_of(20) {
+                report_identity(&doc.name);
+            }
             let target = read_control(control);
             if target != current {
                 current = target;
