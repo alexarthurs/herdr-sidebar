@@ -66,6 +66,12 @@ cargo clippy -- -D warnings
   `strip_bom` in both plugins' `launch.rs`).
 - `cargo build --release` fails with **os error 5 (Access is denied)** while the plugin's TUI is
   running in a pane — Windows locks running exes. Close/quit the pane first, rebuild, relaunch.
+- **Propagating a rebuild to every workspace**: plugin registration is global (one `plugin link`
+  serves all workspaces), but stale panes keep old binaries AND a dead-but-open Explorer/Sidebar
+  pane blocks the ensure hook's re-dock (it matches by label/token, not liveness). Run
+  `herdr plugin action invoke herdr-aa-filetree.redeploy-windows` after rebuilding: it closes
+  every herdr-aa pane in every workspace, kills stragglers, and re-docks the focused workspace;
+  the others re-dock via the focus hook the moment they're next visited.
 
 ### herdr behavior findings (verified live by herdr-aa-filetree against herdr 0.7.1)
 

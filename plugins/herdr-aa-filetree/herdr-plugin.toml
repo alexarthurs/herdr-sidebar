@@ -77,3 +77,21 @@ description = "Open the file explorer docked on the left (focus it if open; clos
 # Same console-free chain as the hooks; --toggle turns the quiet ensure into
 # the open/focus/close toggle.
 command = ["wscript", "//B", "scripts/launch-ensure.vbs", "--toggle"]
+
+# Refresh every workspace onto the latest builds: closes all herdr-aa panes
+# everywhere (stale panes block the ensure hook's re-dock) and kills straggler
+# processes; hooks re-dock fresh panes on each workspace's next focus. Run
+# after rebuilding either plugin.
+[[actions]]
+id = "redeploy"
+platforms = ["linux", "macos"]
+title = "Redeploy plugin panes"
+description = "Close all plugin panes in every workspace so they respawn on the latest builds."
+command = ["bash", "scripts/redeploy.sh"]
+
+[[actions]]
+id = "redeploy-windows"
+platforms = ["windows"]
+title = "Redeploy plugin panes"
+description = "Close all plugin panes in every workspace so they respawn on the latest builds."
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/redeploy.ps1"]
