@@ -39,11 +39,18 @@ fn main() -> std::io::Result<()> {
             println!("{}", launch::focused_tab(&read_stdin()?));
             return Ok(());
         }
+        Some("--preview") => {
+            let Some(control) = std::env::args().nth(2) else {
+                eprintln!("herdr-aa-filetree: --preview needs a control-file path");
+                std::process::exit(2);
+            };
+            return herdr_aa_filetree::viewer::run(std::path::Path::new(&control));
+        }
         Some(flag) if flag == sidebar::GUEST_FLAG => {}
         Some(other) => {
             eprintln!("herdr-aa-filetree: unknown argument `{other}`");
             eprintln!(
-                "usage: herdr-aa-filetree [--launch-decision|--focused-pane|--open-plan|--focused-tab|{}]",
+                "usage: herdr-aa-filetree [--launch-decision|--focused-pane|--open-plan|--focused-tab|--preview <ctl>|{}]",
                 sidebar::GUEST_FLAG
             );
             std::process::exit(2);
