@@ -60,6 +60,15 @@ impl PaneCtl {
     }
 }
 
+/// Where the tree body was drawn last frame, for mouse hit-testing.
+#[derive(Clone, Copy, Default)]
+struct BodyGeom {
+    top: u16,
+    height: u16,
+    /// Scroll offset of the list at draw time.
+    offset: usize,
+}
+
 pub struct App {
     tree: Tree,
     rows: Vec<Row>,
@@ -76,6 +85,9 @@ pub struct App {
     /// ratio can leave the collapsed pane wider than the sliver threshold on
     /// large windows, so collapse state can't be inferred from width alone.
     collapsed: bool,
+    /// Row index under the mouse cursor, for the hover highlight.
+    hovered: Option<usize>,
+    body: BodyGeom,
 }
 
 impl App {
@@ -97,6 +109,8 @@ impl App {
             page: 20,
             expanded_width: DEFAULT_EXPANDED_WIDTH,
             collapsed: false,
+            hovered: None,
+            body: BodyGeom::default(),
         }
     }
 
@@ -169,14 +183,37 @@ impl App {
     }
 
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
-        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        if self.collapsed() {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.expand();
+            }
             return;
         }
-        if self.collapsed() {
-            self.expand();
-        } else if hits_collapse_button(mouse.column, mouse.row, self.last_width) {
-            self.collapse();
+        match mouse.kind {
+            MouseEventKind::Moved => {
+                self.hovered = self.row_at(mouse.row);
+            }
+            MouseEventKind::ScrollUp => self.move_by(-3),
+            MouseEventKind::ScrollDown => self.move_by(3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if hits_collapse_button(mouse.column, mouse.row, self.last_width) {
+                    self.collapse();
+                    return;
+                }
+                let Some(index) = self.row_at(mouse.row) else { return };
+                self.select(index);
+                let row = &self.rows[index];
+                if row.is_dir && hits_chevron(mouse.column, row.depth) {
+                    self.toggle();
+                }
+            }
+            _ => {}
         }
+    }
+
+    /// The visible row index at a pane-local mouse row, if it lands on one.
+    fn row_at(&self, mouse_row: u16) -> Option<usize> {
+        row_index_at(self.body, self.rows.len(), mouse_row)
     }
 
     fn selected_row(&self) -> Option<&Row> {
@@ -250,6 +287,7 @@ impl App {
     /// Recompute visible rows, keeping the selection on the same path when it
     /// still exists (else the nearest valid index).
     fn rebuild(&mut self) {
+        self.hovered = None;
         let selected_path = self.selected_row().map(|r| r.path.clone());
         self.rows = self.tree.rows();
         if self.rows.is_empty() {
@@ -295,7 +333,13 @@ impl App {
             frame.render_widget(Paragraph::new("  (empty)".dim().italic()), body);
         } else {
             let theme = self.theme;
-            let items: Vec<ListItem> = self.rows.iter().map(|r| row_item(r, theme)).collect();
+            let hovered = self.hovered;
+            let items: Vec<ListItem> = self
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| row_item(r, theme, hovered == Some(i)))
+                .collect();
             let list = List::new(items).highlight_style(
                 Style::default()
                     .bg(Color::DarkGray)
@@ -303,6 +347,11 @@ impl App {
             );
             frame.render_stateful_widget(list, body, &mut self.state);
         }
+        self.body = BodyGeom {
+            top: body.y,
+            height: body.height,
+            offset: self.state.offset(),
+        };
 
         frame.render_widget(
             Paragraph::new(
@@ -323,7 +372,7 @@ impl App {
     }
 }
 
-fn row_item(row: &Row, theme: IconTheme) -> ListItem<'static> {
+fn row_item(row: &Row, theme: IconTheme, hovered: bool) -> ListItem<'static> {
     let indent = "  ".repeat(row.depth);
     let arrow = if row.is_dir {
         if row.expanded { "▾ " } else { "▸ " }
@@ -340,11 +389,35 @@ fn row_item(row: &Row, theme: IconTheme) -> ListItem<'static> {
     } else {
         Style::default()
     };
-    ListItem::new(Line::from(vec![
+    let item = ListItem::new(Line::from(vec![
         Span::styled(format!("{indent}{arrow}"), Style::default().dim()),
         Span::styled(format!("{} ", icon.glyph), icon_style),
         Span::styled(row.name.clone(), name_style),
-    ]))
+    ]));
+    if hovered {
+        // Subtler than the DarkGray selection bg; the selection's
+        // highlight_style still wins on the selected row.
+        item.style(Style::default().bg(Color::Rgb(48, 52, 60)))
+    } else {
+        item
+    }
+}
+
+/// True when a click at pane-local `column` lands on a row's disclosure
+/// chevron (the two cells right after the depth indent).
+fn hits_chevron(column: u16, depth: usize) -> bool {
+    let start = (depth * 2) as u16;
+    (start..start + 2).contains(&column)
+}
+
+/// The row index at a pane-local mouse row given the last-drawn body
+/// geometry, if it lands on an actual row.
+fn row_index_at(body: BodyGeom, row_count: usize, mouse_row: u16) -> Option<usize> {
+    if mouse_row < body.top || mouse_row >= body.top + body.height {
+        return None;
+    }
+    let index = body.offset + usize::from(mouse_row - body.top);
+    (index < row_count).then_some(index)
 }
 
 /// True when a click at pane-local (column, row) lands on the `«` button: the
@@ -377,6 +450,26 @@ mod tests {
         assert!(hits_collapse_button(28, 0, 32));
         assert!(!hits_collapse_button(27, 0, 32), "left of the button");
         assert!(!hits_collapse_button(30, 1, 32), "tree row");
+    }
+
+    #[test]
+    fn chevron_hit_region_follows_indent_depth() {
+        assert!(hits_chevron(0, 0));
+        assert!(hits_chevron(1, 0));
+        assert!(!hits_chevron(2, 0), "icon cell");
+        assert!(hits_chevron(2, 1));
+        assert!(hits_chevron(3, 1));
+        assert!(!hits_chevron(0, 1), "indent cell");
+    }
+
+    #[test]
+    fn row_index_accounts_for_header_and_scroll() {
+        let body = BodyGeom { top: 1, height: 10, offset: 5 };
+        assert_eq!(row_index_at(body, 100, 0), None, "header row");
+        assert_eq!(row_index_at(body, 100, 1), Some(5));
+        assert_eq!(row_index_at(body, 100, 10), Some(14));
+        assert_eq!(row_index_at(body, 100, 11), None, "footer row");
+        assert_eq!(row_index_at(body, 6, 2), None, "past the last row");
     }
 
     #[test]
