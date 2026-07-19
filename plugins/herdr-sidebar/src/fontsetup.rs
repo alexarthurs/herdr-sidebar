@@ -127,7 +127,7 @@ fn draw(frame: &mut Frame, screen: &Screen) {
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 key("Y"),
-                Span::raw(" install    "),
+                Span::raw(" install (Recommended)    "),
                 key("N"),
                 Span::raw(" not now — use emoji icons"),
             ]));
