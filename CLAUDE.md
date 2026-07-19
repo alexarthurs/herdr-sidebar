@@ -218,6 +218,14 @@ HACKING.md — budget time for that before promising a patched build.
 
 ### Terminal/TUI gotchas (both plugins)
 
+- **crossterm honors `NO_COLOR`** — and Claude Code's Bash tool sets `NO_COLOR=1`, so a
+  herdr SERVER (re)started from an agent shell passes it to every pane it ever spawns and
+  all crossterm-drawn UI silently goes monochrome (raw-SGR output still renders, which
+  makes it look like a plugin bug; bit Alex live). Both TUIs + the viewer now call
+  `crossterm::style::force_color_output(true)` at startup — a TUI's colors are interface,
+  not pipeable output. Claude panes inside such a server stay pale until the server is
+  restarted from a clean (non-agent) shell.
+
 - Without keyboard-enhancement protocols (not enabled in herdr panes), **modifier+Enter is
   indistinguishable from plain Enter** in most Windows terminals — a "Ctrl+Enter" binding
   silently means "Enter". Design keymaps so unmodified keys suffice (the commit

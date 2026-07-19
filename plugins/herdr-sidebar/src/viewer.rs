@@ -320,6 +320,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
         crossterm::cursor::MoveTo(0, 0),
     );
+    crossterm::style::force_color_output(true); // TUI colors ≠ pipeable output
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let mut page: usize = 20;

@@ -88,6 +88,11 @@ fn main() -> std::io::Result<()> {
         crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge),
         crossterm::cursor::MoveTo(0, 0),
     );
+    // A TUI's colors are interface, not pipeable output: ignore NO_COLOR,
+    // which otherwise leaks in whenever the herdr server was (re)started
+    // from an agent shell (Claude Code's tool env sets it) and silently
+    // turns every pane we draw monochrome.
+    crossterm::style::force_color_output(true);
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     // First run on a machine without a Nerd Font: offer to install one
