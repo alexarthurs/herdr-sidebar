@@ -285,13 +285,27 @@ fn report_identity(doc_name: &str) {
     );
 }
 
-/// Close our own pane (ends this process with it).
-fn close_own_pane() {
+/// Close our own pane (ends this process with it), handing focus back to
+/// the sidebar that spawned us — its pane id is baked into the control-file
+/// name, so a full-screen (zoomed) preview drops the user exactly where
+/// they were.
+fn close_own_pane(control: &Path) {
+    if let Some(owner) = owner_pane_id(control) {
+        let _ = ipc::call_text("pane.focus", serde_json::json!({ "pane_id": owner }));
+    }
     if let Ok(pane_id) = std::env::var("HERDR_PANE_ID")
         && !pane_id.is_empty()
     {
         let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
     }
+}
+
+/// The sidebar pane that owns this viewer, recovered from the control-file
+/// name (`herdr-sidebar-preview-<id with ':' as '_'>.ctl`).
+fn owner_pane_id(control: &Path) -> Option<String> {
+    let stem = control.file_stem()?.to_str()?;
+    let id = stem.strip_prefix("herdr-sidebar-preview-")?.replace('_', ":");
+    (!id.is_empty()).then_some(id)
 }
 
 /// The viewer's event loop; returns when the user closes it.
@@ -335,7 +349,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => {
-                        close_own_pane();
+                        close_own_pane(control);
                         break Ok(());
                     }
                     KeyCode::Up | KeyCode::Char('k') => doc.scroll = doc.scroll.saturating_sub(1),
@@ -350,7 +364,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                     MouseEventKind::ScrollUp => doc.scroll = doc.scroll.saturating_sub(3),
                     MouseEventKind::ScrollDown => doc.scroll = (doc.scroll + 3).min(max),
                     MouseEventKind::Down(MouseButton::Left) if mouse.row == 0 => {
-                        close_own_pane();
+                        close_own_pane(control);
                         break Ok(());
                     }
                     _ => {}
@@ -470,19 +484,34 @@ fn draw_doc(frame: &mut Frame, doc: &mut Doc, theme: IconTheme) -> usize {
 pub fn open_in_pane(my_pane_id: &str, spawn_cwd: &Path, payload: &str) -> Result<(), String> {
     let control = control_path(my_pane_id);
     std::fs::write(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
+    let full = crate::state::load_state().preview_full;
 
     // A live viewer in this tab follows the control file by itself; a DEAD
     // one (stale heartbeat) is closed and replaced.
     if let Ok(json) = ipc::call_text("pane.list", serde_json::json!({})) {
         match viewer_pane_in_tab(&json, my_pane_id) {
-            Some((_, false)) => return Ok(()),
+            Some((id, false)) => {
+                if full {
+                    set_zoom(&id, true);
+                }
+                return Ok(());
+            }
             Some((id, true)) => {
                 let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }));
             }
             None => {}
         }
     }
-    spawn_viewer_pane(my_pane_id, spawn_cwd, &control)
+    spawn_viewer_pane(my_pane_id, spawn_cwd, &control, full)
+}
+
+/// Zoom a pane to the whole tab (or back). Zooming also focuses it, so the
+/// full-screen preview receives the scroll keys immediately.
+fn set_zoom(pane_id: &str, on: bool) {
+    let _ = ipc::call_text(
+        "pane.zoom",
+        serde_json::json!({ "pane_id": pane_id, "mode": if on { "on" } else { "off" } }),
+    );
 }
 
 /// Close this tab's viewer pane if one is open (Esc from the sidebar).
@@ -540,7 +569,12 @@ fn viewer_pane_in_tab(pane_list_json: &str, my_pane_id: &str) -> Option<(String,
 /// Split a viewer pane directly to the caller's right: split the right
 /// NEIGHBOR and swap the fresh pane into its left slot (split only goes
 /// right/down), so the layout reads sidebar | preview | rest.
-fn spawn_viewer_pane(my_pane_id: &str, spawn_cwd: &Path, control: &Path) -> Result<(), String> {
+fn spawn_viewer_pane(
+    my_pane_id: &str,
+    spawn_cwd: &Path,
+    control: &Path,
+    full: bool,
+) -> Result<(), String> {
     let layout = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": my_pane_id })).ok();
     let neighbor = layout.as_deref().and_then(|json| right_neighbor(json, my_pane_id));
     let (target, ratio, needs_swap) = match &neighbor {
@@ -583,9 +617,15 @@ fn spawn_viewer_pane(my_pane_id: &str, spawn_cwd: &Path, control: &Path) -> Resu
         "pane.rename",
         serde_json::json!({ "pane_id": new_pane, "label": "Preview" }),
     );
-    // The split/swap can move focus with the slot; stay in the sidebar so
-    // the user keeps clicking.
-    let _ = ipc::call_text("pane.focus", serde_json::json!({ "pane_id": my_pane_id }));
+    if full {
+        // Full-screen: the preview takes the whole tab and the focus with
+        // it (Esc inside restores everything).
+        set_zoom(&new_pane, true);
+    } else {
+        // Beside mode: the split/swap can move focus with the slot; stay in
+        // the sidebar so the user keeps clicking.
+        let _ = ipc::call_text("pane.focus", serde_json::json!({ "pane_id": my_pane_id }));
+    }
     Ok(())
 }
 

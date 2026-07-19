@@ -160,6 +160,7 @@ enum Overlay {
 enum Setting {
     UnifiedSidebar,
     IconTheme,
+    PreviewFull,
     HiddenFiles,
     Hotkeys,
     Folder,
@@ -760,6 +761,12 @@ impl App {
                 true,
             ),
             (
+                Setting::PreviewFull,
+                "Full-screen preview",
+                if self.sidebar_state.preview_full { "on" } else { "off" }.to_string(),
+                true,
+            ),
+            (
                 Setting::Folder,
                 "Change folder…",
                 self.tree.root_name(),
@@ -789,6 +796,10 @@ impl App {
             }
             Setting::Hotkeys => {
                 self.sidebar_state.show_hotkeys = !self.sidebar_state.show_hotkeys;
+                sidebar::save_state(self.sidebar_state);
+            }
+            Setting::PreviewFull => {
+                self.sidebar_state.preview_full = !self.sidebar_state.preview_full;
                 sidebar::save_state(self.sidebar_state);
             }
             Setting::Folder => {

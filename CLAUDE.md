@@ -327,6 +327,13 @@ HACKING.md — budget time for that before promising a patched build.
 
 ### Diff preview
 
+- Previews/diffs open FULL-TAB by default: the viewer pane is spawned as a normal
+  split+swap, then `pane.zoom {mode:on}` covers the tab (zoom also moves focus to it —
+  deliberate, keys must land in the visible pane). Esc/q in the viewer focuses the OWNER
+  sidebar first (its pane id is baked into the control-file name) and then closes
+  itself, which drops the zoom and restores the layout untouched. "Full-screen preview"
+  in ⚙ Settings (persisted `preview_full`, default on) switches back to the beside-mode
+  split, which returns focus to the sidebar after spawning instead.
 - Clicking a changed file in Source Control (or `o`, or the context menu's Open Diff)
   shows its colored `git diff` in the SAME preview pane the explorer uses: the control
   file carries typed requests (`file/<path>` / `diff/<root>/<rel>/<kind>`, tab-separated),

@@ -117,6 +117,9 @@ pub struct State {
     /// The first-run "install a Nerd Font?" prompt was answered (either
     /// way) — never show it again.
     pub font_prompt_done: bool,
+    /// Previews/diffs ZOOM to the whole tab (Esc restores the layout)
+    /// instead of splitting beside the sidebar.
+    pub preview_full: bool,
 }
 
 impl Default for State {
@@ -127,6 +130,7 @@ impl Default for State {
             show_hotkeys: false,
             icons: None,
             font_prompt_done: false,
+            preview_full: true,
         }
     }
 }
@@ -202,11 +206,12 @@ pub fn save_state(state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"preview_full\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.show_hotkeys,
-        state.font_prompt_done
+        state.font_prompt_done,
+        state.preview_full
     );
     let _ = std::fs::write(path, json);
 }
@@ -238,6 +243,10 @@ pub fn parse_state(json: &str) -> State {
             .get("font_prompt")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.font_prompt_done),
+        preview_full: value
+            .get("preview_full")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.preview_full),
     }
 }
 
@@ -253,8 +262,9 @@ mod tests {
             show_hotkeys: true,
             icons: Some(crate::icons::IconTheme::Emoji),
             font_prompt_done: true,
+            preview_full: false,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"preview_full\":false,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         assert_eq!(parse_state("garbage"), State::default());
