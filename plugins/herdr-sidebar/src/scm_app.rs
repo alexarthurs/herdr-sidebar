@@ -557,12 +557,13 @@ impl App {
         } else {
             String::new()
         };
-        let theme = IconTheme::from_env(
+        let theme = IconTheme::resolve(
             std::env::var("HERDR_SIDEBAR_ICONS")
                 .or_else(|_| std::env::var("HERDR_AA_GIT_ICONS"))
                 .or_else(|_| std::env::var("HERDR_AA_FILETREE_ICONS"))
                 .ok()
                 .as_deref(),
+            sidebar::load_state().icons,
         );
         // The other view ships in this same binary — always available.
         let other_exe = std::env::current_exe().ok();
@@ -948,7 +949,7 @@ impl App {
             KeyCode::Char('a') => self.stage_all(),
             KeyCode::Char('u') => self.unstage_all(),
             KeyCode::Char('r') => self.refresh(),
-            KeyCode::Char('i') => self.theme = self.theme.toggled(),
+            KeyCode::Char('i') => self.set_theme(self.theme.toggled()),
             KeyCode::Char('A') => self.suggest_message(),
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('S') => self.sync_changes(),
@@ -1454,7 +1455,7 @@ impl App {
                 let on = !self.merged();
                 self.set_unified(on);
             }
-            Setting::IconTheme => self.theme = self.theme.toggled(),
+            Setting::IconTheme => self.set_theme(self.theme.toggled()),
             Setting::Hotkeys => {
                 self.sidebar_state.show_hotkeys = !self.sidebar_state.show_hotkeys;
                 sidebar::save_state(self.sidebar_state);
@@ -2539,6 +2540,13 @@ impl App {
             hints.extend([("1", "files"), ("2", "git")]);
         }
         hints
+    }
+
+    /// Switch icon themes and REMEMBER it (see the explorer's twin).
+    fn set_theme(&mut self, theme: IconTheme) {
+        self.theme = theme;
+        self.sidebar_state.icons = Some(theme);
+        sidebar::save_state(self.sidebar_state);
     }
 
     /// The persisted "show hotkeys in the footer" setting.

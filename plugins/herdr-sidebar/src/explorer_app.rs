@@ -230,11 +230,12 @@ impl App {
         if !rows.is_empty() {
             state.select(Some(0));
         }
-        let theme = IconTheme::from_env(
+        let theme = IconTheme::resolve(
             std::env::var("HERDR_SIDEBAR_ICONS")
                 .or_else(|_| std::env::var("HERDR_AA_FILETREE_ICONS"))
                 .ok()
                 .as_deref(),
+            sidebar::load_state().icons,
         );
         let pane_ctl = PaneCtl::from_env();
         // The other view ships in this same binary — always available.
@@ -452,7 +453,7 @@ impl App {
                 self.tree.show_hidden = !self.tree.show_hidden;
                 self.rebuild();
             }
-            KeyCode::Char('i') => self.theme = self.theme.toggled(),
+            KeyCode::Char('i') => self.set_theme(self.theme.toggled()),
             KeyCode::Char('b') => self.hide(),
             KeyCode::Char('c') => self.change_folder_dialog(),
             KeyCode::Char('s') => self.open_settings(),
@@ -781,7 +782,7 @@ impl App {
                 let on = !self.merged();
                 self.set_unified(on);
             }
-            Setting::IconTheme => self.theme = self.theme.toggled(),
+            Setting::IconTheme => self.set_theme(self.theme.toggled()),
             Setting::HiddenFiles => {
                 self.tree.show_hidden = !self.tree.show_hidden;
                 self.rebuild();
@@ -1258,6 +1259,15 @@ impl App {
             spans.push(gear);
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// Switch icon themes and REMEMBER it — an auto-detected theme that
+    /// guessed wrong (font installed but not selected, or vice versa) must
+    /// stay corrected across restarts.
+    fn set_theme(&mut self, theme: IconTheme) {
+        self.theme = theme;
+        self.sidebar_state.icons = Some(theme);
+        sidebar::save_state(self.sidebar_state);
     }
 
     /// The persisted "show hotkeys in the footer" setting.

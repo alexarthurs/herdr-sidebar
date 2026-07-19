@@ -110,11 +110,15 @@ pub struct State {
     /// Show the hotkey chips at the bottom of the sidebar (they always
     /// live in the ⚙ Settings modal; the footer copy is opt-in).
     pub show_hotkeys: bool,
+    /// The user's explicit icon-theme choice; `None` = auto (Nerd Font
+    /// probe). Set the moment they toggle `i` or the Settings row, so a
+    /// wrong auto-guess is corrected once and stays corrected.
+    pub icons: Option<crate::icons::IconTheme>,
 }
 
 impl Default for State {
     fn default() -> Self {
-        Self { merged: false, active: View::Explorer, show_hotkeys: false }
+        Self { merged: false, active: View::Explorer, show_hotkeys: false, icons: None }
     }
 }
 
@@ -184,8 +188,12 @@ pub fn save_state(state: State) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    let icons = match state.icons {
+        Some(theme) => format!(",\"icons\":\"{}\"", theme.state_name()),
+        None => String::new(),
+    };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.show_hotkeys
@@ -212,6 +220,10 @@ pub fn parse_state(json: &str) -> State {
             .get("hotkeys")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.show_hotkeys),
+        icons: value
+            .get("icons")
+            .and_then(|v| v.as_str())
+            .and_then(crate::icons::IconTheme::from_state_name),
     }
 }
 
@@ -221,10 +233,14 @@ mod tests {
 
     #[test]
     fn state_roundtrip_and_forgiving_parse() {
-        let state =
-            State { merged: true, active: View::SourceControl, show_hotkeys: true };
+        let state = State {
+            merged: true,
+            active: View::SourceControl,
+            show_hotkeys: true,
+            icons: Some(crate::icons::IconTheme::Emoji),
+        };
         let json =
-            "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true}";
+            "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         assert_eq!(parse_state("garbage"), State::default());

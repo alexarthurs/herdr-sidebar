@@ -188,6 +188,14 @@ Terminal fonts for icon glyphs (Windows, verified live):
   "CaskaydiaCove Nerd Font Mono"), NOT the GDI name System.Drawing reports ("CaskaydiaCove
   NFM") — VS Code/WT silently fall back to tofu with the wrong one. Newly installed fonts
   need a VS Code window reload to be seen.
+- **A TUI cannot detect whether the terminal font renders a glyph** — missing glyphs
+  (tofu) still occupy their cells, so cursor-position probing sees nothing. The icon
+  theme therefore resolves env → persisted `icons` in state.json → a "Nerd Font
+  installed?" probe (Windows font registries via `reg query` / `fc-list` elsewhere),
+  and any manual toggle persists (`set_theme`) so a wrong guess is corrected exactly
+  once. Installed ≠ selected in the terminal profile: switching WT color schemes via
+  the settings UI can silently DROP profiles.defaults.font, reverting the terminal to
+  a non-Nerd font while the probe still says material (bit Alex live).
 - Sextants (U+1FB00 Symbols for Legacy Computing) and braille are covered by the Cascadia
   family; arbitrary glyph rotation is impossible in terminals — herdr can forward Kitty
   graphics to the host terminal, but Windows Terminal doesn't render that protocol.

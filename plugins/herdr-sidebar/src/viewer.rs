@@ -296,11 +296,12 @@ fn close_own_pane() {
 
 /// The viewer's event loop; returns when the user closes it.
 pub fn run(control: &Path) -> std::io::Result<()> {
-    let theme = IconTheme::from_env(
+    let theme = IconTheme::resolve(
         std::env::var("HERDR_SIDEBAR_ICONS")
             .or_else(|_| std::env::var("HERDR_AA_FILETREE_ICONS"))
             .ok()
             .as_deref(),
+        crate::state::load_state().icons,
     );
     let mut current = read_control(control);
     let mut doc = current.as_ref().map(load).unwrap_or_else(|| Doc {

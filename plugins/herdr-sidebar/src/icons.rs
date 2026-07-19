@@ -18,14 +18,41 @@ pub enum IconTheme {
 }
 
 impl IconTheme {
-    /// Initial theme from `HERDR_SIDEBAR_ICONS` (legacy `HERDR_AA_*_ICONS`
-    /// still honored). Material (the Atom
-    /// Material look) is the default — set `emoji` if the terminal font has no
-    /// Nerd Font glyphs (or just press `i`).
-    pub fn from_env(value: Option<&str>) -> Self {
+    /// Explicit theme from `HERDR_SIDEBAR_ICONS` (legacy `HERDR_AA_*_ICONS`
+    /// still honored); `None` when unset/unknown so resolution can fall
+    /// through to the persisted choice and then the font heuristic.
+    pub fn from_env(value: Option<&str>) -> Option<Self> {
         match value.map(|v| v.trim().to_lowercase()).as_deref() {
-            Some("emoji") => Self::Emoji,
-            _ => Self::Material,
+            Some("emoji") => Some(Self::Emoji),
+            Some("material") => Some(Self::Material),
+            _ => None,
+        }
+    }
+
+    /// Pick the startup theme: env override → the user's persisted choice →
+    /// Material only when a Nerd Font looks installed, else Emoji. A TUI
+    /// CANNOT observe whether the terminal font actually renders a glyph
+    /// (missing glyphs still occupy their cells), so "is any Nerd Font
+    /// installed" is the best signal available — and a wrong guess is one
+    /// persisted `i` keypress away from correct.
+    pub fn resolve(env: Option<&str>, persisted: Option<Self>) -> Self {
+        Self::from_env(env)
+            .or(persisted)
+            .unwrap_or_else(|| if nerd_font_installed() { Self::Material } else { Self::Emoji })
+    }
+
+    pub fn from_state_name(name: &str) -> Option<Self> {
+        match name {
+            "emoji" => Some(Self::Emoji),
+            "material" => Some(Self::Material),
+            _ => None,
+        }
+    }
+
+    pub fn state_name(self) -> &'static str {
+        match self {
+            Self::Emoji => "emoji",
+            Self::Material => "material",
         }
     }
 
@@ -35,6 +62,47 @@ impl IconTheme {
             Self::Material => Self::Emoji,
         }
     }
+}
+
+/// Nerd Fonts register under several spellings: the DirectWrite family
+/// ("CaskaydiaCove Nerd Font"), the GDI abbreviation Windows' font registry
+/// actually stores ("CaskaydiaCove NF (TrueType)" — bit us live), and the
+/// space-less filenames ("CaskaydiaCoveNerdFont-Regular.ttf").
+fn output_mentions_nerd_font(text: &str) -> bool {
+    let t = text.to_lowercase();
+    t.contains("nerd font") || t.contains("nerdfont") || t.contains(" nf ")
+}
+
+/// Best-effort "is any Nerd Font installed" probe, cached. Windows: the two
+/// font registries; elsewhere: `fc-list`. Installed is not the same as
+/// selected in the terminal profile, but it is the strongest hint a TUI can
+/// get, and the safe default for machines without one is what matters.
+fn nerd_font_installed() -> bool {
+    use std::sync::OnceLock;
+    static PROBE: OnceLock<bool> = OnceLock::new();
+    *PROBE.get_or_init(|| {
+        #[cfg(windows)]
+        {
+            let keys = [
+                r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts",
+                r"HKCU\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts",
+            ];
+            keys.iter().any(|key| {
+                std::process::Command::new("reg")
+                    .args(["query", key])
+                    .output()
+                    .map(|out| output_mentions_nerd_font(&String::from_utf8_lossy(&out.stdout)))
+                    .unwrap_or(false)
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            std::process::Command::new("fc-list")
+                .output()
+                .map(|out| output_mentions_nerd_font(&String::from_utf8_lossy(&out.stdout)))
+                .unwrap_or(false)
+        }
+    })
 }
 
 /// A renderable icon: the glyph plus an optional foreground color. Emoji carry
@@ -322,10 +390,26 @@ mod tests {
     }
 
     #[test]
+    fn nerd_font_spellings_all_match() {
+        assert!(output_mentions_nerd_font(
+            r"CaskaydiaCove NF Mono (TrueType)    REG_SZ    C:\x\CaskaydiaCoveNerdFontMono-Regular.ttf"
+        ));
+        assert!(output_mentions_nerd_font("JetBrainsMono Nerd Font: style=Regular"));
+        assert!(output_mentions_nerd_font("FiraCode NF Retina (TrueType)"));
+        assert!(!output_mentions_nerd_font("Consolas (TrueType)  Segoe UI  Cascadia Mono"));
+    }
+
+    #[test]
     fn theme_selection_from_env_and_toggle() {
-        assert_eq!(IconTheme::from_env(None), IconTheme::Material);
-        assert_eq!(IconTheme::from_env(Some("material")), IconTheme::Material);
-        assert_eq!(IconTheme::from_env(Some(" EMOJI ")), IconTheme::Emoji);
+        assert_eq!(IconTheme::from_env(None), None);
+        assert_eq!(IconTheme::from_env(Some("material")), Some(IconTheme::Material));
+        assert_eq!(IconTheme::from_env(Some(" EMOJI ")), Some(IconTheme::Emoji));
+        // Env beats persisted; persisted beats the font probe.
+        assert_eq!(
+            IconTheme::resolve(Some("emoji"), Some(IconTheme::Material)),
+            IconTheme::Emoji
+        );
+        assert_eq!(IconTheme::resolve(None, Some(IconTheme::Emoji)), IconTheme::Emoji);
         assert_eq!(IconTheme::Emoji.toggled(), IconTheme::Material);
         assert_eq!(IconTheme::Material.toggled(), IconTheme::Emoji);
     }

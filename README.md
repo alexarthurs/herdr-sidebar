@@ -47,7 +47,9 @@ A real tree, not a directory dump:
 </div>
 
 - Disclosure chevrons, nested indentation, and **two icon themes** — colored Nerd Font
-  glyphs (Atom-Material style) or emoji, toggled live.
+  glyphs (Atom-Material style) or emoji, toggled live. The sidebar auto-picks: material
+  when a Nerd Font is installed, emoji otherwise — and if it ever guesses wrong (icons
+  showing as ⌷ tofu boxes), press `i` once; the choice persists.
 - **Click a file and it opens** in a preview pane beside the sidebar (line numbers,
   scrolling, binary-safe). Click another file — the same pane updates in place.
 - **Double-click folders** to fold, hover highlights, mouse wheel, and a
