@@ -2,3 +2,4 @@ target/
 .claude/worktrees/
 .claude/settings.local.json
 __pycache__/
+tools/screenshots/attach.log
