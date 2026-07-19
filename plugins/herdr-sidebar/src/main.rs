@@ -90,6 +90,9 @@ fn main() -> std::io::Result<()> {
     );
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // First run on a machine without a Nerd Font: offer to install one
+    // before any icons render.
+    herdr_sidebar::fontsetup::maybe_prompt(&mut terminal)?;
     let result = loop {
         let exit = match view {
             View::Explorer => run_explorer(&mut terminal),

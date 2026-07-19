@@ -7,6 +7,7 @@ pub mod actions;
 pub mod ansi;
 pub mod diffview;
 pub mod ensure;
+pub mod fontsetup;
 pub mod git;
 pub mod icons;
 pub mod ipc;

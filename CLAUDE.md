@@ -196,6 +196,12 @@ Terminal fonts for icon glyphs (Windows, verified live):
   once. Installed ≠ selected in the terminal profile: switching WT color schemes via
   the settings UI can silently DROP profiles.defaults.font, reverting the terminal to
   a non-Nerd font while the probe still says material (bit Alex live).
+- First run without a Nerd Font: `fontsetup.rs` shows a fullscreen install offer
+  (winget on Windows with a curl+bsdtar+HKCU-registry fallback; curl+unzip into the
+  user font dir on mac/Linux), on a background thread so the heartbeat keeps beating.
+  Answer persists as `font_prompt` in state.json; `HERDR_SIDEBAR_FONT_PROMPT=force|off`
+  overrides for testing. Verified live both ways (decline → emoji; install → winget
+  registered the family machine-wide).
 - **WT's bundled Cascadia (checked 1.24: CascadiaCode.ttf/CascadiaMono.ttf) contains NO
   Nerd Font glyphs** — F07B/F0674/E725/E628 all absent from their cmaps (verified with
   fontTools). The "Cascadia now includes Nerd Font symbols" release is the separate

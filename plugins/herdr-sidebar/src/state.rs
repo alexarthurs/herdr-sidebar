@@ -114,11 +114,20 @@ pub struct State {
     /// probe). Set the moment they toggle `i` or the Settings row, so a
     /// wrong auto-guess is corrected once and stays corrected.
     pub icons: Option<crate::icons::IconTheme>,
+    /// The first-run "install a Nerd Font?" prompt was answered (either
+    /// way) — never show it again.
+    pub font_prompt_done: bool,
 }
 
 impl Default for State {
     fn default() -> Self {
-        Self { merged: false, active: View::Explorer, show_hotkeys: false, icons: None }
+        Self {
+            merged: false,
+            active: View::Explorer,
+            show_hotkeys: false,
+            icons: None,
+            font_prompt_done: false,
+        }
     }
 }
 
@@ -193,10 +202,11 @@ pub fn save_state(state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
-        state.show_hotkeys
+        state.show_hotkeys,
+        state.font_prompt_done
     );
     let _ = std::fs::write(path, json);
 }
@@ -224,6 +234,10 @@ pub fn parse_state(json: &str) -> State {
             .get("icons")
             .and_then(|v| v.as_str())
             .and_then(crate::icons::IconTheme::from_state_name),
+        font_prompt_done: value
+            .get("font_prompt")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.font_prompt_done),
     }
 }
 
@@ -238,9 +252,9 @@ mod tests {
             active: View::SourceControl,
             show_hotkeys: true,
             icons: Some(crate::icons::IconTheme::Emoji),
+            font_prompt_done: true,
         };
-        let json =
-            "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         assert_eq!(parse_state("garbage"), State::default());

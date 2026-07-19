@@ -38,7 +38,9 @@ impl IconTheme {
     pub fn resolve(env: Option<&str>, persisted: Option<Self>) -> Self {
         Self::from_env(env)
             .or(persisted)
-            .unwrap_or_else(|| if nerd_font_installed() { Self::Material } else { Self::Emoji })
+            .unwrap_or_else(|| {
+                if nerd_font_installed() { Self::Material } else { Self::Emoji }
+            })
     }
 
     pub fn from_state_name(name: &str) -> Option<Self> {
@@ -77,7 +79,7 @@ fn output_mentions_nerd_font(text: &str) -> bool {
 /// font registries; elsewhere: `fc-list`. Installed is not the same as
 /// selected in the terminal profile, but it is the strongest hint a TUI can
 /// get, and the safe default for machines without one is what matters.
-fn nerd_font_installed() -> bool {
+pub fn nerd_font_installed() -> bool {
     use std::sync::OnceLock;
     static PROBE: OnceLock<bool> = OnceLock::new();
     *PROBE.get_or_init(|| {
