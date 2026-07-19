@@ -327,13 +327,20 @@ HACKING.md — budget time for that before promising a patched build.
 
 ### Diff preview
 
-- Previews/diffs open FULL-TAB by default: the viewer pane is spawned as a normal
-  split+swap, then `pane.zoom {mode:on}` covers the tab (zoom also moves focus to it —
-  deliberate, keys must land in the visible pane). Esc/q in the viewer focuses the OWNER
-  sidebar first (its pane id is baked into the control-file name) and then closes
-  itself, which drops the zoom and restores the layout untouched. "Full-screen preview"
-  in ⚙ Settings (persisted `preview_full`, default on) switches back to the beside-mode
-  split, which returns focus to the sidebar after spawning instead.
+- Previews/diffs open FULL-SIZE by default — everything beside the sidebar, sidebar
+  still visible (user-rejected the zoom approach, which covered it). Mechanism: the
+  tab's other panes are PARKED — `pane.move`d into a background "· preview" tab — with
+  their rects recorded in a plan file beside the control file; the viewer then splits
+  the momentarily-full-width sidebar at its PRE-park width fraction (captured before the
+  park — measuring after reads 100%). Esc (either process; both read the plan) moves
+  them home by guillotine-recovering the split tree from the recorded rects and
+  replaying it pre-order (first pane splits the viewer, each split re-splits the
+  first-subtree's top-left pane at the recorded ratio), then `layout.set_split_ratio`
+  restores the sidebar's width. Verified: exact rects round-trip. Zoom would NOT work
+  here: it covers the whole tab, and same-tab `pane.move` being a no-op is why parking
+  bounces through a real background tab. Stale plans (viewer died with panes parked,
+  e.g. redeploy) self-heal on the next preview open. "Full-size preview" in ⚙ Settings
+  (persisted `preview_full`, default on) reverts to the 50/50 beside-mode split.
 - Clicking a changed file in Source Control (or `o`, or the context menu's Open Diff)
   shows its colored `git diff` in the SAME preview pane the explorer uses: the control
   file carries typed requests (`file/<path>` / `diff/<root>/<rel>/<kind>`, tab-separated),

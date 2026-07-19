@@ -6,8 +6,8 @@
 
 A file explorer and a full source-control panel in one dockable
 [herdr](https://github.com/ogulcancelik/herdr) pane — activity-bar switching, mouse
-everywhere, AI-drafted commit messages, and a file preview that takes over the whole tab
-until Esc drops you back.
+everywhere, AI-drafted commit messages, and a file preview that takes everything beside
+the sidebar until Esc puts your panes back.
 
 <img alt="Rust" src="https://img.shields.io/badge/Rust-self--contained_crate-orange?logo=rust&logoColor=white">
 <img alt="herdr" src="https://img.shields.io/badge/herdr-%E2%89%A5%200.7-5865a3">
@@ -53,9 +53,9 @@ A real tree, not a directory dump:
   offers to download and install JetBrainsMono Nerd Font for you (Windows, macOS,
   Linux). If the theme ever guesses wrong (icons showing as ⌷ tofu boxes), press `i`
   once; the choice persists.
-- **Click a file and it opens** full-tab — the preview zooms over your other panes and
-  Esc restores them exactly as they were (prefer a split beside the sidebar instead?
-  toggle "Full-screen preview" off in ⚙ Settings). Line numbers,
+- **Click a file and it opens** across everything beside the sidebar — your other panes
+  step aside and Esc puts them back exactly where they were, splits and all (prefer a
+  50/50 split instead? toggle "Full-size preview" off in ⚙ Settings). Line numbers,
   scrolling, binary-safe). Click another file — the same pane updates in place.
 - **Double-click folders** to fold, hover highlights, mouse wheel, and a
   **Ctrl+right-click context menu**: New File, New Folder, Rename, Delete, Copy Path /

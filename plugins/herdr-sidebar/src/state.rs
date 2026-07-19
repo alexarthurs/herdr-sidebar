@@ -117,8 +117,9 @@ pub struct State {
     /// The first-run "install a Nerd Font?" prompt was answered (either
     /// way) — never show it again.
     pub font_prompt_done: bool,
-    /// Previews/diffs ZOOM to the whole tab (Esc restores the layout)
-    /// instead of splitting beside the sidebar.
+    /// Previews/diffs take the whole area beside the sidebar (other panes
+    /// park in a background tab; Esc restores them) instead of a 50/50
+    /// split.
     pub preview_full: bool,
 }
 

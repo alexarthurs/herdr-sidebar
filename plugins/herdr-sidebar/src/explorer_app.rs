@@ -762,7 +762,7 @@ impl App {
             ),
             (
                 Setting::PreviewFull,
-                "Full-screen preview",
+                "Full-size preview",
                 if self.sidebar_state.preview_full { "on" } else { "off" }.to_string(),
                 true,
             ),
