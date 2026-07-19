@@ -125,7 +125,16 @@ herdr plugin action invoke herdr-sidebar.open-sidebar           # linux / macos
 ```
 
 **Requirements:** Rust to build, herdr ≥ 0.7. **Recommended:** a Nerd Font terminal face
-for the material icons (the emoji theme works in any font), and the
+for the material icons — without one the sidebar auto-starts in its emoji theme, which
+renders in any font. Note Windows Terminal's bundled Cascadia does NOT include the icon
+glyphs; grab a patched font in one command and select it in your terminal profile:
+
+```
+winget install DEVCOM.JetBrainsMonoNerdFont
+```
+
+(or any font from [nerdfonts.com](https://www.nerdfonts.com/font-downloads), e.g.
+CaskaydiaCove). Also recommended: the
 [`claude` CLI](https://claude.com/claude-code) for ✧ commit messages.
 
 ## Keys

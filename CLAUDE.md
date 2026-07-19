@@ -196,6 +196,11 @@ Terminal fonts for icon glyphs (Windows, verified live):
   once. Installed ≠ selected in the terminal profile: switching WT color schemes via
   the settings UI can silently DROP profiles.defaults.font, reverting the terminal to
   a non-Nerd font while the probe still says material (bit Alex live).
+- **WT's bundled Cascadia (checked 1.24: CascadiaCode.ttf/CascadiaMono.ttf) contains NO
+  Nerd Font glyphs** — F07B/F0674/E725/E628 all absent from their cmaps (verified with
+  fontTools). The "Cascadia now includes Nerd Font symbols" release is the separate
+  "NF" variant, which WT does not ship. So there is NO zero-install path to material
+  icons, and a "running under WT ⇒ assume glyphs" heuristic would be wrong.
 - Sextants (U+1FB00 Symbols for Legacy Computing) and braille are covered by the Cascadia
   family; arbitrary glyph rotation is impossible in terminals — herdr can forward Kitty
   graphics to the host terminal, but Windows Terminal doesn't render that protocol.
