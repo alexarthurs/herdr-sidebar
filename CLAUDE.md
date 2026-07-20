@@ -247,6 +247,18 @@ HACKING.md — budget time for that before promising a patched build.
   every ~5s; launch decisions treat a stamp older than `HEARTBEAT_STALE_SECS` (20s) — or a
   "Sidebar" label with no token at all — as a corpse and return `REPLACE <id>`: close the
   pane, dock a fresh one. Ensure hook and all launcher scripts handle it.
+- **Server-restart resume creates corpses that NO event heals by itself**: herdr
+  restores panes with their labels and scrollback, but the process inside is a fresh
+  shell and metadata tokens are gone; restore and client attach emit NO hookable events
+  at all (verified live — tab.created/workspace.created/pane.focused all silent).
+  The fix is two-part: (1) label-without-token now counts as a corpse for ALL our
+  labels (Sidebar/Explorer/Source Control/Preview), and (2) the ensure hook also runs
+  on `pane.focused` + `tab.created` + `workspace.created`, so the user's FIRST
+  interaction after attach heals the tab. Hooking pane.* from a pane-creating script
+  is only safe because `open()` now HOLDS ITS LOCK until the spawned TUI stamps its
+  token — without that wait, queued hook invocations see the fresh label-only pane and
+  replace it before it boots: an infinite replace loop (observed live, dozens of panes
+  churned). The separated-pane launcher scripts carry the same wait.
 - **Stamp the heartbeat on EVERY event-loop iteration, not only in the poll-timeout
   branch**: sustained input with <500ms gaps (held-key auto-repeat, a long paste) keeps
   `event::poll` returning true, starving a timeout-branch heartbeat until the launcher

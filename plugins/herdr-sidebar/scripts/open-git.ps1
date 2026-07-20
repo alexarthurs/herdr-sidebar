@@ -78,6 +78,14 @@ function Open-Pane {
     # quote-stripping so herdr receives the quotes intact (herdr-file-viewer GH #58).
     & $HerdrBin pane run $np "& \`"$Bin\`" --view git"
     & $HerdrBin pane rename $np 'Source Control' *> $null
+    # Wait for the TUI's identity token so queued ensure hooks see a LIVE
+    # pane (the corpse rule replaces label-without-token panes).
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 200
+        $tok = ((& $HerdrBin pane list --json | ConvertFrom-Json).result.panes |
+            Where-Object { $_.pane_id -eq $np }).tokens
+        if ($tok) { break }
+    }
     # herdr has no focus-by-id; a zoom on/off cycle focuses deterministically.
     & $HerdrBin pane zoom $np --on *> $null
     & $HerdrBin pane zoom $np --off *> $null

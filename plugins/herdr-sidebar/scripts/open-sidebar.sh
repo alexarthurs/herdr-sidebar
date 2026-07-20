@@ -61,6 +61,8 @@ open_pane() {
   "$herdr_bin" pane swap --source-pane "$np" --target-pane "$target" >/dev/null 2>&1 || true
   "$herdr_bin" pane run "$np" "exec \"$bin\""
   "$herdr_bin" pane rename "$np" Explorer >/dev/null 2>&1 || true
+  # Give the TUI time to stamp its identity token before hooks re-check.
+  sleep 3
   # herdr has no focus-by-id; a zoom on/off cycle focuses deterministically.
   "$herdr_bin" pane zoom "$np" --on >/dev/null 2>&1 || true
   exec "$herdr_bin" pane zoom "$np" --off

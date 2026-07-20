@@ -90,6 +90,46 @@ command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "s
 # has a left-docked sidebar (idempotent, never steals focus). A tab hooked at
 # first focus still has its single full-height pane, so the sidebar becomes a
 # full-height left column that later splits can't shorten.
+# tab.created / workspace.created fire when a restarted server RESTORES its
+# session — the resumed tab is already focused, so no focus TRANSITION (and
+# no tab.focused/workspace.focused) ever happens, which used to leave dead
+# resumed sidebars (label + scrollback survive a restart; the process and
+# metadata tokens do not) sitting unhealed until the user switched tabs.
+# pane.focused heals resumed corpses the moment the user interacts with the
+# restored session (client attach emits no tab/workspace events at all).
+# Hooking pane.* from a pane-creating script is only safe because open()
+# holds its lock until the spawned TUI stamps its token — queued invocations
+# then observe a LIVE pane and no-op instead of replace-looping.
+[[events]]
+on = "pane.focused"
+platforms = ["linux", "macos"]
+command = ["bash", "scripts/ensure-sidebar.sh"]
+
+[[events]]
+on = "pane.focused"
+platforms = ["windows"]
+command = ["wscript", "//B", "scripts/launch-ensure.vbs"]
+
+[[events]]
+on = "tab.created"
+platforms = ["linux", "macos"]
+command = ["bash", "scripts/ensure-sidebar.sh"]
+
+[[events]]
+on = "tab.created"
+platforms = ["windows"]
+command = ["wscript", "//B", "scripts/launch-ensure.vbs"]
+
+[[events]]
+on = "workspace.created"
+platforms = ["linux", "macos"]
+command = ["bash", "scripts/ensure-sidebar.sh"]
+
+[[events]]
+on = "workspace.created"
+platforms = ["windows"]
+command = ["wscript", "//B", "scripts/launch-ensure.vbs"]
+
 [[events]]
 on = "tab.focused"
 platforms = ["linux", "macos"]

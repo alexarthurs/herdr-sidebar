@@ -132,6 +132,18 @@ fn open(panes_json: &str, focus_new: bool) -> std::io::Result<()> {
     )?;
     full_height_repair(&new_pane);
 
+    // Hold the lock until the TUI stamps its identity token (~1-2s): hook
+    // invocations queued behind us must observe a LIVE pane, or the
+    // corpse rule would replace this spawn before it finishes booting.
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if let Ok(json) = ipc::call_text("pane.list", serde_json::json!({}))
+            && launch::pane_has_token(&json, &new_pane)
+        {
+            break;
+        }
+    }
+
     if focus_new {
         focus(&new_pane)?;
     } else {

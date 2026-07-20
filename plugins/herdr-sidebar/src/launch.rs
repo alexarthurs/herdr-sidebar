@@ -57,11 +57,16 @@ impl Pane {
             || self.label.as_deref() == Some(SIDEBAR_LABEL)
     }
 
-    /// A "Sidebar"-labeled pane with NO heartbeat token is a corpse: only the
-    /// TUI sets that label, and a live TUI always has a token. (An
-    /// "Explorer"-labeled token-less pane is just launcher-fresh — grace.)
-    fn sidebar_label_without_token(&self) -> bool {
-        self.label.as_deref() == Some(SIDEBAR_LABEL) && !self.tokens.contains_key(METADATA_SOURCE)
+    /// One of OUR labels with NO heartbeat token is a corpse. The main way
+    /// this happens: herdr resumes a restarted server's panes with their
+    /// labels and scrollback, but the process inside is a fresh shell and
+    /// metadata tokens do not survive. (A launcher does rename a pane
+    /// moments before the TUI stamps its first token, so this can race a
+    /// fresh spawn for ~a second — REPLACE just respawns, and the next pass
+    /// sees a live token, so the race self-heals.)
+    fn our_label_without_token(&self) -> bool {
+        matches!(self.label.as_deref(), Some("Sidebar" | "Explorer"))
+            && !self.tokens.contains_key(METADATA_SOURCE)
     }
 }
 
@@ -163,7 +168,7 @@ pub fn launch_decision(pane_list_json: &str, now: u64) -> String {
     let Some(id) = pane.pane_id.as_deref().filter(|id| is_flag_safe(id)) else {
         return "OPEN".to_string();
     };
-    if token_stale(&pane.tokens, METADATA_SOURCE, now) || pane.sidebar_label_without_token() {
+    if token_stale(&pane.tokens, METADATA_SOURCE, now) || pane.our_label_without_token() {
         return format!("REPLACE {id}");
     }
     if Some(id) == focused.pane_id.as_deref() {
@@ -197,7 +202,10 @@ pub fn launch_decision_git(pane_list_json: &str, now: u64) -> String {
     let Some(id) = pane.pane_id.as_deref().filter(|id| is_flag_safe(id)) else {
         return "OPEN".to_string();
     };
-    if token_stale(&pane.tokens, SC_METADATA_SOURCE, now) {
+    if token_stale(&pane.tokens, SC_METADATA_SOURCE, now)
+        || (pane.label.as_deref() == Some(SC_PANE_LABEL)
+            && !pane.tokens.contains_key(SC_METADATA_SOURCE))
+    {
         return format!("REPLACE {id}");
     }
     if Some(id) == focused.pane_id.as_deref() {
@@ -205,6 +213,23 @@ pub fn launch_decision_git(pane_list_json: &str, now: u64) -> String {
     } else {
         format!("FOCUS {id}")
     }
+}
+
+/// Whether `pane_id` carries any of our identity tokens yet — the spawn
+/// wait polls this so hook invocations queued behind the lock always see a
+/// LIVE pane (without it, the label-without-token corpse rule replaces the
+/// fresh spawn before its TUI boots: an infinite replace loop, seen live).
+pub fn pane_has_token(pane_list_json: &str, pane_id: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return false;
+    };
+    msg.result
+        .panes
+        .iter()
+        .filter(|p| p.pane_id.as_deref() == Some(pane_id))
+        .any(|p| {
+            p.tokens.contains_key(METADATA_SOURCE) || p.tokens.contains_key(SC_METADATA_SOURCE)
+        })
 }
 
 /// `<pane_id>\t<cwd>` of the focused pane, or empty on any failure. The cwd
@@ -461,7 +486,7 @@ mod tests {
     #[test]
     fn decision_focuses_unfocused_explorer_in_same_tab() {
         let json = pane_list(&format!(
-            r#"{FOCUSED},{{"pane_id":"w1:p2","label":"Explorer","tab_id":"w1:t1"}}"#
+            r#"{FOCUSED},{{"pane_id":"w1:p2","label":"Explorer","tab_id":"w1:t1","tokens":{{"herdr-sidebar-explorer":95}}}}"#
         ));
         assert_eq!(launch_decision(&json, 100), "FOCUS w1:p2");
     }
@@ -469,7 +494,7 @@ mod tests {
     #[test]
     fn decision_closes_when_explorer_is_focused() {
         let json = pane_list(
-            r#"{"pane_id":"w1:p2","label":"Explorer","tab_id":"w1:t1","focused":true}"#,
+            r#"{"pane_id":"w1:p2","label":"Explorer","tab_id":"w1:t1","focused":true,"tokens":{"herdr-sidebar-explorer":95}}"#,
         );
         assert_eq!(launch_decision(&json, 100), "CLOSE w1:p2");
     }
@@ -496,16 +521,18 @@ mod tests {
             r#"{FOCUSED},{{"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{{"herdr-sidebar-explorer":{{"value":"explorer"}}}}}}"#
         ));
         assert_eq!(launch_decision(&legacy, 100), "REPLACE w1:p2");
-        // Label-only (no token yet): freshly spawned, NOT dead.
-        let fresh = pane_list(&format!(
-            r#"{FOCUSED},{{"pane_id":"w1:p2","label":"Explorer","tab_id":"w1:t1"}}"#
+        // Label without a token = a RESUMED corpse (labels survive server
+        // restarts, tokens and the process do not) — for every our-label.
+        for label in ["Explorer", "Sidebar"] {
+            let corpse = pane_list(&format!(
+                r#"{FOCUSED},{{"pane_id":"w1:p2","label":"{label}","tab_id":"w1:t1"}}"#
+            ));
+            assert_eq!(launch_decision(&corpse, 100), "REPLACE w1:p2", "{label} corpse");
+        }
+        let sc_corpse = pane_list(&format!(
+            r#"{FOCUSED},{{"pane_id":"w1:p3","label":"Source Control","tab_id":"w1:t1"}}"#
         ));
-        assert_eq!(launch_decision(&fresh, 100), "FOCUS w1:p2");
-        // But a "Sidebar" label without a token means the TUI ran and died.
-        let corpse = pane_list(&format!(
-            r#"{FOCUSED},{{"pane_id":"w1:p2","label":"Sidebar","tab_id":"w1:t1"}}"#
-        ));
-        assert_eq!(launch_decision(&corpse, 100), "REPLACE w1:p2");
+        assert_eq!(launch_decision_git(&sc_corpse, 100), "REPLACE w1:p3");
         // Same rules for the separated Source Control decision.
         let sc_stale = pane_list(&format!(
             r#"{FOCUSED},{{"pane_id":"w1:p3","tab_id":"w1:t1","tokens":{{"herdr-sidebar-git":40}}}}"#

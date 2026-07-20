@@ -556,6 +556,7 @@ fn viewer_pane_in_tab(pane_list_json: &str, my_pane_id: &str) -> Option<(String,
     struct Pane {
         pane_id: Option<String>,
         tab_id: Option<String>,
+        label: Option<String>,
         #[serde(default)]
         tokens: serde_json::Map<String, serde_json::Value>,
     }
@@ -566,10 +567,16 @@ fn viewer_pane_in_tab(pane_list_json: &str, my_pane_id: &str) -> Option<(String,
         .find(|p| p.pane_id.as_deref() == Some(my_pane_id))?
         .tab_id
         .clone()?;
+    // Token match finds a live viewer; a "Preview"-labeled pane WITHOUT the
+    // token is a resumed corpse (labels survive server restarts, tokens
+    // don't) — report it too, with a missing token, so the stale check
+    // below flags it and the caller closes it instead of spawning a twin.
     let viewer = panes
         .iter()
         .filter(|p| p.tab_id.as_deref() == Some(my_tab.as_str()))
-        .find(|p| p.tokens.contains_key(METADATA_SOURCE))?;
+        .find(|p| {
+            p.tokens.contains_key(METADATA_SOURCE) || p.label.as_deref() == Some("Preview")
+        })?;
     let id = viewer.pane_id.clone()?;
     let now = crate::state::unix_now();
     let stale = viewer
