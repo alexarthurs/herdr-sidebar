@@ -487,6 +487,12 @@ pub fn open_in_pane(my_pane_id: &str, spawn_cwd: &Path, payload: &str) -> Result
     std::fs::write(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
     let full = crate::state::load_state().preview_full;
 
+    // Measure the sidebar's width share FIRST: closing a stale viewer below
+    // leaves the sidebar momentarily alone at full width, which reads as a
+    // meaningless ~1.0 (that ordering is how the half-width sidebar bug
+    // happened — the old clamp turned the degenerate 1.0 into 0.5).
+    let mut pre_park_frac = owner_frac(my_pane_id);
+
     // A live viewer in this tab follows the control file by itself; a DEAD
     // one (stale heartbeat) is closed and replaced.
     if let Ok(json) = ipc::call_text("pane.list", serde_json::json!({})) {
@@ -496,6 +502,7 @@ pub fn open_in_pane(my_pane_id: &str, spawn_cwd: &Path, payload: &str) -> Result
                     // Covers toggling the setting on while a preview is
                     // already open beside the sidebar.
                     park_others(my_pane_id);
+                    enforce_owner_width(my_pane_id, pre_park_frac.unwrap_or(0.3));
                 }
                 return Ok(());
             }
@@ -504,19 +511,27 @@ pub fn open_in_pane(my_pane_id: &str, spawn_cwd: &Path, payload: &str) -> Result
             }
             None => {
                 // The viewer died with panes parked (redeploy, tab surgery):
-                // bring them home before opening fresh.
+                // bring them home before opening fresh — and re-measure,
+                // since the restore just rebuilt the layout.
                 restore_parked(my_pane_id);
+                pre_park_frac = owner_frac(my_pane_id).or(pre_park_frac);
             }
         }
     }
-    let pre_park_frac = owner_frac(my_pane_id);
     if full {
         park_others(my_pane_id);
     }
-    spawn_viewer_pane(my_pane_id, spawn_cwd, &control, pre_park_frac)
+    spawn_viewer_pane(my_pane_id, spawn_cwd, &control, pre_park_frac)?;
+    if full {
+        enforce_owner_width(my_pane_id, pre_park_frac.unwrap_or(0.3));
+    }
+    Ok(())
 }
 
-/// The owner pane's share of its tab width right now.
+/// The owner pane's share of its tab width right now — `None` when the
+/// geometry carries no signal (a full-width sidebar in a stacked or
+/// single-pane layout would read as ~1.0 and, clamped, once produced a
+/// half-tab sidebar — user-reported).
 fn owner_frac(owner: &str) -> Option<f64> {
     let layout = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": owner })).ok()?;
     let msg = serde_json::from_str::<LayoutMsg2>(&layout).ok()?;
@@ -525,7 +540,19 @@ fn owner_frac(owner: &str) -> Option<f64> {
         .iter()
         .find(|p| p.pane_id.as_deref() == Some(owner))
         .and_then(|p| p.rect)
-        .map(|r| (r.width as f64 / body.area.width.max(1) as f64).clamp(0.1, 0.5))
+        .map(|r| r.width as f64 / body.area.width.max(1) as f64)
+        .filter(|f| (0.02..0.55).contains(f))
+        .map(|f| f.max(0.1))
+}
+
+/// Pin the sidebar's width after the preview opens: in full mode the tab is
+/// sidebar | viewer, so the root split ratio IS the sidebar's share. Makes
+/// the width deterministic no matter which spawn path ran.
+fn enforce_owner_width(owner: &str, frac: f64) {
+    let _ = ipc::call_text(
+        "layout.set_split_ratio",
+        serde_json::json!({ "pane_id": owner, "path": [], "ratio": frac }),
+    );
 }
 
 /// Close this tab's viewer pane if one is open (Esc from the sidebar),
@@ -769,8 +796,10 @@ fn park_others(owner: &str) {
         .iter()
         .find(|p| p.pane_id.as_deref() == Some(owner))
         .and_then(|p| p.rect)
-        .map(|r| (r.width as f64 / body.area.width.max(1) as f64).clamp(0.1, 0.5))
-        .unwrap_or(0.2);
+        .map(|r| r.width as f64 / body.area.width.max(1) as f64)
+        .filter(|f| (0.02..0.55).contains(f))
+        .map(|f| f.max(0.1))
+        .unwrap_or(0.3);
     let mut others: Vec<(String, RectJ)> = body
         .panes
         .into_iter()

@@ -358,7 +358,13 @@ HACKING.md — budget time for that before promising a patched build.
   restores the sidebar's width. Verified: exact rects round-trip. Zoom would NOT work
   here: it covers the whole tab, and same-tab `pane.move` being a no-op is why parking
   bounces through a real background tab. Stale plans (viewer died with panes parked,
-  e.g. redeploy) self-heal on the next preview open. "Full-size preview" in ⚙ Settings
+  e.g. redeploy) self-heal on the next preview open. **Measure the sidebar's width
+  fraction FIRST, before closing a stale viewer**: the close leaves the sidebar
+  momentarily alone at full width, and a post-close measurement reads a meaningless
+  ~1.0 (clamped to 0.5, that was the half-width-sidebar bug). `owner_frac` treats
+  any fraction outside 0.02..0.55 as no-signal (`None` → 0.3 fallback), and after
+  the viewer opens `enforce_owner_width` pins the root split to the pre-click
+  fraction so the width is deterministic whichever spawn path ran. "Full-size preview" in ⚙ Settings
   (persisted `preview_full`, default on) reverts to the 50/50 beside-mode split.
 - Clicking a changed file in Source Control (or `o`, or the context menu's Open Diff)
   shows its colored `git diff` in the SAME preview pane the explorer uses: the control
