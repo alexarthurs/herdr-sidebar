@@ -259,6 +259,10 @@ HACKING.md — budget time for that before promising a patched build.
   token — without that wait, queued hook invocations see the fresh label-only pane and
   replace it before it boots: an infinite replace loop (observed live, dozens of panes
   churned). The separated-pane launcher scripts carry the same wait.
+  Cleaner alternative (herdr-notes v0.1.1 does this): the LAUNCHER stamps the
+  identity token itself, synchronously, right after `pane.split` and BEFORE
+  `pane run` — there is then no token-less window at all, so no wait/poll is
+  needed. Worth adopting if the launchers are ever reworked.
 - **Stamp the heartbeat on EVERY event-loop iteration, not only in the poll-timeout
   branch**: sustained input with <500ms gaps (held-key auto-repeat, a long paste) keeps
   `event::poll` returning true, starving a timeout-branch heartbeat until the launcher
