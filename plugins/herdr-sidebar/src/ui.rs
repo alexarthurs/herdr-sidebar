@@ -3,9 +3,11 @@
 //! pane-list parsing both views use to find their sibling panes. One home —
 //! these used to be copy-mirrored between two crates.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 use crate::icons::IconTheme;
 use crate::state::View;
@@ -49,6 +51,26 @@ pub fn wrap_hints(
         used += if line.len() == 3 { w } else { 2 + w };
     }
     lines.into_iter().map(Line::from).collect()
+}
+
+/// A subtle right-edge scrollbar when the list overflows its viewport.
+/// Purely an indicator: the wheel scrolls, the bar just shows where.
+pub fn draw_scrollbar(frame: &mut Frame, area: Rect, total: usize, viewport: usize, pos: usize) {
+    if total <= viewport || area.width == 0 || area.height == 0 {
+        return;
+    }
+    let mut state = ScrollbarState::new(total.saturating_sub(viewport)).position(pos);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .thumb_symbol("┃")
+            .track_style(Style::default().dim())
+            .thumb_style(Style::default()),
+        area,
+        &mut state,
+    );
 }
 
 /// True when a click at pane-local (column, row) lands on the `«` collapse

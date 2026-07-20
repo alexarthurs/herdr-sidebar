@@ -19,15 +19,15 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
 
 use herdr_sidebar::git::{FileEntry, Git, Status};
 use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::state::Exit;
 use herdr_sidebar::ui::{
-    activity_icons, branch_icon, gear_icon, hits, hits_collapse_button, sibling_panes_of,
-    sparkle_icon, truncate_to, within, wrap_hints,
+    activity_icons, branch_icon, draw_scrollbar, gear_icon, hits, hits_collapse_button,
+    sibling_panes_of, sparkle_icon, truncate_to, within, wrap_hints,
 };
 use herdr_sidebar::actions::{copy_to_clipboard, reveal};
 use herdr_sidebar::suggest;
@@ -517,7 +517,13 @@ pub struct App {
     active: usize,
     cwd: PathBuf,
     rows: Vec<Row>,
-    list: ListState,
+    /// Explicit selection — `None` until the user picks a row (nothing is
+    /// highlighted by default; hover stays subtle).
+    selected: Option<usize>,
+    /// View scroll offset in ROWS, independent of the selection.
+    scroll: usize,
+    /// Bring the selection into view on the next draw (keyboard nav only).
+    snap: bool,
     focus: Focus,
     theme: IconTheme,
     drawers: [DrawerPanel; 8],
@@ -576,7 +582,9 @@ impl App {
             active: 0,
             cwd,
             rows: Vec::new(),
-            list: ListState::default(),
+            selected: None,
+            scroll: 0,
+            snap: false,
             focus: Focus::List,
             theme,
             drawers: Default::default(),
@@ -801,11 +809,15 @@ impl App {
             }
         }
         if self.rows.is_empty() {
-            self.list.select(None);
+            self.selected = None;
+            self.scroll = 0;
             return;
         }
-        let index = self.list.selected().unwrap_or(0).min(self.rows.len() - 1);
-        self.list.select(Some(self.nearest_selectable(index)));
+        if let Some(sel) = self.selected {
+            let index = sel.min(self.rows.len() - 1);
+            self.selected = Some(self.nearest_selectable(index));
+        }
+        self.scroll = self.scroll.min(self.rows.len() - 1);
         self.follow_selection();
     }
 
@@ -824,7 +836,7 @@ impl App {
     /// selection: drawers, commit box, and sync all act on the selected
     /// row's repository.
     fn follow_selection(&mut self) {
-        let selected = self.list.selected().and_then(|i| self.rows.get(i)).copied();
+        let selected = self.selected.and_then(|i| self.rows.get(i)).copied();
         if let Some(r) = selected.and_then(Row::repo)
             && r != self.active
             && r < self.repos.len()
@@ -832,10 +844,10 @@ impl App {
             self.active = r;
             self.history_target = None;
             self.reload_expanded_drawers();
-            let keep = self.list.selected();
+            let keep = self.selected;
             self.rebuild();
             if let Some(i) = keep {
-                self.list.select(Some(i.min(self.rows.len().saturating_sub(1))));
+                self.selected = Some(i.min(self.rows.len().saturating_sub(1)));
             }
             return;
         }
@@ -854,10 +866,10 @@ impl App {
                 self.reload_expanded_drawers();
                 // Line count may have changed; rebuild WITHOUT re-entering
                 // follow_selection (path is unchanged now).
-                let selected = self.list.selected();
+                let selected = self.selected;
                 self.rebuild();
                 if let Some(i) = selected {
-                    self.list.select(Some(i.min(self.rows.len() - 1)));
+                    self.selected = Some(i.min(self.rows.len() - 1));
                 }
             }
         }
@@ -973,8 +985,8 @@ impl App {
             MouseEventKind::Moved => {
                 self.hovered = self.row_at(mouse.row);
             }
-            MouseEventKind::ScrollUp => self.move_by(-3),
-            MouseEventKind::ScrollDown => self.move_by(3),
+            MouseEventKind::ScrollUp => self.scroll_view(-3),
+            MouseEventKind::ScrollDown => self.scroll_view(3),
             MouseEventKind::Down(MouseButton::Left) => return self.left_click(mouse),
             MouseEventKind::Down(MouseButton::Right) => {
                 // Reaches us only as Ctrl+right-click (herdr's passthrough
@@ -1757,7 +1769,7 @@ impl App {
 
     /// `o`: open the diff for the currently selected file row.
     fn open_selected_diff(&mut self) {
-        let Some(&row) = self.list.selected().and_then(|i| self.rows.get(i)) else {
+        let Some(&row) = self.selected.and_then(|i| self.rows.get(i)) else {
             return;
         };
         match row {
@@ -1862,17 +1874,30 @@ impl App {
 
     fn select(&mut self, index: usize) {
         if !self.rows.is_empty() {
-            self.list.select(Some(index.min(self.rows.len() - 1)));
+            self.selected = Some(index.min(self.rows.len() - 1));
+            self.snap = true;
             self.follow_selection();
         }
+    }
+
+    /// Wheel: move the VIEW only — the selection stays where it is.
+    fn scroll_view(&mut self, delta: isize) {
+        let max = self.rows.len().saturating_sub(1) as isize;
+        self.scroll = (self.scroll as isize + delta).clamp(0, max) as usize;
     }
 
     fn move_by(&mut self, delta: isize) {
         if self.rows.is_empty() {
             return;
         }
+        // First keyboard step on a selection-less list picks the first stop.
+        let Some(sel) = self.selected else {
+            let first = self.nearest_selectable(0);
+            self.select(first);
+            return;
+        };
         let len = self.rows.len() as isize;
-        let current = self.list.selected().unwrap_or(0) as isize;
+        let current = sel as isize;
         let step = if delta >= 0 { 1 } else { -1 };
         let mut next = (current + delta).clamp(0, len - 1);
         // Widget rows aren't keyboard stops: keep going in the same direction,
@@ -1891,7 +1916,7 @@ impl App {
     /// Enter/Space on the selected row: toggle a section/drawer, or move a
     /// file between the staged and unstaged lists.
     fn activate(&mut self) {
-        let Some(&row) = self.list.selected().and_then(|i| self.rows.get(i)) else {
+        let Some(&row) = self.selected.and_then(|i| self.rows.get(i)) else {
             return;
         };
         match row {
@@ -2390,10 +2415,47 @@ impl App {
         let theme = self.theme;
         let hovered = self.hovered;
         let active = self.active;
+
+        // Clamp the scroll and (keyboard nav only) walk it forward until the
+        // selection fits — rows have variable heights.
+        let h = (area.height as usize).max(1);
+        self.scroll = self.scroll.min(self.rows.len().saturating_sub(1));
+        if self.snap {
+            if let Some(sel) = self.selected {
+                if sel < self.scroll {
+                    self.scroll = sel;
+                } else {
+                    while self.scroll < sel {
+                        let used: usize = (self.scroll..=sel)
+                            .map(|i| self.row_height(self.rows[i]) as usize)
+                            .sum();
+                        if used <= h {
+                            break;
+                        }
+                        self.scroll += 1;
+                    }
+                }
+            }
+            self.snap = false;
+        }
+        // Visible slice: everything from `scroll` until the viewport is
+        // spent (plus one partially-clipped row).
+        let mut end = self.scroll;
+        let mut used = 0usize;
+        while end < self.rows.len() && used < h {
+            used += self.row_height(self.rows[end]) as usize;
+            end += 1;
+        }
+        let visible = end - self.scroll;
+
+        let selected = self.selected;
+        let list_focused = self.focus == Focus::List;
         let items: Vec<ListItem> = self
             .rows
             .iter()
             .enumerate()
+            .skip(self.scroll)
+            .take(visible)
             .map(|(i, row)| {
                 let row_hovered = hovered == Some(i);
                 let item = match *row {
@@ -2460,24 +2522,26 @@ impl App {
                         row_hovered.then_some('+'),
                     ),
                 };
-                if hovered == Some(i) {
+                if selected == Some(i) {
+                    let style = if list_focused {
+                        Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().bg(Color::Rgb(0x2a, 0x2d, 0x2e))
+                    };
+                    item.style(style)
+                } else if hovered == Some(i) {
                     item.style(Style::default().bg(HOVER_BG))
                 } else {
                     item
                 }
             })
             .collect();
-        let highlight = if self.focus == Focus::List {
-            Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().bg(Color::Rgb(0x2a, 0x2d, 0x2e))
-        };
-        let list = List::new(items).highlight_style(highlight);
-        frame.render_stateful_widget(list, area, &mut self.list);
+        frame.render_widget(List::new(items), area);
+        draw_scrollbar(frame, area, self.rows.len(), visible, self.scroll);
         self.body = BodyGeom {
             top: area.y,
             height: area.height,
-            offset: self.list.offset(),
+            offset: self.scroll,
         };
 
         // Terminal cursor inside the focused INLINE message box (multi-repo).

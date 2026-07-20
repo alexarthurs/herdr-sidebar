@@ -295,6 +295,13 @@ HACKING.md — budget time for that before promising a patched build.
   pane a corpse after 20s. "Change Folder (Type Path)…" keeps the typed prompt (absolute,
   relative, or ~-prefixed); either path swaps the PROCESS cwd, so the other view follows
   on its next switch.
+- List UX invariants (both views): NOTHING is highlighted until the user selects
+  (hover stays subtle); the wheel scrolls the VIEW only (`scroll_view`) and never
+  moves the selection; keyboard nav snaps the view to the selection; overflow shows a
+  right-edge scrollbar (`ui::draw_scrollbar`). Implementation note: ratatui's stateful
+  List AUTO-SCROLLS to keep its selection visible, which fights wheel-scrolling — both
+  views therefore window their rows manually (selected/scroll/snap fields) and render
+  a plain List of the visible slice.
 - Gotcha: after the ✧ suggestion lands, panel focus moves to the message box — letter keys
   then type text instead of triggering actions (Esc returns to the list).
 

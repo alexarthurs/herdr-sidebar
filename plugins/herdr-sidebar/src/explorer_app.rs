@@ -10,13 +10,14 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Clear, List, ListItem, Paragraph};
 
 use herdr_sidebar::actions::{self, MenuAction, MenuEntry};
 use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::ui::{
-    activity_icons, gear_icon, hits_collapse_button, sibling_panes_of, wrap_hints,
+    activity_icons, draw_scrollbar, gear_icon, hits_collapse_button, sibling_panes_of,
+    wrap_hints,
 };
 use herdr_sidebar::tree::{Row, Tree};
 
@@ -173,7 +174,14 @@ type SettingRow = (Setting, &'static str, String, bool);
 pub struct App {
     tree: Tree,
     rows: Vec<Row>,
-    state: ListState,
+    /// The user's explicit selection — `None` until they pick something
+    /// (no row is highlighted by default; hover stays subtle).
+    selected: Option<usize>,
+    /// View scroll offset in rows, independent of the selection: the wheel
+    /// moves this alone.
+    scroll: usize,
+    /// Bring the selection into view on the next draw (keyboard nav only).
+    snap: bool,
     theme: IconTheme,
     pane_ctl: Option<PaneCtl>,
     /// Pane size from the last draw; sizing decisions and PageUp/PageDown
@@ -227,10 +235,6 @@ impl App {
     pub fn new(root: PathBuf) -> Self {
         let mut tree = Tree::new(root);
         let rows = tree.rows();
-        let mut state = ListState::default();
-        if !rows.is_empty() {
-            state.select(Some(0));
-        }
         let theme = IconTheme::resolve(
             std::env::var("HERDR_SIDEBAR_ICONS")
                 .or_else(|_| std::env::var("HERDR_AA_FILETREE_ICONS"))
@@ -245,7 +249,9 @@ impl App {
         let app = Self {
             tree,
             rows,
-            state,
+            selected: None,
+            scroll: 0,
+            snap: false,
             theme,
             pane_ctl,
             last_width: DEFAULT_EXPANDED_WIDTH,
@@ -475,8 +481,8 @@ impl App {
             MouseEventKind::Moved => {
                 self.hovered = self.row_at(mouse.row);
             }
-            MouseEventKind::ScrollUp => self.move_by(-3),
-            MouseEventKind::ScrollDown => self.move_by(3),
+            MouseEventKind::ScrollUp => self.scroll_view(-3),
+            MouseEventKind::ScrollDown => self.scroll_view(3),
             MouseEventKind::Down(MouseButton::Left) => {
                 let zones = self.activity;
                 if self.merged() && mouse.row == zones.row {
@@ -1052,19 +1058,34 @@ impl App {
     }
 
     fn selected_row(&self) -> Option<&Row> {
-        self.rows.get(self.state.selected()?)
+        self.rows.get(self.selected?)
     }
 
     fn select(&mut self, index: usize) {
         if !self.rows.is_empty() {
-            self.state.select(Some(index.min(self.rows.len() - 1)));
+            self.selected = Some(index.min(self.rows.len() - 1));
+            self.snap = true;
         }
     }
 
     fn move_by(&mut self, delta: isize) {
-        let current = self.state.selected().unwrap_or(0) as isize;
-        let next = (current + delta).clamp(0, self.rows.len().saturating_sub(1) as isize);
+        if self.rows.is_empty() {
+            return;
+        }
+        // First keyboard step on a selection-less list picks the first row.
+        let Some(current) = self.selected else {
+            self.select(0);
+            return;
+        };
+        let next =
+            (current as isize + delta).clamp(0, self.rows.len().saturating_sub(1) as isize);
         self.select(next as usize);
+    }
+
+    /// Wheel: move the VIEW only — the selection stays where it is.
+    fn scroll_view(&mut self, delta: isize) {
+        let max = self.rows.len().saturating_sub(1) as isize;
+        self.scroll = (self.scroll as isize + delta).clamp(0, max) as usize;
     }
 
     /// Right/l: expand a collapsed directory, step into an expanded one.
@@ -1075,7 +1096,7 @@ impl App {
         }
         if row.expanded {
             // First child, if any, sits directly below at depth + 1.
-            let index = self.state.selected().unwrap_or(0);
+            let index = self.selected.unwrap_or(0);
             if self
                 .rows
                 .get(index + 1)
@@ -1099,7 +1120,7 @@ impl App {
             self.rebuild();
             return;
         }
-        let index = self.state.selected().unwrap_or(0);
+        let index = self.selected.unwrap_or(0);
         let depth = row.depth;
         if depth == 0 {
             return;
@@ -1128,18 +1149,23 @@ impl App {
         let selected_path = self.selected_row().map(|r| r.path.clone());
         self.rows = self.tree.rows();
         if self.rows.is_empty() {
-            self.state.select(None);
+            self.selected = None;
+            self.scroll = 0;
             return;
         }
-        let index = selected_path
-            .and_then(|p| self.rows.iter().position(|r| r.path == p))
-            .unwrap_or_else(|| {
-                self.state
-                    .selected()
-                    .unwrap_or(0)
-                    .min(self.rows.len() - 1)
-            });
-        self.state.select(Some(index));
+        // Keep an EXISTING selection on its path (or nearest index); a
+        // selection-less list stays selection-less.
+        if let Some(path) = selected_path {
+            let index = self
+                .rows
+                .iter()
+                .position(|r| r.path == path)
+                .unwrap_or_else(|| self.selected.unwrap_or(0).min(self.rows.len() - 1));
+            self.selected = Some(index);
+        } else if let Some(sel) = self.selected {
+            self.selected = Some(sel.min(self.rows.len() - 1));
+        }
+        self.scroll = self.scroll.min(self.rows.len() - 1);
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
@@ -1169,25 +1195,36 @@ impl App {
         if self.rows.is_empty() {
             frame.render_widget(Paragraph::new("  (empty)".dim().italic()), body);
         } else {
+            let h = (body.height as usize).max(1);
+            self.scroll = self.scroll.min(self.rows.len().saturating_sub(h));
+            if self.snap {
+                if let Some(sel) = self.selected {
+                    if sel < self.scroll {
+                        self.scroll = sel;
+                    } else if sel >= self.scroll + h {
+                        self.scroll = sel + 1 - h;
+                    }
+                }
+                self.snap = false;
+            }
             let theme = self.theme;
             let hovered = self.hovered;
+            let selected = self.selected;
             let items: Vec<ListItem> = self
                 .rows
                 .iter()
                 .enumerate()
-                .map(|(i, r)| row_item(r, theme, hovered == Some(i)))
+                .skip(self.scroll)
+                .take(h)
+                .map(|(i, r)| row_item(r, theme, hovered == Some(i), selected == Some(i)))
                 .collect();
-            let list = List::new(items).highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            );
-            frame.render_stateful_widget(list, body, &mut self.state);
+            frame.render_widget(List::new(items), body);
+            draw_scrollbar(frame, body, self.rows.len(), h, self.scroll);
         }
         self.body = BodyGeom {
             top: body.y,
             height: body.height,
-            offset: self.state.offset(),
+            offset: self.scroll,
         };
 
         // Collapse button at the bottom-right of the LAST footer line,
@@ -1437,7 +1474,7 @@ impl App {
 
 }
 
-fn row_item(row: &Row, theme: IconTheme, hovered: bool) -> ListItem<'static> {
+fn row_item(row: &Row, theme: IconTheme, hovered: bool, selected: bool) -> ListItem<'static> {
     let indent = "  ".repeat(row.depth);
     let arrow = if row.is_dir {
         if row.expanded { "▾ " } else { "▸ " }
@@ -1457,9 +1494,10 @@ fn row_item(row: &Row, theme: IconTheme, hovered: bool) -> ListItem<'static> {
         Span::styled(format!("{} ", icon.glyph), icon_style),
         Span::raw(row.name.clone()),
     ]));
-    if hovered {
-        // Subtler than the DarkGray selection bg; the selection's
-        // highlight_style still wins on the selected row.
+    if selected {
+        item.style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+    } else if hovered {
+        // Subtler than the selection bg — hover is a hint, not a choice.
         item.style(Style::default().bg(Color::Rgb(48, 52, 60)))
     } else {
         item
