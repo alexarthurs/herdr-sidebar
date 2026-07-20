@@ -1,6 +1,6 @@
 [package]
 name = "herdr-sidebar"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 description = "VS Code-style sidebar for herdr: file explorer + source control in one pane"
 license = "MIT"
