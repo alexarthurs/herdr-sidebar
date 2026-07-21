@@ -126,7 +126,7 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
-            merged: false,
+            merged: true,
             active: View::Explorer,
             show_hotkeys: false,
             icons: None,
