@@ -64,6 +64,10 @@ cargo clippy -- -D warnings
   the Windows variants and gate both with the item-level `platforms` key.
 - herdr panes on this machine run **Windows PowerShell 5.1**: chain with `;` / `if ($?)`,
   never `&&`.
+- **PS 5.1 mangles native-command arguments containing double quotes** — even inside a
+  single-quoted here-string: `git commit -m @'…"quoted text"…'@` splits the message at the
+  embedded `"` into multiple pathspec args (bit an agent live). Write multi-line/quoted
+  commit messages to a temp file and use `git commit -F <file>` instead.
 - **PS 5.1 prepends a UTF-8 BOM when piping into a native process's stdin** (`$json | my.exe`
   delivers `EF BB BF{...}`; verified live by both plugins). serde_json rejects a BOM before
   `{`, so anything parsing herdr JSON from stdin must strip a leading `\u{feff}` first (see
