@@ -201,7 +201,22 @@ Terminal fonts for icon glyphs (Windows, verified live):
   user font dir on mac/Linux), on a background thread so the heartbeat keeps beating.
   Answer persists as `font_prompt` in state.json; `HERDR_SIDEBAR_FONT_PROMPT=force|off`
   overrides for testing. Verified live both ways (decline → emoji; install → winget
-  registered the family machine-wide).
+  registered the family machine-wide). UX invariants (user-reported clip on a fresh
+  machine: a ~34-col pane cut the copy off after "Download and install", so the Y/N
+  affordances were invisible and the prompt read as static text): every screen
+  re-wraps to the pane width and drops blocks lowest-priority-first when short —
+  the keycap options ([Y]/[N], and [C] copy on failure) are NEVER dropped; only an
+  explicit N/Esc/q declines (stray keys are ignored, Enter = Y); the failure screen
+  shows the error plus the exact manual command (`winget install
+  DEVCOM.JetBrainsMonoNerdFont` on Windows) copyable with `c`; Esc during a hung
+  install stops waiting WITHOUT persisting a theme, so the next start re-probes.
+  Test hooks: `HERDR_SIDEBAR_FONT_INSTALL=fail|ok` simulates the installer outcome
+  (~2s delay, no real install), and pointing `HERDR_PLUGIN_STATE_DIR` at a scratch
+  dir keeps the GLOBAL state.json out of live tests. The prompt also stamps the
+  pane's identity heartbeat itself (`ipc::report_identity`, shared with both apps'
+  PaneCtl): it runs BEFORE the app loop's first stamp, and a token-less "Sidebar"
+  pane older than the launcher's ~6s wait gets REPLACE-killed by the corpse rule
+  while the user is still reading the question.
 - **WT's bundled Cascadia (checked 1.24: CascadiaCode.ttf/CascadiaMono.ttf) contains NO
   Nerd Font glyphs** — F07B/F0674/E725/E628 all absent from their cmaps (verified with
   fontTools). The "Cascadia now includes Nerd Font symbols" release is the separate
