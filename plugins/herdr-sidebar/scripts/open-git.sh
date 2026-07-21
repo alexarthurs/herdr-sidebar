@@ -33,6 +33,26 @@ if [ ! -x "$bin" ]; then
     --focus
 fi
 
+# Serialize with the auto-ensure hook (SAME lock dir): a user toggle racing a
+# focus-burst ensure otherwise docks TWO sidebars (seen live on the first
+# macOS install). Unlike the hook, the launcher WAITS for the lock rather
+# than yielding, so the user's toggle is never silently dropped.
+lock_dir="${TMPDIR:-/tmp}/herdr-sidebar-ensure.lock"
+locked=""
+for _ in $(seq 1 20); do
+  if mkdir "$lock_dir" 2>/dev/null; then locked=1; break; fi
+  sleep 0.5
+done
+if [ -z "$locked" ]; then
+  # Break locks older than 30s (a crashed holder), otherwise give up.
+  now="$(date +%s)"
+  born="$(stat -c %Y "$lock_dir" 2>/dev/null || stat -f %m "$lock_dir" 2>/dev/null || echo "$now")"
+  [ "$((now - born))" -ge 30 ] || exit 0
+  rm -rf "$lock_dir" 2>/dev/null
+  mkdir "$lock_dir" 2>/dev/null || exit 0
+fi
+trap 'rmdir "$lock_dir" 2>/dev/null' EXIT
+
 panes="$("$herdr_bin" pane list 2>/dev/null || true)"
 
 open_pane() {
@@ -41,7 +61,7 @@ open_pane() {
   fid="${fp%%	*}"
   fcwd="${fp#*	}"
   if [ -z "$fid" ]; then
-    exec "$herdr_bin" plugin pane open --plugin herdr-sidebar \
+    "$herdr_bin" plugin pane open --plugin herdr-sidebar \
       --entrypoint git --placement split --direction right --focus
   fi
 
@@ -66,7 +86,7 @@ open_pane() {
   sleep 3
   # herdr has no focus-by-id; a zoom on/off cycle focuses deterministically.
   "$herdr_bin" pane zoom "$np" --on >/dev/null 2>&1 || true
-  exec "$herdr_bin" pane zoom "$np" --off
+  "$herdr_bin" pane zoom "$np" --off
 }
 
 decision="OPEN"
@@ -78,11 +98,11 @@ case "$decision" in
   "FOCUS "*)
     pid="${decision#FOCUS }"
     "$herdr_bin" pane zoom "$pid" --on >/dev/null 2>&1 || true
-    exec "$herdr_bin" pane zoom "$pid" --off
+    "$herdr_bin" pane zoom "$pid" --off
     ;;
   "CLOSE "*)
     pid="${decision#CLOSE }"
-    exec "$herdr_bin" pane close "$pid"
+    "$herdr_bin" pane close "$pid"
     ;;
   "REPLACE "*)
     # Dead pane (stale heartbeat): close the corpse, then dock a fresh one.

@@ -473,6 +473,37 @@ Control view without touching real repos: branches, a second worktree
 staged/modified/untracked spread. Rebuild it any time with `tools/setup-playground.sh`
 (destructive: wipes and recreates all three directories).
 
+## macOS (verified live against herdr 0.7.4 on macOS 26)
+
+First clean install of both plugins on a Mac (driven over SSH), findings:
+
+- Install: `curl -fsSL https://herdr.dev/install.sh | sh` (lands in `~/.local/bin`), then
+  `herdr plugin install <owner>/<repo>[/subdir] --yes` — the `--yes` must come AFTER the
+  target (before it, the arg parser rejects the whole command), and it is REQUIRED when
+  stdin is not a TTY ("remote plugin install requires --yes when stdin is not interactive").
+- Plugin state dir on unix resolves to `XDG_STATE_HOME` else
+  `~/.local/state/herdr/plugins/<plugin-id>/` (our `state.rs` fallback; herdr injects
+  `HERDR_PLUGIN_STATE_DIR` for hooks/actions only, same as Windows).
+- **Headless/SSH herdr**: `herdr` needs a TTY. A pipeline-attached `ssh -tt` client gets a
+  degenerate window (panes ~2 rows) and every `pane split` fails with
+  `pane_split_failed: ghostty error -2` — the split result is smaller than a pane minimum.
+  Fix: run the client under a fake sized TTY:
+  `nohup script -q /dev/null /bin/zsh -c 'stty rows 54 cols 220; exec herdr' &`.
+  The server survives client death, restoring the session on next attach — but
+  `pkill -f 'herdr$'` matches the SERVER too; workspace ids change across that restart.
+- **Unix launcher vs ensure-hook race**: `open-sidebar.sh` / `open-git.sh` originally took
+  no lock, so a user toggle racing a focus-burst ensure docked TWO sidebars (seen live).
+  They now take the SAME `herdr-sidebar-ensure.lock` mkdir lock as the hook — waiting
+  (20×0.5s) instead of yielding so the toggle isn't dropped. Post-lock terminal commands
+  must NOT `exec`: exec skips the EXIT trap and leaks the lock until the 30s stale-break.
+- The `merged` (unified sidebar) default was still `false` from the experiment era — fresh
+  installs came up as a pinned separate Explorer. Flipped to `true` (existing users keep
+  their persisted value).
+- Everything else verified working on macOS unchanged: ensure hook docks on tab focus,
+  unified view switch, SCM drawers/commit box in a real repo, full-size diff preview with
+  park/restore round-trip, first-run Nerd Font prompt (curl+unzip path), heartbeat tokens,
+  herdr-notes toggle.
+
 ## Herdr workspace
 
 `herdr-layout.yaml` at the repo root describes the workspace (Coordinator tab running claude,
