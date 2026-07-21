@@ -82,29 +82,34 @@ fn output_mentions_nerd_font(text: &str) -> bool {
 pub fn nerd_font_installed() -> bool {
     use std::sync::OnceLock;
     static PROBE: OnceLock<bool> = OnceLock::new();
-    *PROBE.get_or_init(|| {
-        #[cfg(windows)]
-        {
-            let keys = [
-                r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts",
-                r"HKCU\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts",
-            ];
-            keys.iter().any(|key| {
-                std::process::Command::new("reg")
-                    .args(["query", key])
-                    .output()
-                    .map(|out| output_mentions_nerd_font(&String::from_utf8_lossy(&out.stdout)))
-                    .unwrap_or(false)
-            })
-        }
-        #[cfg(not(windows))]
-        {
-            std::process::Command::new("fc-list")
+    *PROBE.get_or_init(probe_nerd_font)
+}
+
+/// One UNCACHED probe pass — [`nerd_font_installed`] caches it for the
+/// session; the first-run font prompt re-runs it after an install to
+/// confirm the registration actually took.
+pub fn probe_nerd_font() -> bool {
+    #[cfg(windows)]
+    {
+        let keys = [
+            r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts",
+            r"HKCU\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts",
+        ];
+        keys.iter().any(|key| {
+            std::process::Command::new("reg")
+                .args(["query", key])
                 .output()
                 .map(|out| output_mentions_nerd_font(&String::from_utf8_lossy(&out.stdout)))
                 .unwrap_or(false)
-        }
-    })
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("fc-list")
+            .output()
+            .map(|out| output_mentions_nerd_font(&String::from_utf8_lossy(&out.stdout)))
+            .unwrap_or(false)
+    }
 }
 
 /// A renderable icon: the glyph plus an optional foreground color. Emoji carry

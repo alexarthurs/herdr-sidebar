@@ -481,30 +481,7 @@ impl PaneCtl {
     /// view's (one Sidebar pane satisfies both plugins' launchers), otherwise
     /// clear the other view's token.
     fn report_tokens(&self, my: View, merged: bool) {
-        // Token value = heartbeat timestamp; launchers treat stale stamps as
-        // dead panes and replace them (see launch::HEARTBEAT_STALE_SECS).
-        let now = sidebar::unix_now().to_string();
-        let mine = serde_json::json!({ my.plugin_id(): now });
-        let _ = herdr_sidebar::ipc::call_text(
-            "pane.report_metadata",
-            serde_json::json!({ "pane_id": self.pane_id, "source": my.plugin_id(), "tokens": mine }),
-        );
-        let other = my.other();
-        // Clearing needs an explicit null VALUE: report_metadata MERGES the
-        // token map, so an empty map is a no-op (verified live, herdr 0.7.1).
-        let other_tokens = if merged {
-            serde_json::json!({ other.plugin_id(): now })
-        } else {
-            serde_json::json!({ other.plugin_id(): serde_json::Value::Null })
-        };
-        let _ = herdr_sidebar::ipc::call_text(
-            "pane.report_metadata",
-            serde_json::json!({
-                "pane_id": self.pane_id,
-                "source": other.plugin_id(),
-                "tokens": other_tokens,
-            }),
-        );
+        herdr_sidebar::ipc::report_identity(&self.pane_id, my, merged);
     }
 }
 
