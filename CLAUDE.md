@@ -451,16 +451,28 @@ end-to-end twice:
    INSIDE the session (`herdr plugin link .` with the socket env set); the ensure hook
    then docks sidebars on tab focus. Keep agent panes ≤63 cols (compact no-email
    banner). Leave the session running for the other repo's reshoots.
-1. **Window**: `resize_wt.ps1 1760 996` (note the size it prints as "was" and RESTORE it
-   afterwards — the user's own size drifts between shoots). All shots assume 1760×996;
-   the crop for it is `crop.ps1 <raw> <out> 8 48 1744 940` (keeps herdr's full chrome —
-   tab strip + spaces/agents sidebar — and drops the WT titlebar).
+1. **Window (re-verified for the v0.5.x reshoot)**: the shoot window uses a dedicated
+   WT profile `herdr-shoot` (fontSize 11; added to WT settings.json — backup saved as
+   settings.json.herdr-shoot.bak) launched with
+   `wt -w new nt -p herdr-shoot --title herdr-shoot` (attach_shoot.ps1 runs inside).
+   Size the window until the TAB AREA is **138×48 cells** (1526×1011 px at font 11 —
+   verify with `pane layout`, don't trust pixels); crop is
+   `crop.ps1 <raw> <out> 8 48 1510 955`. Grid ratios: sidebar 38 cols
+   (root ratio 0.2754), agent quadrants 50 cols each (TL/TR split 0.5) — an EQUAL 2×2.
+   **Claude's banner includes the user's EMAIL at ≥73 cols** (re-measured v2.1.216;
+   the old ≤63/74+ note was stale) — keep agent panes ≤72; 50 is the floor where the
+   codex banner still fits unwrapped-ish. Old 1760×996 numbers are obsolete.
 2. **Demo repo**: `setup_demo.sh` rebuilds `C:/Users/Alex/Projects/acme-app` (staged
    docs/auth.md, modified routes.rs, dirty `acme-sdk` child repo, 1 commit ahead of a bare
    `.acme-origin.git`) — multi-repo + sync + diff all have something to show.
 3. **Stage**: new tab in this workspace with `--cwd` = acme-app, `herdr tab focus` it,
    invoke `herdr-sidebar.open-sidebar-windows`, close the tab's shell pane.
-4. **Shots** (drive via `pane send-keys`, capture via `capture.ps1 <raw.png>`):
+4. **Shots** (drive via `pane send-keys`, capture via `tools/screenshots/shot.py
+   <sidebar_pane_id[,pane2]> <name>` — it pumps SGR mouse motion into the listed panes
+   during capture so the hover title-bar buttons stay visible (their 3s linger is
+   shorter than the capture powershell's startup), captures via **capture_exact.ps1**
+   and crops; `--no-motion` for modal shots. ALWAYS `tab focus` the target tab first —
+   staging the other tab leaves focus there and you capture the wrong tab):
    *preview* — explorer view, expand src/api (`Down Down Enter`, `Down Enter`), select
    routes.rs, Enter opens the preview pane. *scm* — `2`, Down×4 to routes.rs, `o` opens
    the diff. *separated* — `s`, Enter toggles unified off (capture, then toggle back).
@@ -476,10 +488,34 @@ end-to-end twice:
 
 Hard-won capture gotchas:
 
-- `capture.ps1` is a **screen-space** copy of the WT window rect: whatever overlays that
-  region wins the pixels. A fullscreen game on the same monitor, or WT itself hung
-  ("Not Responding" — happened during a GPU/TDR wedge), silently yields garbage frames;
-  **verify every capture by actually viewing it** before shipping.
+- `capture.ps1`/`capture_titled.ps1` are **screen-space** copies: whatever overlays that
+  region wins the pixels (a fullscreen game ate a whole round of captures), and
+  capture_titled's SUBSTRING title match once grabbed the USER'S OWN terminal — Claude
+  Code's auto-set terminal title happened to contain "herdr-shoot". Use
+  **capture_exact.ps1** (exact title + PrintWindow PW_RENDERFULLCONTENT): immune to
+  occlusion, monitors, and title collisions. Still **view every capture** before shipping.
+- **NO_COLOR kills Claude Code's orange** (the CLAUDE.md crossterm gotcha, shoot-server
+  edition): agent tool shells carry NO_COLOR=1 (even when a nested probe shell says
+  otherwise — check `$env:NO_COLOR` in the ACTUAL shell), every server started from one
+  passes it to every pane, and claude renders monochrome. Start the shoot server with
+  the var explicitly removed and verify a pane echoes `NO_COLOR=[]` before staging.
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` on claude spawns also suppresses the
+  release-promo box that otherwise pushes the welcome banner out of short panes.
+- Claude re-renders its banner on RESIZE: a narrow-launch trick does not survive a
+  later widen — the email comes back. The pane width at capture time is what counts.
+- The sidebar's `state.json` is **GLOBAL** (%LOCALAPPDATA%\herdr\plugins\herdr-sidebar
+  — shared with the user's real session!). The separated shot toggles unified off and
+  needs `preview_full:false` (edit the file directly; the settings-modal Down-count is
+  view-dependent) — RESTORE merged:true + preview_full:true when done.
+- Separated shot composition: after toggling, pin Source Control to 38 cols
+  (root ratio 0.275), open the routes.rs diff (beside mode), then `pane swap` the
+  viewer to the far right so it reads SC | Explorer | diff.
+- The spaces list order = workspace CREATION order; recreating a workspace mid-shoot
+  sends it to the bottom — recreate ALL of them in roster order.
+- Fake agent rows (pane.report_agent) do NOT survive a server restart — re-report them.
+- codex shows an update notice on spawn; `npm install -g @openai/codex` then
+  `cls; codex` relaunch gives a clean banner (update prompts eat the next keystroke
+  as composer text when the skip choice was already saved).
 - The visible tab is whatever the WT window shows — `herdr tab focus <staging tab>` first,
   and re-check before each capture; pane closes/spawns can bounce focus to another tab.
 - Claude's welcome banner is width-dependent: ≲60 cols renders the compact box (no email),
