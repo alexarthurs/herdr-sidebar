@@ -26,8 +26,9 @@ use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::state::Exit;
 use herdr_sidebar::ui::{
-    activity_icons, branch_icon, draw_scrollbar, gear_icon, hits, hits_collapse_button,
-    sibling_panes_of, sparkle_icon, truncate_to, within, wrap_hints,
+    TitleAction, activity_icons, branch_icon, draw_scrollbar, gear_icon, hits,
+    hits_collapse_button, sibling_panes_of, sparkle_icon, title_action_spans,
+    title_actions_visible, title_actions_width, truncate_to, within, wrap_hints,
 };
 use herdr_sidebar::actions::{copy_to_clipboard, reveal};
 use herdr_sidebar::suggest;
@@ -539,6 +540,14 @@ pub struct App {
     hovered: Option<usize>,
     body: BodyGeom,
     zones: ClickZones,
+    /// The hover title-bar buttons' click zones from the last draw (empty
+    /// while they are hidden).
+    title_zones: Vec<(Rect, TitleAction)>,
+    /// When the mouse last moved/clicked/scrolled over this pane — the hover
+    /// approximation that shows the title-bar buttons.
+    last_mouse: Option<std::time::Instant>,
+    /// Last known mouse position, for the button hover highlight.
+    mouse_pos: Option<(u16, u16)>,
     page: usize,
     last_width: u16,
     last_height: u16,
@@ -596,6 +605,9 @@ impl App {
             hovered: None,
             body: BodyGeom::default(),
             zones: ClickZones::default(),
+            title_zones: Vec::new(),
+            last_mouse: None,
+            mouse_pos: None,
             page: 20,
             last_width: 40,
             last_height: 24,
@@ -728,6 +740,26 @@ impl App {
             }
         }
         self.refresh();
+    }
+
+    /// The title bar's Collapse All: fold every repo section and drawer. The
+    /// headers all stay visible to re-expand — except a single repo's own
+    /// header, which is only rendered in multi-repo mode, so a lone repo
+    /// keeps its Staged/Changes headers instead of vanishing entirely.
+    fn collapse_all(&mut self) {
+        let multi = self.multi();
+        for repo in &mut self.repos {
+            if multi {
+                repo.collapsed = true;
+            }
+            repo.staged_collapsed = true;
+            repo.changes_collapsed = true;
+        }
+        for drawer in &mut self.drawers {
+            drawer.expanded = false;
+        }
+        self.scroll = 0;
+        self.rebuild();
     }
 
     fn reload_expanded_drawers(&mut self) {
@@ -977,6 +1009,10 @@ impl App {
 
     /// `Some(exit)` ends the event loop, mirroring on_key.
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Exit> {
+        // Any mouse activity = "the mouse is over this pane": it shows the
+        // hover title-bar buttons until the linger expires.
+        self.last_mouse = Some(std::time::Instant::now());
+        self.mouse_pos = Some((mouse.column, mouse.row));
         if self.overlay.is_some() {
             self.overlay_mouse(mouse);
             return None;
@@ -1017,6 +1053,16 @@ impl App {
         }
         if hits(z.gear, x, y) {
             self.open_settings();
+            return None;
+        }
+        if let Some(&(_, action)) =
+            self.title_zones.iter().find(|(rect, _)| hits(*rect, x, y))
+        {
+            match action {
+                TitleAction::Refresh => self.refresh(),
+                TitleAction::CollapseAll => self.collapse_all(),
+                _ => {}
+            }
             return None;
         }
         if hits(z.sparkle, x, y) {
@@ -2290,7 +2336,6 @@ impl App {
             }
             None => String::new(),
         };
-        let branch = Span::styled(right_text, Style::default().dim());
         // In unified mode the ⚙ lives in the activity bar; standalone puts it
         // at the header's right edge.
         let gear = if self.merged() {
@@ -2299,10 +2344,29 @@ impl App {
             Some(Span::styled(format!("{} ", gear_icon(self.theme)), Style::default().dim()))
         };
         let gear_w = gear.as_ref().map(Span::width).unwrap_or(0);
+        // The hover title-action buttons sit just left of the gear.
+        self.title_zones.clear();
+        let (action_spans, actions_w) = if title_actions_visible(self.last_mouse) {
+            let actions = [TitleAction::Refresh, TitleAction::CollapseAll];
+            let w = title_actions_width(self.theme, &actions);
+            let ax = area.x + area.width.saturating_sub(gear_w as u16 + w);
+            let (spans, zones) =
+                title_action_spans(self.theme, &actions, ax, area.y, self.mouse_pos);
+            self.title_zones = zones;
+            (spans, usize::from(w))
+        } else {
+            (Vec::new(), 0)
+        };
+        // The branch text yields to the buttons and gear in narrow panes.
+        let avail = (area.width as usize)
+            .saturating_sub(left.width() + actions_w + gear_w)
+            .saturating_sub(1);
+        let branch = Span::styled(truncate_to(right_text, avail), Style::default().dim());
         let pad = (area.width as usize)
-            .saturating_sub(left.width() + branch.width() + gear_w)
+            .saturating_sub(left.width() + branch.width() + actions_w + gear_w)
             .max(1);
         let mut spans = vec![left, Span::raw(" ".repeat(pad)), branch];
+        spans.extend(action_spans);
         if let Some(gear) = gear {
             let gx = area.x + area.width.saturating_sub(gear_w as u16);
             self.zones.gear = Rect::new(gx, area.y, gear_w as u16, 1);

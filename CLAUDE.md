@@ -308,6 +308,19 @@ HACKING.md — budget time for that before promising a patched build.
   a plain List of the visible slice.
 - Gotcha: after the ✧ suggestion lands, panel focus moves to the message box — letter keys
   then type text instead of triggering actions (Esc returns to the list).
+- **Title-bar action buttons** (`ui.rs` `TitleAction`/`title_action_spans`): VS Code-style
+  hover buttons at the header's top-right (Explorer: New File / New Folder / Refresh /
+  Collapse All; SCM: Refresh / Collapse All), left of the standalone ⚙. Terminals emit NO
+  "mouse left the pane" event, so hover is approximated: any mouse event shows them, and
+  they fade `TITLE_ACTIONS_LINGER` (3s) after the last one — motion re-shows them before a
+  click ever lands, and click zones are only populated while drawn, so a click can never
+  trigger an invisible button. Material theme uses the Nerd Font's bundled **codicons**
+  (cod-new_file EA7F / cod-new_folder EA80 / cod-refresh EB37 / cod-collapse_all EAC5 —
+  VS Code's own icons; verified in the CaskaydiaCove cmap). Chips are a plain ` X ` (one
+  space each side, NO activity-bar-style slack cell): the **Mono NF build renders these
+  single-cell**, and a trailing slack cell pushes the glyph's right edge to the chip's
+  center (user-reported live); the non-Mono build just overflows into the trailing space
+  like the tree's file icons do.
 
 ### Source Control view specifics (`src/scm_app.rs`)
 
@@ -393,11 +406,26 @@ HACKING.md — budget time for that before promising a patched build.
 ### Verifying a plugin TUI end-to-end
 
 Drive the real binary in a throwaway herdr pane instead of unit-testing rendering:
-`pane split --current --no-focus --cwd <scratch repo>`, then `pane run <id> "& '<abs path to exe>'"`
-(PS call operator — a bare path splits on spaces), then `pane send-keys <id> Down Enter …`,
-capture with `pane read <id> --source visible`, and confirm side effects with plain `git`
-commands in the scratch repo. Close the pane when done. Cheap, and it catches layout
-truncation bugs unit tests can't.
+`pane split --current --direction right --no-focus --cwd <scratch repo>` (--direction is
+required), then `pane run <id> "& '<abs path to exe>'"` (PS call operator — a bare path
+splits on spaces), then `pane send-keys <id> Down Enter …`, capture with
+`pane read <id> --source visible`, and confirm side effects with plain `git` commands in
+the scratch repo. Close the pane when done. Cheap, and it catches layout truncation bugs
+unit tests can't. Run the TUI with `$env:HERDR_PANE_ID=''` so it skips identity-token
+reporting — otherwise the test pane registers as a real sidebar and the tab's launcher/
+ensure logic can fight over it.
+
+**Mouse interactions ARE drivable** (verified live): `pane.send_input` text is fed to the
+TUI's stdin, and crossterm parses SGR mouse sequences from it like any terminal input.
+Send `ESC[<35;X;YM` (motion), `ESC[<0;X;YM` (left press), `ESC[<0;X;Ym` (release) with
+1-based coords — put motion AND press/release in ONE send_input text: the event loop
+draws between events, so the motion populates hover state/click zones before the click
+lands (needed for anything hover-revealed). Two gotchas: `pane read` renders private-use
+Nerd Font glyphs as blanks — launch with `HERDR_SIDEBAR_ICONS=emoji` when you need to SEE
+icon positions in captures; and Claude Code's tools reject raw ESC bytes in commands, so
+build sequences programmatically (`[char]27`, or JSON `\u001b` via a params file — see
+`herdr_ipc.py` pattern: open `\\.\pipe\<HERDR_SOCKET_PATH>` from Python; PS 5.1's
+FileStream refuses pipe paths).
 
 ## README screenshots (how-to)
 
