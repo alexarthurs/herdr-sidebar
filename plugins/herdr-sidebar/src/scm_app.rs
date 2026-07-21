@@ -28,7 +28,8 @@ use herdr_sidebar::state::Exit;
 use herdr_sidebar::ui::{
     TitleAction, activity_icons, branch_icon, draw_scrollbar, gear_icon, hits,
     hits_collapse_button, sibling_panes_of, sparkle_icon, title_action_spans,
-    title_actions_visible, title_actions_width, truncate_to, within, wrap_hints,
+    title_actions_visible, title_actions_width, truncate_to, within, wrap_footer_message,
+    wrap_hints,
 };
 use herdr_sidebar::actions::{copy_to_clipboard, reveal};
 use herdr_sidebar::suggest;
@@ -2634,25 +2635,30 @@ impl App {
         }
     }
 
-    /// Footer content: a flash message, or the hotkey hints wrapped so they
-    /// never clip in a narrow sidebar.
+    /// Footer content: a flash message or confirm prompt (WRAPPED — the
+    /// one-line assumption used to clip them mid-question in narrow panes),
+    /// or the hotkey hints.
     fn footer_lines(&self, width: u16) -> Vec<Line<'static>> {
-        if let Some(Overlay::ConfirmDiscard { entry, .. }) = &self.overlay {
-            return vec![Line::styled(
-                format!(" Discard changes to '{}'? (y/N)", entry.path),
-                Style::default().fg(DELETED),
-            )];
-        }
-        if let Some(Overlay::ConfirmGit { prompt, .. }) = &self.overlay {
-            return vec![Line::styled(format!(" {prompt}"), Style::default().fg(DELETED))];
-        }
-        if let Some((text, is_error)) = &self.flash {
-            let color = if *is_error { DELETED } else { UNTRACKED };
-            let prefix = if *is_error { " " } else { " ✓ " };
-            return vec![Line::styled(
-                format!("{prefix}{text}"),
-                Style::default().fg(color),
-            )];
+        let message: Option<(String, Color)> = match (&self.overlay, &self.flash) {
+            (Some(Overlay::ConfirmDiscard { entry, .. }), _) => Some((
+                format!("Discard changes to '{}'? (y/N)", entry.path),
+                DELETED,
+            )),
+            (Some(Overlay::ConfirmGit { prompt, .. }), _) => {
+                Some((prompt.clone(), DELETED))
+            }
+            (_, Some((text, is_error))) => {
+                let color = if *is_error { DELETED } else { UNTRACKED };
+                let prefix = if *is_error { "" } else { "✓ " };
+                Some((format!("{prefix}{text}"), color))
+            }
+            _ => None,
+        };
+        if let Some((msg, color)) = message {
+            return wrap_footer_message(&msg, width, 4)
+                .into_iter()
+                .map(|l| Line::styled(l, Style::default().fg(color)))
+                .collect();
         }
         if !self.show_hotkeys() {
             return Vec::new();

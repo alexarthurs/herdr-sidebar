@@ -17,8 +17,8 @@ use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::ui::{
     TitleAction, activity_icons, draw_scrollbar, gear_icon, hits, hits_collapse_button,
-    sibling_panes_of, title_action_spans, title_actions_visible, title_actions_width,
-    truncate_to, wrap_hints,
+    input_tail, sibling_panes_of, title_action_spans, title_actions_visible,
+    title_actions_width, truncate_to, wrap_footer_message, wrap_hints,
 };
 use herdr_sidebar::tree::{Row, Tree};
 
@@ -1292,22 +1292,36 @@ impl App {
             Paragraph::new("«".bold().fg(Color::LightBlue)).alignment(Alignment::Center),
             footer_button,
         );
-        let footer_lines: Vec<Line> = if let Some(notice) = &self.notice {
-            vec![format!(" {notice}").fg(Color::Yellow).into()]
+        let footer_lines: Vec<Line> = if let Some((msg, color)) = self.footer_message() {
+            wrap_footer_message(&msg, footer.width, 4)
+                .into_iter()
+                .map(|l| l.fg(color).into())
+                .collect()
         } else {
             match &self.overlay {
-                Some(Overlay::Prompt { title, input, .. }) => vec![Line::from(vec![
-                    Span::styled(format!(" {title}: "), Style::default().bold()),
-                    Span::raw(input.clone()),
-                    Span::styled("█", Style::default().dim()),
-                    Span::styled("  (⏎ ok · esc cancel)", Style::default().dim()),
-                ])],
-                Some(Overlay::ConfirmDelete { path, .. }) => {
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    vec![format!(" Delete '{name}' permanently? (y/N)").fg(Color::Red).into()]
+                Some(Overlay::Prompt { title, input, .. }) => {
+                    // One line, always: drop the hint when narrow, and show
+                    // the TAIL of a long input so the cursor stays visible.
+                    let head = format!(" {title}: ");
+                    let hint = "  (⏎ ok · esc cancel)";
+                    let fixed = Span::raw(head.as_str()).width() + 1 + 4;
+                    let width = usize::from(footer.width);
+                    let hint_fits =
+                        fixed + Span::raw(hint).width() + Span::raw(input.as_str()).width()
+                            <= width;
+                    let avail = width
+                        .saturating_sub(fixed)
+                        .saturating_sub(if hint_fits { Span::raw(hint).width() } else { 0 })
+                        .max(4);
+                    let mut spans = vec![
+                        Span::styled(head, Style::default().bold()),
+                        Span::raw(input_tail(input, avail)),
+                        Span::styled("█", Style::default().dim()),
+                    ];
+                    if hint_fits {
+                        spans.push(Span::styled(hint, Style::default().dim()));
+                    }
+                    vec![Line::from(spans)]
                 }
                 _ if self.show_hotkeys() => {
                     wrap_hints(&self.hints(), frame.area().width, 3)
@@ -1422,13 +1436,34 @@ impl App {
         hints
     }
 
-    /// Rows the footer needs at `width` (the hint lines; notices and prompts
-    /// always fit in one of them).
+    /// Rows the footer needs at `width`: notices and confirms WRAP in narrow
+    /// panes (a one-line assumption used to clip "Delete '…' permanently?
+    /// (y/N)" mid-question); the name prompt stays one line (its input
+    /// shrinks instead); hints wrap as before.
     fn footer_height(&self, width: u16) -> u16 {
-        if self.notice.is_some() || self.overlay.is_some() || !self.show_hotkeys() {
-            return 1; // notices, prompts, and the « button share one line
+        if let Some((msg, _)) = self.footer_message() {
+            return wrap_footer_message(&msg, width, 4).len() as u16;
+        }
+        if self.overlay.is_some() || !self.show_hotkeys() {
+            return 1; // prompt / menu / settings share one line with «
         }
         wrap_hints(&self.hints(), width, 3).len() as u16
+    }
+
+    /// The uniform-style footer message, if one is active: a notice, or the
+    /// delete confirm. Shared by footer_height and draw so they agree.
+    fn footer_message(&self) -> Option<(String, Color)> {
+        if let Some(notice) = &self.notice {
+            return Some((notice.clone(), Color::Yellow));
+        }
+        if let Some(Overlay::ConfirmDelete { path, .. }) = &self.overlay {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            return Some((format!("Delete '{name}' permanently? (y/N)"), Color::Red));
+        }
+        None
     }
 
     /// The VS Code activity bar: view-switcher icons plus a detach button.

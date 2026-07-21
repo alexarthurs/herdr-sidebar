@@ -210,6 +210,60 @@ pub fn hits(rect: Rect, x: u16, y: u16) -> bool {
 
 /// Cut `s` down to at most `max` display columns, ending in `…` when trimmed.
 /// Empty when even the ellipsis wouldn't fit.
+/// Word-wrap a uniform-style footer message to the pane width: one leading
+/// space per line, `reserve` columns kept clear of the right edge (the «
+/// button zone). Unbreakable words longer than a line hard-break. Never
+/// returns an empty vec — footers size themselves from `.len()`.
+pub fn wrap_footer_message(text: &str, width: u16, reserve: u16) -> Vec<String> {
+    let max = usize::from(width.max(12))
+        .saturating_sub(usize::from(reserve))
+        .max(6);
+    let fits = |s: &str, extra: usize| Span::raw(s).width() + extra <= max;
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::from(" ");
+    for word in text.split_whitespace() {
+        let sep = usize::from(cur.len() > 1);
+        if !fits(&cur, sep + Span::raw(word).width()) && cur.len() > 1 {
+            lines.push(std::mem::replace(&mut cur, String::from(" ")));
+        }
+        if cur.len() > 1 {
+            cur.push(' ');
+        }
+        if fits(&cur, Span::raw(word).width()) {
+            cur.push_str(word);
+        } else {
+            for c in word.chars() {
+                if !fits(&cur, 2) {
+                    lines.push(std::mem::replace(&mut cur, String::from(" ")));
+                }
+                cur.push(c);
+            }
+        }
+    }
+    if cur.len() > 1 || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// Keep the TAIL of a typed input so the cursor end stays visible when the
+/// text outgrows the prompt line (shell-style).
+pub fn input_tail(input: &str, max: usize) -> String {
+    if Span::raw(input).width() <= max {
+        return input.to_string();
+    }
+    let mut out = String::new();
+    for c in input.chars().rev() {
+        let mut candidate = c.to_string();
+        candidate.push_str(&out);
+        if Span::raw(candidate.as_str()).width() + 1 > max {
+            break;
+        }
+        out = candidate;
+    }
+    format!("…{out}")
+}
+
 pub fn truncate_to(s: String, max: usize) -> String {
     if Span::raw(s.as_str()).width() <= max {
         return s;
@@ -277,6 +331,41 @@ pub fn sibling_panes_of(pane_list_json: &str, my_pane_id: &str, other: View) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn messages_wrap_to_narrow_panes() {
+        // The reported clip: a delete confirm in a ~26-col pane.
+        let lines = wrap_footer_message("Delete 'test' permanently? (y/N)", 26, 4);
+        assert!(lines.len() > 1, "must wrap, not clip: {lines:?}");
+        for l in &lines {
+            assert!(l.starts_with(' '), "leading space kept: {l:?}");
+            assert!(
+                ratatui::text::Span::raw(l.as_str()).width() <= 22,
+                "line within width-reserve: {l:?}"
+            );
+        }
+        assert_eq!(
+            lines.join("").split_whitespace().collect::<Vec<_>>().join(" "),
+            "Delete 'test' permanently? (y/N)",
+            "no words lost"
+        );
+        // Wide panes stay single-line.
+        assert_eq!(wrap_footer_message("Delete 'test' permanently? (y/N)", 80, 4).len(), 1);
+        // An unbreakable long word hard-breaks instead of overflowing.
+        let long = wrap_footer_message("Deleted averyveryverylongfilename.extension", 20, 4);
+        assert!(long.len() > 1);
+        // Empty input still yields one (empty) line — footers size from len().
+        assert_eq!(wrap_footer_message("", 30, 4).len(), 1);
+    }
+
+    #[test]
+    fn input_tail_keeps_cursor_end_visible() {
+        assert_eq!(input_tail("short", 10), "short");
+        let tail = input_tail("a-very-long-typed-filename.txt", 12);
+        assert!(tail.starts_with('…'), "{tail:?}");
+        assert!(tail.ends_with(".txt"), "{tail:?}");
+        assert!(ratatui::text::Span::raw(tail.as_str()).width() <= 12);
+    }
 
     #[test]
     fn hints_wrap_instead_of_clipping() {
