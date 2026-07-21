@@ -19,7 +19,7 @@
 
 id = "herdr-sidebar"
 name = "herdr-sidebar"
-version = "0.5.2"
+version = "0.6.0"
 description = "VS Code-style sidebar: file explorer + source control (with ✧ AI commit messages) in one herdr pane."
 min_herdr_version = "0.7.0"
 platforms = ["linux", "macos", "windows"]
