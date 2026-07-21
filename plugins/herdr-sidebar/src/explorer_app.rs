@@ -16,8 +16,9 @@ use herdr_sidebar::actions::{self, MenuAction, MenuEntry};
 use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::ui::{
-    activity_icons, draw_scrollbar, gear_icon, hits_collapse_button, sibling_panes_of,
-    wrap_hints,
+    TitleAction, activity_icons, draw_scrollbar, gear_icon, hits, hits_collapse_button,
+    sibling_panes_of, title_action_spans, title_actions_visible, title_actions_width,
+    truncate_to, wrap_hints,
 };
 use herdr_sidebar::tree::{Row, Tree};
 
@@ -202,6 +203,15 @@ pub struct App {
     /// The ⚙ button's rect from the last draw (activity bar in unified mode,
     /// header row otherwise).
     gear: Rect,
+    /// The hover title-bar buttons' click zones from the last draw (empty
+    /// while they are hidden).
+    title_zones: Vec<(Rect, TitleAction)>,
+    /// When the mouse last moved/clicked/scrolled over this pane — the hover
+    /// approximation that shows the title-bar buttons (see
+    /// [`herdr_sidebar::ui::TITLE_ACTIONS_LINGER`]).
+    last_mouse: Option<std::time::Instant>,
+    /// Last known mouse position, for the button hover highlight.
+    mouse_pos: Option<(u16, u16)>,
     /// Last left-click (row index, when) for double-click detection.
     last_click: Option<(usize, std::time::Instant)>,
     /// Last heartbeat stamp, throttling the token refresh.
@@ -265,6 +275,9 @@ impl App {
             other_exe,
             activity: ActivityZones::default(),
             gear: Rect::default(),
+            title_zones: Vec::new(),
+            last_mouse: None,
+            mouse_pos: None,
             last_click: None,
             last_beat: std::time::Instant::now(),
             picking: None,
@@ -473,6 +486,10 @@ impl App {
 
     /// `Some(exit)` ends the event loop, mirroring on_key.
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Exit> {
+        // Any mouse activity = "the mouse is over this pane": it shows the
+        // hover title-bar buttons until the linger expires.
+        self.last_mouse = Some(std::time::Instant::now());
+        self.mouse_pos = Some((mouse.column, mouse.row));
         if self.overlay.is_some() {
             self.overlay_mouse(mouse);
             return None;
@@ -500,6 +517,14 @@ impl App {
                     && mouse.row < g.y + g.height
                 {
                     self.open_settings();
+                    return None;
+                }
+                if let Some(&(_, action)) = self
+                    .title_zones
+                    .iter()
+                    .find(|(rect, _)| hits(*rect, mouse.column, mouse.row))
+                {
+                    self.title_action(action);
                     return None;
                 }
                 if hits_collapse_button(mouse.column, mouse.row, self.last_width, self.last_height)
@@ -536,6 +561,31 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    /// One of the hover title-bar buttons was clicked.
+    fn title_action(&mut self, action: TitleAction) {
+        match action {
+            TitleAction::NewFile => self.open_create_prompt(false),
+            TitleAction::NewFolder => self.open_create_prompt(true),
+            TitleAction::Refresh => self.refresh_tree(),
+            TitleAction::CollapseAll => {
+                self.tree.collapse_all();
+                self.scroll = 0;
+                self.rebuild();
+            }
+        }
+    }
+
+    /// The title-bar New File / New Folder buttons: prompt for a name,
+    /// creating in the VS Code target (see [`create_target_dir`]).
+    fn open_create_prompt(&mut self, folder: bool) {
+        let dir = create_target_dir(self.selected_row(), self.tree.root_path());
+        self.overlay = Some(Overlay::Prompt {
+            title: if folder { "New folder" } else { "New file" }.into(),
+            input: String::new(),
+            kind: if folder { PromptKind::NewFolder(dir) } else { PromptKind::NewFile(dir) },
+        });
     }
 
     /// Open the file context menu at the click position, targeting the row
@@ -1289,21 +1339,44 @@ impl App {
         }
     }
 
-    /// The workspace-name header; standalone mode puts the ⚙ at its right edge
-    /// (unified mode's ⚙ lives in the activity bar instead).
+    /// The workspace-name header (the root folder's name, uppercase like VS
+    /// Code); standalone mode puts the ⚙ at its right edge (unified mode's ⚙
+    /// lives in the activity bar instead), and the hover title-action buttons
+    /// sit just left of it.
     fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
-        let root_label = format!(" {}", self.tree.root_name().to_uppercase());
+        let gear = (!self.merged()).then(|| {
+            Span::styled(format!("{} ", gear_icon(self.theme)), Style::default().dim())
+        });
+        let gear_w = gear.as_ref().map(Span::width).unwrap_or(0) as u16;
+        self.title_zones.clear();
+        let (action_spans, actions_w) = if title_actions_visible(self.last_mouse) {
+            let actions = [
+                TitleAction::NewFile,
+                TitleAction::NewFolder,
+                TitleAction::Refresh,
+                TitleAction::CollapseAll,
+            ];
+            let w = title_actions_width(self.theme, &actions);
+            let ax = area.x + area.width.saturating_sub(gear_w + w);
+            let (spans, zones) =
+                title_action_spans(self.theme, &actions, ax, area.y, self.mouse_pos);
+            self.title_zones = zones;
+            (spans, w)
+        } else {
+            (Vec::new(), 0)
+        };
+        // The name yields to the buttons and gear in narrow panes.
+        let avail = usize::from(area.width.saturating_sub(gear_w + actions_w));
+        let root_label =
+            truncate_to(format!(" {}", self.tree.root_name().to_uppercase()), avail);
         let name = Span::styled(root_label, Style::default().bold().fg(Color::LightBlue));
-        let mut spans = vec![name];
-        if !self.merged() {
-            let gear =
-                Span::styled(format!("{} ", gear_icon(self.theme)), Style::default().dim());
-            let gear_w = gear.width() as u16;
+        let pad = usize::from(area.width)
+            .saturating_sub(name.width() + usize::from(actions_w) + usize::from(gear_w));
+        let mut spans = vec![name, Span::raw(" ".repeat(pad))];
+        spans.extend(action_spans);
+        if let Some(gear) = gear {
             let gx = area.x + area.width.saturating_sub(gear_w);
             self.gear = Rect::new(gx, area.y, gear_w, 1);
-            let pad = usize::from(area.width)
-                .saturating_sub(spans[0].width() + usize::from(gear_w));
-            spans.push(Span::raw(" ".repeat(pad)));
             spans.push(gear);
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1519,6 +1592,17 @@ fn step_menu(entries: &[MenuEntry], from: usize, direction: isize) -> usize {
     }
 }
 
+/// VS Code's creation target for the title-bar New File / New Folder buttons:
+/// a selected folder itself, a selected file's parent, or the workspace root
+/// when nothing is selected.
+fn create_target_dir(selected: Option<&Row>, root: PathBuf) -> PathBuf {
+    match selected {
+        Some(row) if row.is_dir => row.path.clone(),
+        Some(row) => row.path.parent().map(Path::to_path_buf).unwrap_or(root),
+        None => root,
+    }
+}
+
 /// True when a click at pane-local `column` lands on a row's disclosure
 /// chevron (the two cells right after the depth indent).
 fn hits_chevron(column: u16, depth: usize) -> bool {
@@ -1572,6 +1656,28 @@ mod tests {
         assert!(hits_chevron(2, 1));
         assert!(hits_chevron(3, 1));
         assert!(!hits_chevron(0, 1), "indent cell");
+    }
+
+    #[test]
+    fn create_target_matches_vscode_semantics() {
+        let root = PathBuf::from("C:\\ws");
+        let dir = Row {
+            path: root.join("src"),
+            name: "src".into(),
+            is_dir: true,
+            depth: 0,
+            expanded: false,
+        };
+        let file = Row {
+            path: root.join("src").join("main.rs"),
+            name: "main.rs".into(),
+            is_dir: false,
+            depth: 1,
+            expanded: false,
+        };
+        assert_eq!(create_target_dir(Some(&dir), root.clone()), root.join("src"));
+        assert_eq!(create_target_dir(Some(&file), root.clone()), root.join("src"));
+        assert_eq!(create_target_dir(None, root.clone()), root);
     }
 
     #[test]

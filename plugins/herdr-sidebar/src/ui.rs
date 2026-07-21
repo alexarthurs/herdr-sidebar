@@ -116,6 +116,90 @@ pub fn branch_icon(theme: IconTheme) -> &'static str {
     }
 }
 
+/// One VS Code-style title-bar action button (the hover row at the top-right
+/// of a panel's title bar).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TitleAction {
+    NewFile,
+    NewFolder,
+    Refresh,
+    CollapseAll,
+}
+
+/// How long the title-bar action buttons stay visible after the last mouse
+/// event. Terminals emit no "mouse left the pane" event, so hover can only be
+/// approximated: any mouse activity over the pane shows the buttons, and they
+/// fade after this linger (any further motion re-shows them instantly).
+pub const TITLE_ACTIONS_LINGER: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The hover approximation described on [`TITLE_ACTIONS_LINGER`].
+pub fn title_actions_visible(last_mouse: Option<std::time::Instant>) -> bool {
+    last_mouse.is_some_and(|at| at.elapsed() < TITLE_ACTIONS_LINGER)
+}
+
+/// Theme-matched glyph for a title-bar action: VS Code's own codicons in the
+/// material theme (the Nerd Font ships the cod- set), VS16-free fallbacks
+/// otherwise.
+pub fn title_action_icon(theme: IconTheme, action: TitleAction) -> &'static str {
+    match (theme, action) {
+        (IconTheme::Material, TitleAction::NewFile) => "\u{ea7f}", //  cod-new_file
+        (IconTheme::Material, TitleAction::NewFolder) => "\u{ea80}", //  cod-new_folder
+        (IconTheme::Material, TitleAction::Refresh) => "\u{eb37}", //  cod-refresh
+        (IconTheme::Material, TitleAction::CollapseAll) => "\u{eac5}", //  cod-collapse_all
+        (IconTheme::Emoji, TitleAction::NewFile) => "📄",
+        (IconTheme::Emoji, TitleAction::NewFolder) => "📁",
+        (IconTheme::Emoji, TitleAction::Refresh) => "⟳",
+        (IconTheme::Emoji, TitleAction::CollapseAll) => "⊟",
+    }
+}
+
+/// A button's rendered chip: one space each side, NO extra slack cell. The
+/// Mono Nerd Font build renders codicons in a single cell, so a trailing
+/// slack cell (as the activity bar uses) pushes the glyph's center left of
+/// the chip's — its right edge lands mid-chip (user-reported). In the
+/// non-Mono build the glyph just overflows into its own trailing space, which
+/// is how the tree's file icons already render.
+fn title_action_chip(theme: IconTheme, action: TitleAction) -> String {
+    format!(" {} ", title_action_icon(theme, action))
+}
+
+/// Total rendered width of the button row, for right-aligning it.
+pub fn title_actions_width(theme: IconTheme, actions: &[TitleAction]) -> u16 {
+    actions
+        .iter()
+        .map(|&a| Span::raw(title_action_chip(theme, a)).width() as u16)
+        .sum()
+}
+
+/// Build the title-bar buttons as spans (left edge at `x` on row `y`) plus
+/// their click zones for hit-testing. The chip under `hover` renders with a
+/// keycap background so the mouse target is visible before the click.
+pub fn title_action_spans(
+    theme: IconTheme,
+    actions: &[TitleAction],
+    x: u16,
+    y: u16,
+    hover: Option<(u16, u16)>,
+) -> (Vec<Span<'static>>, Vec<(Rect, TitleAction)>) {
+    let mut spans = Vec::new();
+    let mut zones = Vec::new();
+    let mut cx = x;
+    for &action in actions {
+        let chip = title_action_chip(theme, action);
+        let w = Span::raw(chip.as_str()).width() as u16;
+        let rect = Rect::new(cx, y, w, 1);
+        let style = if hover.is_some_and(|(hx, hy)| hits(rect, hx, hy)) {
+            Style::default().bg(KEYCAP_BG)
+        } else {
+            Style::default().dim()
+        };
+        spans.push(Span::styled(chip, style));
+        zones.push((rect, action));
+        cx += w;
+    }
+    (spans, zones)
+}
+
 pub fn within(x: u16, (start, end): (u16, u16)) -> bool {
     (start..end).contains(&x)
 }
@@ -234,6 +318,39 @@ mod tests {
         assert!(cut.ends_with('…'));
         assert!(Span::raw(cut.as_str()).width() <= 8);
         assert_eq!(truncate_to("abc".into(), 1), "");
+    }
+
+    #[test]
+    fn title_action_zones_are_contiguous_and_match_width() {
+        for theme in [IconTheme::Material, IconTheme::Emoji] {
+            let actions = [
+                TitleAction::NewFile,
+                TitleAction::NewFolder,
+                TitleAction::Refresh,
+                TitleAction::CollapseAll,
+            ];
+            let (spans, zones) = title_action_spans(theme, &actions, 10, 0, None);
+            assert_eq!(spans.len(), 4);
+            let mut x = 10;
+            for (rect, _) in &zones {
+                assert_eq!(rect.x, x, "chips tile left to right with no gaps");
+                x += rect.width;
+            }
+            let total: u16 = zones.iter().map(|(r, _)| r.width).sum();
+            assert_eq!(total, title_actions_width(theme, &actions));
+            // A click inside the second chip maps to New Folder.
+            let (rect, action) = zones[1];
+            assert!(hits(rect, rect.x, 0));
+            assert_eq!(action, TitleAction::NewFolder);
+        }
+    }
+
+    #[test]
+    fn title_actions_hide_without_recent_mouse() {
+        assert!(!title_actions_visible(None));
+        assert!(title_actions_visible(Some(std::time::Instant::now())));
+        let old = std::time::Instant::now() - TITLE_ACTIONS_LINGER - std::time::Duration::from_secs(1);
+        assert!(!title_actions_visible(Some(old)));
     }
 
     #[test]

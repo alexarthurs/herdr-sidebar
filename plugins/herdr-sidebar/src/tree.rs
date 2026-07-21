@@ -70,6 +70,11 @@ impl Tree {
         self.expanded.remove(path);
     }
 
+    /// Collapse every expanded directory (the title bar's Collapse All).
+    pub fn collapse_all(&mut self) {
+        self.expanded.clear();
+    }
+
     pub fn toggle(&mut self, path: &Path) {
         if !self.expanded.remove(path) {
             self.expanded.insert(path.to_path_buf());
@@ -213,6 +218,21 @@ mod tests {
             names(&tree.rows()),
             vec![("src".into(), 0), ("Cargo.toml".into(), 0)]
         );
+    }
+
+    #[test]
+    fn collapse_all_closes_every_expanded_dir() {
+        let tmp = TempDir::new("collapseall");
+        tmp.mkdir("a/inner");
+        tmp.mkdir("b");
+        let mut tree = Tree::new(tmp.0.clone());
+        tree.expand(&tmp.0.join("a"));
+        tree.expand(&tmp.0.join("a/inner"));
+        tree.expand(&tmp.0.join("b"));
+        assert!(tree.rows().iter().any(|r| r.expanded));
+        tree.collapse_all();
+        assert!(tree.rows().iter().all(|r| !r.expanded));
+        assert_eq!(tree.rows().len(), 2, "only the top level remains");
     }
 
     #[test]
