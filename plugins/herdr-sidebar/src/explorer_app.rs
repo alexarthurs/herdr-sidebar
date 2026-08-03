@@ -140,6 +140,7 @@ enum Setting {
     UnifiedSidebar,
     IconTheme,
     PreviewFull,
+    AutoOpen,
     HiddenFiles,
     Hotkeys,
     Folder,
@@ -800,6 +801,12 @@ impl App {
                 true,
             ),
             (
+                Setting::AutoOpen,
+                "Auto open on focus",
+                if self.sidebar_state.auto_open { "on" } else { "off" }.to_string(),
+                true,
+            ),
+            (
                 Setting::Folder,
                 "Change folder…",
                 self.tree.root_name(),
@@ -833,6 +840,10 @@ impl App {
             }
             Setting::PreviewFull => {
                 self.sidebar_state.preview_full = !self.sidebar_state.preview_full;
+                sidebar::save_state(self.sidebar_state);
+            }
+            Setting::AutoOpen => {
+                self.sidebar_state.auto_open = !self.sidebar_state.auto_open;
                 sidebar::save_state(self.sidebar_state);
             }
             Setting::Folder => {

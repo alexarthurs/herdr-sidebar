@@ -47,6 +47,10 @@ fn main() -> std::io::Result<()> {
             println!("{}", launch::focused_tab(&read_stdin()?));
             return Ok(());
         }
+        Some("--state-auto-open") => {
+            println!("{}", if state::load_state().auto_open { "true" } else { "false" });
+            return Ok(());
+        }
         Some("--preview") => {
             let Some(control) = std::env::args().nth(2) else {
                 eprintln!("herdr-sidebar: --preview needs a control-file path");
@@ -58,7 +62,7 @@ fn main() -> std::io::Result<()> {
         Some(other) => {
             eprintln!("herdr-sidebar: unknown argument `{other}`");
             eprintln!(
-                "usage: herdr-sidebar [--view explorer|git|--preview <ctl>|--launch-decision [git]|--focused-pane|--open-plan|--focused-tab]"
+                "usage: herdr-sidebar [--view explorer|git|--preview <ctl>|--launch-decision [git]|--focused-pane|--open-plan|--focused-tab|--state-auto-open]"
             );
             std::process::exit(2);
         }

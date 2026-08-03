@@ -30,6 +30,11 @@ trap 'rmdir "$lock_dir" 2>/dev/null' EXIT
 panes="$("$herdr_bin" pane list 2>/dev/null || true)"
 [ -n "$panes" ] || exit 0
 
+# Respect the global "auto open" setting (⚙ Settings → "Auto open on
+# focus"): when off, this quiet hook never reopens the sidebar. The user's
+# explicit `open-sidebar` toggle bypasses this (scripts/open-sidebar.sh).
+[ "$("$bin" --state-auto-open 2>/dev/null || echo false)" = "true" ] || exit 0
+
 decision="$(printf '%s' "$panes" | "$bin" --launch-decision 2>/dev/null || true)"
 [ "$decision" = "OPEN" ] || exit 0
 
