@@ -47,6 +47,13 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
     let Some(_lock) = Lock::acquire() else {
         return Ok(());
     };
+    // Quiet mode respects the global "auto open" setting: when off, the
+    // focus/tab/workspace hooks never re-open the sidebar. Toggle mode (the
+    // user's explicit `open-sidebar` action) ignores it, so the sidebar is
+    // still summonable on demand.
+    if !toggle && !crate::state::load_state().auto_open {
+        return Ok(());
+    }
     let panes = ipc::call_text("pane.list", serde_json::json!({}))?;
     let tab = launch::focused_tab(&panes);
     let snooze_dir = snooze::dir();
@@ -238,5 +245,34 @@ mod tests {
         assert!(!snooze::is_set(&dir, "w1:t2"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Quiet mode (the focus hooks) honors the global `auto_open` setting:
+    /// when off, `run(false)` must return BEFORE any socket I/O, so it can be
+    /// exercised without a live herdr. Toggle mode (`run(true)`) would attempt
+    /// the socket call and so is not unit-tested here.
+    #[test]
+    fn quiet_mode_skips_when_auto_open_disabled() {
+        let state_dir = std::env::temp_dir()
+            .join(format!("aa-ft-auto-open-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let _ = std::fs::write(
+            state_dir.join("state.json"),
+            b"{\"auto_open\":false}",
+        )
+        .unwrap();
+        // SAFETY: this test fully owns HERDR_PLUGIN_STATE_DIR for its brief
+        // run; no other thread reads process env here, and we restore it
+        // (remove_var) before returning.
+        unsafe { std::env::set_var("HERDR_PLUGIN_STATE_DIR", &state_dir); }
+
+        let result = run(false);
+
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("HERDR_PLUGIN_STATE_DIR"); }
+        let _ = std::fs::remove_dir_all(&state_dir);
+
+        assert!(result.is_ok(), "quiet run with auto_open=false must short-circuit, not reach the socket");
     }
 }

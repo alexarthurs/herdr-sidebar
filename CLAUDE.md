@@ -308,6 +308,17 @@ HACKING.md — budget time for that before promising a patched build.
   forwards it via the `env` param (`state::spawn_env`). Legacy
   `%APPDATA%\herdr\aa-sidebar.json` is migrated on first load. A fresh sidebar opens on
   the last-active view.
+- "Auto open on focus" ⚙ Settings row (persisted `auto_open`, **default false**): when
+  off, the quiet `[[events]]` hooks (`pane.focused`/`tab.created`/`workspace.created`/
+  `tab.focused`/`workspace.focused` → `ensure-sidebar.sh` / the Windows ensure sidecar)
+  NEVER re-dock the sidebar — it stays closed until the user summons it via the
+  `open-sidebar`/`open-sidebar-windows` toggle action (which bypasses the setting). This
+  is a **global** setting (one `state.json`, shared across every workspace/tab), and
+  upgrading users with no `auto_open` in their persisted state get the new default
+  (`false`) — i.e. existing users who liked the always-reopen behavior must re-enable it
+  in ⚙ Settings after upgrading. The ensure scripts read it via the binary's
+  `--state-auto-open` stdin-less mode (prints `true`/`false`); the sidecar calls
+  `state::load_state().auto_open` directly in `ensure::run` (toggle mode ignores it).
 - The unified pane reports BOTH identity tokens (`herdr-sidebar-explorer`,
   `herdr-sidebar-git`) so either launcher decision finds it; turning unified off clears
   the other token (null value — report_metadata MERGES token maps).

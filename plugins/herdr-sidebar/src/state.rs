@@ -121,6 +121,11 @@ pub struct State {
     /// park in a background tab; Esc restores them) instead of a 50/50
     /// split.
     pub preview_full: bool,
+    /// Whether the quiet focus/tab/workspace hooks re-open the sidebar.
+    /// `false` (the default) keeps the sidebar closed until the user
+    /// summons it via the toggle action; existing users who liked the old
+    /// always-reopen behavior flip this on in ⚙ Settings.
+    pub auto_open: bool,
 }
 
 impl Default for State {
@@ -132,6 +137,7 @@ impl Default for State {
             icons: None,
             font_prompt_done: false,
             preview_full: true,
+            auto_open: false,
         }
     }
 }
@@ -206,13 +212,14 @@ pub fn save_state(state: State) {
         Some(theme) => format!(",\"icons\":\"{}\"", theme.state_name()),
         None => String::new(),
     };
-    let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"preview_full\":{}{icons}}}",
+let json = format!(
+        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"preview_full\":{},\"auto_open\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.show_hotkeys,
         state.font_prompt_done,
-        state.preview_full
+        state.preview_full,
+        state.auto_open
     );
     let _ = std::fs::write(path, json);
 }
@@ -248,6 +255,10 @@ pub fn parse_state(json: &str) -> State {
             .get("preview_full")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.preview_full),
+        auto_open: value
+            .get("auto_open")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.auto_open),
     }
 }
 
@@ -264,12 +275,17 @@ mod tests {
             icons: Some(crate::icons::IconTheme::Emoji),
             font_prompt_done: true,
             preview_full: false,
+            auto_open: true,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"preview_full\":false,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"preview_full\":false,\"auto_open\":true,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         assert_eq!(parse_state("garbage"), State::default());
         assert_eq!(parse_state("{\"active\":\"bogus\"}"), State::default());
+        // Default is auto_open=false (keep closed until the user opens it).
+        assert!(!State::default().auto_open);
+        assert!(!parse_state("{}").auto_open);
+        assert!(parse_state("{\"auto_open\":true}").auto_open);
     }
 
     #[test]
