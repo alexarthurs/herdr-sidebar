@@ -307,9 +307,11 @@ impl App {
             return;
         };
         let payload = herdr_sidebar::viewer::file_request(path);
+        let doc_key = herdr_sidebar::viewer::doc_key_for_file(path);
         if let Err(e) = herdr_sidebar::viewer::open_in_pane(
             &pane_id,
             &self.tree.root_path(),
+            &doc_key,
             &payload,
         ) {
             self.notice = Some(e);

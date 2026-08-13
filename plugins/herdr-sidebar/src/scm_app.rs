@@ -1782,8 +1782,10 @@ impl App {
             .flatten();
         let payload =
             herdr_sidebar::viewer::show_request(repo.git.root(), &spec, path.as_deref());
+        let doc_key =
+            herdr_sidebar::viewer::doc_key_for_show(repo.git.root(), &spec, path.as_deref());
         if let Err(e) =
-            herdr_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &payload)
+            herdr_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &doc_key, &payload)
         {
             self.flash = Some((e, true));
         }
@@ -1806,8 +1808,10 @@ impl App {
         };
         let payload =
             herdr_sidebar::viewer::diff_request(repo.git.root(), &entry.path, kind);
+        let doc_key =
+            herdr_sidebar::viewer::doc_key_for_diff(repo.git.root(), &entry.path, kind);
         if let Err(e) =
-            herdr_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &payload)
+            herdr_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &doc_key, &payload)
         {
             self.flash = Some((e, true));
         }

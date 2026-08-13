@@ -64,11 +64,17 @@ fn write_scratch_file(path: &Path, contents: &str) -> std::io::Result<()> {
     std::fs::write(path, contents)
 }
 
-/// The control file a tab's viewer watches. Keyed by TAB so a sidebar in
-/// any tab can steer any preview; the spawning sidebar's pane id churns on
-/// every redeploy and ensure-hook heal, the tab does not.
-pub fn control_path_for_tab(tab_id: &str) -> PathBuf {
-    scratch_dir().join(format!("herdr-sidebar-preview-{}.ctl", tab_id.replace(':', "_")))
+/// The control file a viewer watches, named after the VIEWER's own pane.
+///
+/// The path is argv for the viewer process, fixed for its life, so it must
+/// key on something that outlives a tab move — the preview pane itself. The
+/// sidebar's pane id would be wrong (it churns on every redeploy and
+/// ensure-hook heal) and so would the tab (previews get moved between tabs).
+pub fn control_path_for_pane(preview_pane_id: &str) -> PathBuf {
+    scratch_dir().join(format!(
+        "herdr-sidebar-preview-{}.ctl",
+        preview_pane_id.replace(':', "_")
+    ))
 }
 
 /// Identity of the document a preview shows, stamped into the preview
@@ -415,26 +421,18 @@ fn report_identity(doc_name: &str, doc_key: Option<&str>) {
 
 /// Close our own pane (ends this process with it), handing focus back to
 /// the sidebar in our tab so the user lands where they were clicking.
-fn close_own_pane(control: &Path) {
-    if let Some(tab) = owner_tab_id(control)
-        && let Ok(list) = ipc::call_text("pane.list", serde_json::json!({}))
-        && let Some(sidebar) = sidebar_in_tab(&list, &tab)
-    {
-        let _ = ipc::call_text("pane.focus", serde_json::json!({ "pane_id": sidebar }));
+fn close_own_pane() {
+    let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else { return };
+    if pane_id.is_empty() {
+        return;
     }
-    if let Ok(pane_id) = std::env::var("HERDR_PANE_ID")
-        && !pane_id.is_empty()
-    {
-        let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
+    if let Ok(list) = ipc::call_text("pane.list", serde_json::json!({})) {
+        let tab = crate::launch::tab_of(&list, &pane_id);
+        if let Some(sidebar) = sidebar_in_tab(&list, &tab) {
+            let _ = ipc::call_text("pane.focus", serde_json::json!({ "pane_id": sidebar }));
+        }
     }
-}
-
-/// The tab whose control file this is — the inverse of
-/// [`control_path_for_tab`].
-fn owner_tab_id(control: &Path) -> Option<String> {
-    let stem = control.file_stem()?.to_str()?;
-    let id = stem.strip_prefix("herdr-sidebar-preview-")?.replace('_', ":");
-    (!id.is_empty()).then_some(id)
+    let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
 }
 
 /// The sidebar pane in `tab`, so a closing preview can hand focus back.
@@ -508,7 +506,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => {
-                        close_own_pane(control);
+                        close_own_pane();
                         break Ok(());
                     }
                     KeyCode::Up | KeyCode::Char('k') => doc.scroll = doc.scroll.saturating_sub(1),
@@ -523,7 +521,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                     MouseEventKind::ScrollUp => doc.scroll = doc.scroll.saturating_sub(3),
                     MouseEventKind::ScrollDown => doc.scroll = (doc.scroll + 3).min(max),
                     MouseEventKind::Down(MouseButton::Left) if mouse.row == 0 => {
-                        close_own_pane(control);
+                        close_own_pane();
                         break Ok(());
                     }
                     _ => {}
@@ -637,57 +635,60 @@ fn draw_doc(frame: &mut Frame, doc: &mut Doc, theme: IconTheme) -> usize {
 // Client side: how the sidebar views open things in the viewer pane.
 // ---------------------------------------------------------------------------
 
-/// Write `payload` to the caller's control file and make sure a live viewer
-/// pane exists beside it (spawning one to our right when needed). Errors are
-/// human-readable notices.
-pub fn open_in_pane(my_pane_id: &str, spawn_cwd: &Path, payload: &str) -> Result<(), String> {
-    let my_tab = ipc::call_text("pane.list", serde_json::json!({}))
-        .ok()
-        .map(|list| crate::launch::tab_of(&list, my_pane_id))
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| "preview needs a herdr tab".to_string())?;
-    let control = control_path_for_tab(&my_tab);
-    write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
-    let full = crate::state::load_state().preview_full;
+/// Open `payload` (identified by `doc_key`) following VS Code tab rules:
+/// jump to the document's existing tab, else overwrite the one ephemeral
+/// tab, else create a tab for it.
+pub fn open_in_pane(
+    my_pane_id: &str,
+    spawn_cwd: &Path,
+    doc_key: &str,
+    payload: &str,
+) -> Result<(), String> {
+    let list = ipc::call_text("pane.list", serde_json::json!({}))
+        .map_err(|e| format!("preview failed: {e}"))?;
+    let previews = previews_in(&list);
 
-    // Measure the sidebar's width share FIRST: closing a stale viewer below
-    // leaves the sidebar momentarily alone at full width, which reads as a
-    // meaningless ~1.0 (that ordering is how the half-width sidebar bug
-    // happened — the old clamp turned the degenerate 1.0 into 0.5).
-    let mut pre_park_frac = owner_frac(my_pane_id);
+    // 1. Already open — jump to it, pinned or not.
+    if let Some(p) = preview_for_doc(&previews, doc_key) {
+        let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": p.tab_id }));
+        return Ok(());
+    }
 
-    // A live viewer in this tab follows the control file by itself; a DEAD
-    // one (stale heartbeat) is closed and replaced.
-    if let Ok(json) = ipc::call_text("pane.list", serde_json::json!({})) {
-        match viewer_pane_in_tab(&json, my_pane_id) {
-            Some((_, false)) => {
-                if full {
-                    // Covers toggling the setting on while a preview is
-                    // already open beside the sidebar.
-                    park_others(my_pane_id);
-                    enforce_owner_width(my_pane_id, pre_park_frac.unwrap_or(0.3));
-                }
-                return Ok(());
-            }
-            Some((id, true)) => {
-                let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }));
-            }
-            None => {
-                // The viewer died with panes parked (redeploy, tab surgery):
-                // bring them home before opening fresh — and re-measure,
-                // since the restore just rebuilt the layout.
-                restore_parked(my_pane_id);
-                pre_park_frac = owner_frac(my_pane_id).or(pre_park_frac);
-            }
-        }
+    // 2. Overwrite the ephemeral tab.
+    if let Some(p) = reusable_preview(&previews) {
+        write_scratch_file(&control_path_for_pane(&p.pane_id), payload)
+            .map_err(|e| format!("preview failed: {e}"))?;
+        let _ = ipc::call_text(
+            "tab.rename",
+            serde_json::json!({ "tab_id": p.tab_id, "label": tab_label(doc_key, false) }),
+        );
+        let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": p.tab_id }));
+        return Ok(());
     }
-    if full {
-        park_others(my_pane_id);
-    }
-    spawn_viewer_pane(my_pane_id, spawn_cwd, &control, pre_park_frac)?;
-    if full {
-        enforce_owner_width(my_pane_id, pre_park_frac.unwrap_or(0.3));
-    }
+
+    // 3. Nothing reusable — a tab of its own.
+    spawn_preview_tab(my_pane_id, spawn_cwd, doc_key, payload)
+}
+
+/// Spawn a preview and give it its own tab. The pane is split beside the
+/// sidebar first and then MOVED out: `tab.create` would leave a stray shell
+/// pane, and the move reuses the proven `pane.move` path. The `tab.created`
+/// hook docks a sidebar alongside it, so the tree stays reachable.
+fn spawn_preview_tab(
+    my_pane_id: &str,
+    spawn_cwd: &Path,
+    doc_key: &str,
+    payload: &str,
+) -> Result<(), String> {
+    let new_pane = spawn_viewer_pane(my_pane_id, spawn_cwd, payload)?;
+    let _ = ipc::call_text(
+        "pane.move",
+        serde_json::json!({
+            "pane_id": new_pane,
+            "destination": { "type": "new_tab", "label": tab_label(doc_key, false) },
+            "focus": true,
+        }),
+    );
     Ok(())
 }
 
@@ -845,15 +846,14 @@ fn reusable_preview(previews: &[PreviewPane]) -> Option<PreviewPane> {
 fn spawn_viewer_pane(
     my_pane_id: &str,
     spawn_cwd: &Path,
-    control: &Path,
-    pre_park_frac: Option<f64>,
-) -> Result<(), String> {
+    payload: &str,
+) -> Result<String, String> {
     let layout = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": my_pane_id })).ok();
     let neighbor = layout.as_deref().and_then(|json| right_neighbor(json, my_pane_id));
     // Splitting ourselves (no neighbor — e.g. everything else just parked,
     // leaving us momentarily full-width): keep the width the sidebar had
     // BEFORE the park, not a ballooned 30-50%.
-    let own_frac = pre_park_frac.unwrap_or(0.3);
+    let own_frac = 0.3;
     let (target, ratio, needs_swap) = match &neighbor {
         Some(id) => (id.clone(), 0.5, true),
         None => (my_pane_id.to_string(), own_frac, false),
@@ -879,6 +879,10 @@ fn spawn_viewer_pane(
             serde_json::json!({ "source_pane_id": new_pane, "target_pane_id": target }),
         );
     }
+    // Seed the control file BEFORE launching: the path is argv, so it is
+    // fixed for the process's life and must name the pane, not its tab.
+    let control = control_path_for_pane(&new_pane);
+    write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "herdr-sidebar".to_string());
@@ -897,7 +901,7 @@ fn spawn_viewer_pane(
     // The split/swap can move focus with the slot; stay in the sidebar so
     // the user keeps clicking.
     let _ = ipc::call_text("pane.focus", serde_json::json!({ "pane_id": my_pane_id }));
-    Ok(())
+    Ok(new_pane)
 }
 
 
@@ -1283,18 +1287,15 @@ mod tests {
     ]}}"#;
 
     #[test]
-    fn control_files_are_addressed_by_tab_not_by_sidebar_pane() {
-        // Any sidebar can drive another tab's preview by naming its tab.
-        assert_eq!(control_path_for_tab("w4:t7"), control_path_for_tab("w4:t7"));
-        assert_ne!(control_path_for_tab("w4:t7"), control_path_for_tab("w4:t8"));
+    fn control_files_are_addressed_by_the_preview_pane() {
+        // The path is argv for the viewer, so it must key on something that
+        // survives a tab move: the preview pane itself. Any sidebar can then
+        // steer any preview by naming its pane.
+        assert_eq!(control_path_for_pane("w4:p9"), control_path_for_pane("w4:p9"));
+        assert_ne!(control_path_for_pane("w4:p9"), control_path_for_pane("w4:pA"));
         assert!(
-            control_path_for_tab("w4:t7").to_string_lossy().contains("w4_t7"),
+            control_path_for_pane("w4:p9").to_string_lossy().contains("w4_p9"),
             "colons are not filename-safe"
-        );
-        // ...and the viewer can read the tab back off its own control file.
-        assert_eq!(
-            owner_tab_id(&control_path_for_tab("w4:t7")).as_deref(),
-            Some("w4:t7")
         );
     }
 
