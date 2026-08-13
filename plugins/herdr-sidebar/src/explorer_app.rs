@@ -225,9 +225,14 @@ impl App {
     pub fn new(root: PathBuf) -> Self {
         let mut tree = Tree::new(root);
         // Mirror the tree the user was already looking at: a sidebar docked
-        // into a brand-new preview tab starts with the same dirs expanded.
-        tree.set_expanded(sidebar::load_expanded());
+        // into a brand-new preview tab starts with the same dirs expanded
+        // and the same row selected.
+        let saved = sidebar::load_tree_state();
+        tree.set_expanded(saved.expanded);
         let rows = tree.rows();
+        let restored_selection = saved
+            .selected
+            .and_then(|want| rows.iter().position(|r| r.path == want));
         let theme = IconTheme::resolve(
             std::env::var("HERDR_SIDEBAR_ICONS")
                 .or_else(|_| std::env::var("HERDR_AA_FILETREE_ICONS"))
@@ -242,9 +247,9 @@ impl App {
         let app = Self {
             tree,
             rows,
-            selected: None,
+            selected: restored_selection,
             scroll: 0,
-            snap: false,
+            snap: restored_selection.is_some(),
             theme,
             pane_ctl,
             last_width: DEFAULT_EXPANDED_WIDTH,
@@ -1123,7 +1128,18 @@ impl App {
         if !self.rows.is_empty() {
             self.selected = Some(index.min(self.rows.len() - 1));
             self.snap = true;
+            self.persist_tree();
         }
+    }
+
+    /// Record the tree's shape and selection for the NEXT sidebar to start —
+    /// a tab opened for a preview comes up mirroring this one. Not a live
+    /// sync: already-open tabs are never revisited.
+    fn persist_tree(&self) {
+        sidebar::save_tree_state(&sidebar::TreeState {
+            expanded: self.tree.expanded_paths(),
+            selected: self.selected_row().map(|r| r.path.clone()),
+        });
     }
 
     fn move_by(&mut self, delta: isize) {
@@ -1204,10 +1220,8 @@ impl App {
     /// still exists (else the nearest valid index).
     fn rebuild(&mut self) {
         self.hovered = None;
-        // Every expand/collapse funnels through here, so this is the one
-        // place the persisted shape has to be refreshed for new tabs.
-        sidebar::save_expanded(&self.tree.expanded_paths());
         let selected_path = self.selected_row().map(|r| r.path.clone());
+        self.persist_tree();
         self.rows = self.tree.rows();
         if self.rows.is_empty() {
             self.selected = None;

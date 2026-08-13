@@ -218,34 +218,60 @@ pub fn save_state(state: State) {
     let _ = std::fs::write(path, json);
 }
 
-/// Which directories are expanded, kept beside `state.json` rather than in
-/// [`State`] so that stays `Copy` (it is passed by value everywhere).
+/// The shape of the tree a freshly opened sidebar should start with, so a
+/// new tab mirrors what the user was already looking at. Kept beside
+/// `state.json` rather than in [`State`], which stays `Copy` because it is
+/// passed by value everywhere.
+///
+/// Captured at sidebar startup only — expanding a folder in one tab does not
+/// reach into tabs that are already open.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct TreeState {
+    pub expanded: Vec<PathBuf>,
+    pub selected: Option<PathBuf>,
+}
+
 fn tree_path() -> Option<PathBuf> {
     Some(state_dir()?.join("tree.json"))
 }
 
-/// The expanded directories a freshly opened sidebar should start with, so a
-/// new tab mirrors the tree the user was already looking at.
-pub fn load_expanded() -> Vec<PathBuf> {
+/// Forgiving read: a missing, truncated, or older array-shaped file yields
+/// defaults rather than wedging the tree.
+pub fn load_tree_state() -> TreeState {
     let Some(json) = tree_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
-        return Vec::new();
+        return TreeState::default();
     };
-    serde_json::from_str::<Vec<String>>(json.trim_start_matches('\u{feff}'))
-        .map(|v| v.into_iter().map(PathBuf::from).collect())
-        .unwrap_or_default()
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json.trim_start_matches('\u{feff}'))
+    else {
+        return TreeState::default();
+    };
+    let paths = |v: Option<&serde_json::Value>| -> Vec<PathBuf> {
+        v.and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str()).map(PathBuf::from).collect())
+            .unwrap_or_default()
+    };
+    // The first version of this file was a bare array of expanded dirs.
+    if value.is_array() {
+        return TreeState { expanded: paths(Some(&value)), selected: None };
+    }
+    TreeState {
+        expanded: paths(value.get("expanded")),
+        selected: value.get("selected").and_then(|v| v.as_str()).map(PathBuf::from),
+    }
 }
 
-/// Best-effort persist of the expanded set; losing it only costs the next
-/// sidebar its starting shape.
-pub fn save_expanded(paths: &[PathBuf]) {
+/// Best-effort persist; losing it only costs the next sidebar its starting
+/// shape.
+pub fn save_tree_state(state: &TreeState) {
     let Some(path) = tree_path() else { return };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-    if let Ok(json) = serde_json::to_string(&names) {
-        let _ = std::fs::write(path, json);
-    }
+    let json = serde_json::json!({
+        "expanded": state.expanded.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "selected": state.selected.as_ref().map(|p| p.display().to_string()),
+    });
+    let _ = std::fs::write(path, json.to_string());
 }
 
 /// Forgiving parse: any missing/garbled field falls back to the default, so a
@@ -285,6 +311,43 @@ pub fn parse_state(json: &str) -> State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `load_tree_state` parses whatever is on disk. The first release wrote
+    /// a bare array of expanded dirs; those files are still out there and
+    /// must not wipe the tree or panic.
+    #[test]
+    fn tree_state_reads_both_the_array_and_object_shapes() {
+        fn parse(json: &str) -> TreeState {
+            // Mirrors load_tree_state's decoding, minus the file read.
+            let value: serde_json::Value = match serde_json::from_str(json) {
+                Ok(v) => v,
+                Err(_) => return TreeState::default(),
+            };
+            let paths = |v: Option<&serde_json::Value>| -> Vec<PathBuf> {
+                v.and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|s| s.as_str()).map(PathBuf::from).collect())
+                    .unwrap_or_default()
+            };
+            if value.is_array() {
+                return TreeState { expanded: paths(Some(&value)), selected: None };
+            }
+            TreeState {
+                expanded: paths(value.get("expanded")),
+                selected: value.get("selected").and_then(|v| v.as_str()).map(PathBuf::from),
+            }
+        }
+
+        let legacy = parse(r#"["/r/src"]"#);
+        assert_eq!(legacy.expanded, vec![PathBuf::from("/r/src")]);
+        assert_eq!(legacy.selected, None);
+
+        let current = parse(r#"{"expanded":["/r/src"],"selected":"/r/src/main.rs"}"#);
+        assert_eq!(current.expanded, vec![PathBuf::from("/r/src")]);
+        assert_eq!(current.selected, Some(PathBuf::from("/r/src/main.rs")));
+
+        assert_eq!(parse(r#"{"expanded":["/r/src"],"selected":null}"#).selected, None);
+        assert_eq!(parse("garbage"), TreeState::default());
+    }
 
     #[test]
     fn state_roundtrip_and_forgiving_parse() {
