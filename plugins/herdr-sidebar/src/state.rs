@@ -117,10 +117,6 @@ pub struct State {
     /// The first-run "install a Nerd Font?" prompt was answered (either
     /// way) — never show it again.
     pub font_prompt_done: bool,
-    /// Previews/diffs take the whole area beside the sidebar (other panes
-    /// park in a background tab; Esc restores them) instead of a 50/50
-    /// split.
-    pub preview_full: bool,
     /// The focus/created event hooks auto-dock a sidebar into tabs that lack
     /// one. Off = the sidebar stays closed until the user invokes the
     /// open-sidebar toggle themselves (issue #8); the explicit toggle always
@@ -136,7 +132,6 @@ impl Default for State {
             show_hotkeys: false,
             icons: None,
             font_prompt_done: false,
-            preview_full: true,
             auto_open: true,
         }
     }
@@ -213,12 +208,11 @@ pub fn save_state(state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"preview_full\":{},\"auto_open\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"auto_open\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.show_hotkeys,
         state.font_prompt_done,
-        state.preview_full,
         state.auto_open
     );
     let _ = std::fs::write(path, json);
@@ -251,10 +245,6 @@ pub fn parse_state(json: &str) -> State {
             .get("font_prompt")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.font_prompt_done),
-        preview_full: value
-            .get("preview_full")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(default.preview_full),
         auto_open: value
             .get("auto_open")
             .and_then(|v| v.as_bool())
@@ -274,10 +264,9 @@ mod tests {
             show_hotkeys: true,
             icons: Some(crate::icons::IconTheme::Emoji),
             font_prompt_done: true,
-            preview_full: false,
             auto_open: false,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"preview_full\":false,\"auto_open\":false,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"auto_open\":false,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open on.

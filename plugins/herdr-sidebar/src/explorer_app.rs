@@ -139,7 +139,6 @@ enum Overlay {
 enum Setting {
     UnifiedSidebar,
     IconTheme,
-    PreviewFull,
     AutoOpen,
     HiddenFiles,
     Hotkeys,
@@ -815,12 +814,6 @@ impl App {
                 true,
             ),
             (
-                Setting::PreviewFull,
-                "Full-size preview",
-                if self.sidebar_state.preview_full { "on" } else { "off" }.to_string(),
-                true,
-            ),
-            (
                 Setting::AutoOpen,
                 "Auto-open sidebar",
                 if self.sidebar_state.auto_open { "on" } else { "off" }.to_string(),
@@ -856,10 +849,6 @@ impl App {
             }
             Setting::Hotkeys => {
                 self.sidebar_state.show_hotkeys = !self.sidebar_state.show_hotkeys;
-                sidebar::save_state(self.sidebar_state);
-            }
-            Setting::PreviewFull => {
-                self.sidebar_state.preview_full = !self.sidebar_state.preview_full;
                 sidebar::save_state(self.sidebar_state);
             }
             Setting::AutoOpen => {

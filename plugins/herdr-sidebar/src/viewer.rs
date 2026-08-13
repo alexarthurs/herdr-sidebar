@@ -38,7 +38,7 @@ const POLL: Duration = Duration::from_millis(250);
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_LINES: usize = 5000;
 
-/// Directory for the sidebar's private scratch files (control/park files).
+/// Directory for the sidebar's private scratch files (viewer control files).
 /// `std::env::temp_dir()` can be a shared, world-writable directory (unix
 /// `/tmp`) where our filenames are predictable from the pane id; scope our
 /// files into a private, mode-0700 subdirectory so another local user can't
@@ -723,37 +723,8 @@ fn spawn_preview_tab(
     Ok(PreviewTarget { pane_id: new_pane, tab_id })
 }
 
-/// The owner pane's share of its tab width right now — `None` when the
-/// geometry carries no signal (a full-width sidebar in a stacked or
-/// single-pane layout would read as ~1.0 and, clamped, once produced a
-/// half-tab sidebar — user-reported).
-fn owner_frac(owner: &str) -> Option<f64> {
-    let layout = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": owner })).ok()?;
-    let msg = serde_json::from_str::<LayoutMsg2>(&layout).ok()?;
-    let body = msg.result.layout;
-    body.panes
-        .iter()
-        .find(|p| p.pane_id.as_deref() == Some(owner))
-        .and_then(|p| p.rect)
-        .map(|r| r.width as f64 / body.area.width.max(1) as f64)
-        .filter(|f| (0.02..0.55).contains(f))
-        .map(|f| f.max(0.1))
-}
-
-/// Pin the sidebar's width after the preview opens: in full mode the tab is
-/// sidebar | viewer, so the root split ratio IS the sidebar's share. Makes
-/// the width deterministic no matter which spawn path ran.
-fn enforce_owner_width(owner: &str, frac: f64) {
-    let _ = ipc::call_text(
-        "layout.set_split_ratio",
-        serde_json::json!({ "pane_id": owner, "path": [], "ratio": frac }),
-    );
-}
-
-/// Close this tab's viewer pane if one is open (Esc from the sidebar),
-/// bringing any parked panes home first.
+/// Close this tab's viewer pane if one is open (Esc from the sidebar).
 pub fn close_in_tab(my_pane_id: &str) {
-    restore_parked(my_pane_id);
     let Ok(json) = ipc::call_text("pane.list", serde_json::json!({})) else {
         return;
     };
@@ -881,9 +852,8 @@ fn spawn_viewer_pane(
 ) -> Result<String, String> {
     let layout = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": my_pane_id })).ok();
     let neighbor = layout.as_deref().and_then(|json| right_neighbor(json, my_pane_id));
-    // Splitting ourselves (no neighbor — e.g. everything else just parked,
-    // leaving us momentarily full-width): keep the width the sidebar had
-    // BEFORE the park, not a ballooned 30-50%.
+    // Splitting ourselves (no neighbor): a third of the tab, matching the
+    // sidebar's usual share.
     let own_frac = 0.3;
     let (target, ratio, needs_swap) = match &neighbor {
         Some(id) => (id.clone(), 0.5, true),
@@ -936,326 +906,6 @@ fn spawn_viewer_pane(
 }
 
 
-// ---------------------------------------------------------------------------
-// Full-size mode: park the tab's other panes while a preview is open.
-// ---------------------------------------------------------------------------
-
-/// Park plan for a TAB, recorded beside the control file so either process
-/// (sidebar or viewer) can restore. Keyed by tab id and never by the
-/// sidebar's pane id: the sidebar respawns with a fresh pane id on redeploy
-/// and on ensure-hook healing, while the tab the parked panes must return to
-/// does not change. A pane-id key made the "already parked?" guard miss, so
-/// every preview re-parked into another new tab and orphaned the old plan.
-fn park_path_for_tab(tab: &str) -> PathBuf {
-    scratch_dir().join(format!("herdr-sidebar-park-{}.json", tab.replace(':', "_")))
-}
-
-/// `owner`'s plan path resolved from a `pane list` payload; `None` when that
-/// pane sits in no tab (it has already gone away).
-fn park_path_in(pane_list_json: &str, owner: &str) -> Option<PathBuf> {
-    let tab = crate::launch::tab_of(pane_list_json, owner);
-    (!tab.is_empty()).then(|| park_path_for_tab(&tab))
-}
-
-/// Live lookup of `owner`'s plan path, falling back to OUR own pane's tab so
-/// the viewer can still restore after the sidebar that spawned it is gone.
-fn park_path(owner: &str) -> Option<PathBuf> {
-    let list = ipc::call_text("pane.list", serde_json::json!({})).ok()?;
-    park_path_in(&list, owner).or_else(|| {
-        let me = std::env::var("HERDR_PANE_ID").ok()?;
-        park_path_in(&list, &me)
-    })
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
-struct RectJ {
-    x: i64,
-    y: i64,
-    width: i64,
-    height: i64,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ParkPlan {
-    /// The tab the panes came from (and go back to).
-    tab: String,
-    /// Sidebar's share of the tab width at park time, for the re-split.
-    owner_ratio: f64,
-    /// Parked panes with their ORIGINAL rects, reading order.
-    panes: Vec<(String, RectJ)>,
-}
-
-#[derive(serde::Deserialize)]
-struct LayoutMsg2 {
-    result: LayoutRes2,
-}
-#[derive(serde::Deserialize)]
-struct LayoutRes2 {
-    layout: LayoutBody2,
-}
-#[derive(serde::Deserialize)]
-struct LayoutBody2 {
-    area: RectJ,
-    panes: Vec<LayoutPane2>,
-}
-#[derive(serde::Deserialize)]
-struct LayoutPane2 {
-    pane_id: Option<String>,
-    rect: Option<RectJ>,
-}
-
-/// Pane ids in `owner`'s tab that are OURS (sidebar views / preview) and so
-/// never get parked, from a `pane.list` response.
-fn our_panes_in_tab(pane_list_json: &str, owner: &str) -> Vec<String> {
-    #[derive(serde::Deserialize)]
-    struct Msg {
-        result: Res,
-    }
-    #[derive(serde::Deserialize)]
-    struct Res {
-        #[serde(default)]
-        panes: Vec<Pane>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Pane {
-        pane_id: Option<String>,
-        tab_id: Option<String>,
-        label: Option<String>,
-        #[serde(default)]
-        tokens: serde_json::Map<String, serde_json::Value>,
-    }
-    let Ok(msg) = serde_json::from_str::<Msg>(pane_list_json.trim_start_matches('\u{feff}'))
-    else {
-        return vec![owner.to_string()];
-    };
-    let tab = msg
-        .result
-        .panes
-        .iter()
-        .find(|p| p.pane_id.as_deref() == Some(owner))
-        .and_then(|p| p.tab_id.clone());
-    msg.result
-        .panes
-        .iter()
-        .filter(|p| p.tab_id == tab)
-        .filter(|p| {
-            p.pane_id.as_deref() == Some(owner)
-                || matches!(
-                    p.label.as_deref(),
-                    Some("Sidebar" | "Explorer" | "Source Control" | "Preview")
-                )
-                || p.tokens.keys().any(|k| k.starts_with("herdr-sidebar"))
-        })
-        .filter_map(|p| p.pane_id.clone())
-        .collect()
-}
-
-/// Move every non-ours pane of `owner`'s tab into a background tab and
-/// record how to put them back. No-op when nothing to park or a plan
-/// already exists.
-fn park_others(owner: &str) {
-    let Ok(list) = ipc::call_text("pane.list", serde_json::json!({})) else { return };
-    let tab = crate::launch::tab_of(&list, owner);
-    if tab.is_empty() {
-        return;
-    }
-    let plan_path = park_path_for_tab(&tab);
-    if plan_path.exists() {
-        return;
-    }
-    let ours = our_panes_in_tab(&list, owner);
-    let Ok(layout) = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": owner }))
-    else {
-        return;
-    };
-    let Ok(msg) = serde_json::from_str::<LayoutMsg2>(&layout) else { return };
-    let body = msg.result.layout;
-    let owner_ratio = body
-        .panes
-        .iter()
-        .find(|p| p.pane_id.as_deref() == Some(owner))
-        .and_then(|p| p.rect)
-        .map(|r| r.width as f64 / body.area.width.max(1) as f64)
-        .filter(|f| (0.02..0.55).contains(f))
-        .map(|f| f.max(0.1))
-        .unwrap_or(0.3);
-    let mut others: Vec<(String, RectJ)> = body
-        .panes
-        .into_iter()
-        .filter_map(|p| Some((p.pane_id?, p.rect?)))
-        .filter(|(id, _)| !ours.contains(id))
-        .collect();
-    if others.is_empty() {
-        return;
-    }
-    others.sort_by_key(|(_, r)| (r.y, r.x));
-
-    // First pane opens the park tab; the rest pile in (their layout there
-    // is irrelevant — the tab is never focused).
-    let mut park_tab = String::new();
-    for (i, (id, _)) in others.iter().enumerate() {
-        let dest = if i == 0 {
-            serde_json::json!({ "type": "new_tab" })
-        } else {
-            serde_json::json!({ "type": "tab", "tab_id": park_tab, "split": "right" })
-        };
-        let _ = ipc::call_text(
-            "pane.move",
-            serde_json::json!({ "pane_id": id, "destination": dest, "focus": false }),
-        );
-        if i == 0 {
-            if let Ok(list2) = ipc::call_text("pane.list", serde_json::json!({})) {
-                park_tab = crate::launch::tab_of(&list2, id);
-            }
-            if park_tab.is_empty() || park_tab == tab {
-                return; // move didn't take; don't strand a half-plan
-            }
-        }
-    }
-    let plan = ParkPlan { tab, owner_ratio, panes: others };
-    if let Ok(json) = serde_json::to_string(&plan) {
-        let _ = write_scratch_file(&plan_path, &json);
-    }
-}
-
-/// Bring parked panes home, rebuilding their grid from the recorded rects
-/// (each pane re-splits the recorded left/top neighbor at the recorded
-/// proportions). Returns whether a plan existed.
-pub fn restore_parked(owner: &str) -> bool {
-    let Some(path) = park_path(owner) else { return false };
-    let Ok(json) = std::fs::read_to_string(&path) else { return false };
-    let _ = std::fs::remove_file(&path);
-    let Ok(plan) = serde_json::from_str::<ParkPlan>(&json) else { return false };
-
-    let viewer = ipc::call_text("pane.list", serde_json::json!({}))
-        .ok()
-        .and_then(|l| viewer_pane_in_tab(&l, owner).map(|(id, _)| id));
-
-    let tree = build_tree(&plan.panes);
-    // The tree's representative (top-left-most) pane comes home first,
-    // splitting whatever holds the region: the preview (which closes right
-    // after, handing everything over) or the sidebar itself.
-    let (anchor, ratio) = match &viewer {
-        Some(v) => (v.clone(), 0.1),
-        None => (owner.to_string(), plan.owner_ratio),
-    };
-    move_into(&plan.tab, rep(&tree), &anchor, "right", ratio);
-    replay(&plan.tab, &tree);
-    // And the sidebar's own width, which the park inflated.
-    let _ = ipc::call_text(
-        "layout.set_split_ratio",
-        serde_json::json!({ "pane_id": owner, "path": [], "ratio": plan.owner_ratio }),
-    );
-    true
-}
-
-/// A recovered split tree: exactly the rects the panes had at park time.
-enum Node {
-    Leaf(String),
-    Split {
-        dir: &'static str,
-        ratio: f64,
-        first: Box<Node>,
-        second: Box<Node>,
-    },
-}
-
-/// The subtree's representative: its top-left-most pane, which stands in
-/// for the whole region until the subtree's own splits are replayed.
-fn rep(node: &Node) -> &str {
-    match node {
-        Node::Leaf(id) => id,
-        Node::Split { first, .. } => rep(first),
-    }
-}
-
-/// Rebuild the split tree from pane rects by guillotine recovery: find a
-/// full-height (or full-width) cut line that cleanly partitions the panes,
-/// recurse on both sides. Binary-split layouts always admit one; if none is
-/// found (foreign layout), fall back to a degenerate right-stack.
-fn build_tree(panes: &[(String, RectJ)]) -> Node {
-    if panes.len() == 1 {
-        return Node::Leaf(panes[0].0.clone());
-    }
-    let min_x = panes.iter().map(|(_, r)| r.x).min().unwrap_or(0);
-    let max_x = panes.iter().map(|(_, r)| r.x + r.width).max().unwrap_or(0);
-    let min_y = panes.iter().map(|(_, r)| r.y).min().unwrap_or(0);
-    let max_y = panes.iter().map(|(_, r)| r.y + r.height).max().unwrap_or(0);
-
-    // Vertical cut candidates: every pane's left edge strictly inside.
-    for (_, r) in panes {
-        let cut = r.x;
-        if cut <= min_x || cut >= max_x {
-            continue;
-        }
-        if panes.iter().all(|(_, q)| q.x + q.width <= cut || q.x >= cut) {
-            let (a, b): (Vec<_>, Vec<_>) =
-                panes.iter().cloned().partition(|(_, q)| q.x + q.width <= cut);
-            if !a.is_empty() && !b.is_empty() {
-                return Node::Split {
-                    dir: "right",
-                    ratio: (cut - min_x) as f64 / (max_x - min_x).max(1) as f64,
-                    first: Box::new(build_tree(&a)),
-                    second: Box::new(build_tree(&b)),
-                };
-            }
-        }
-    }
-    for (_, r) in panes {
-        let cut = r.y;
-        if cut <= min_y || cut >= max_y {
-            continue;
-        }
-        if panes.iter().all(|(_, q)| q.y + q.height <= cut || q.y >= cut) {
-            let (a, b): (Vec<_>, Vec<_>) =
-                panes.iter().cloned().partition(|(_, q)| q.y + q.height <= cut);
-            if !a.is_empty() && !b.is_empty() {
-                return Node::Split {
-                    dir: "down",
-                    ratio: (cut - min_y) as f64 / (max_y - min_y).max(1) as f64,
-                    first: Box::new(build_tree(&a)),
-                    second: Box::new(build_tree(&b)),
-                };
-            }
-        }
-    }
-    // No clean cut (shouldn't happen for herdr layouts): stack them.
-    let rest = build_tree(&panes[1..]);
-    Node::Split {
-        dir: "right",
-        ratio: 0.5,
-        first: Box::new(Node::Leaf(panes[0].0.clone())),
-        second: Box::new(rest),
-    }
-}
-
-/// Pre-order replay: at each split, the region is currently held entirely
-/// by rep(first); moving rep(second) in with the recorded direction/ratio
-/// carves the region correctly before either side's inner splits run.
-fn replay(tab: &str, node: &Node) {
-    let Node::Split { dir, ratio, first, second } = node else { return };
-    move_into(tab, rep(second), rep(first), dir, *ratio);
-    replay(tab, first);
-    replay(tab, second);
-}
-
-fn move_into(tab: &str, pane: &str, target: &str, split: &str, ratio: f64) {
-    let _ = ipc::call_text(
-        "pane.move",
-        serde_json::json!({
-            "pane_id": pane,
-            "destination": {
-                "type": "tab",
-                "tab_id": tab,
-                "split": split,
-                "target_pane_id": target,
-                "ratio": ratio.clamp(0.1, 0.9),
-            },
-            "focus": false,
-        }),
-    );
-}
-
 /// The pane directly to the right of `pane_id` (sharing vertical overlap),
 /// from a `pane.layout` response.
 fn right_neighbor(layout_json: &str, pane_id: &str) -> Option<String> {
@@ -1304,11 +954,8 @@ fn right_neighbor(layout_json: &str, pane_id: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// The sidebar respawns with a FRESH pane id on every redeploy and on
-    /// ensure-hook healing, but the parked panes' way home is the TAB. Keying
-    /// the plan by pane id meant the "already parked?" guard never fired for
-    /// the new id: each preview parked the same terminals into yet another
-    /// new tab and orphaned the previous plan, so nothing ever restored.
+    /// One pinned preview, one ephemeral preview, and a sidebar pane that is
+    /// neither — the three cases every routing decision must separate.
     const PREVIEWS: &str = r#"{"result":{"panes":[
         {"pane_id":"w4:p1","tab_id":"w4:t1","tokens":{"herdr-sidebar-explorer":"1"}},
         {"pane_id":"w4:p2","tab_id":"w4:t2",
@@ -1401,24 +1048,6 @@ mod tests {
         assert_eq!(tab_label("/repo/src/main.rs", true), "main.rs");
         assert_eq!(parse_tab_label("*main.rs"), ("main.rs".to_string(), false));
         assert_eq!(parse_tab_label("main.rs"), ("main.rs".to_string(), true));
-    }
-
-    #[test]
-    fn park_plan_is_keyed_by_tab_not_by_the_sidebars_pane_id() {
-        let json = r#"{"result":{"panes":[
-            {"pane_id":"w4:p1E","tab_id":"w4:tH"},
-            {"pane_id":"w4:p1R","tab_id":"w4:tH"},
-            {"pane_id":"w4:pM","tab_id":"w4:tP"}
-        ]}}"#;
-        let before_respawn = park_path_in(json, "w4:p1E").expect("sidebar is in a tab");
-        let after_respawn = park_path_in(json, "w4:p1R").expect("sidebar is in a tab");
-        assert_eq!(
-            before_respawn, after_respawn,
-            "a respawned sidebar must find the SAME park plan"
-        );
-        // A different tab keeps its own plan, and an unknown pane has none.
-        assert_ne!(park_path_in(json, "w4:pM").expect("in a tab"), before_respawn);
-        assert!(park_path_in(json, "w4:pZZ").is_none());
     }
 
     #[cfg(unix)]
