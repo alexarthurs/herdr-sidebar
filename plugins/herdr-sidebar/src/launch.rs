@@ -118,7 +118,7 @@ struct Rect {
 
 /// Windows PowerShell 5.1 prepends a UTF-8 BOM when piping into a native
 /// process's stdin (verified live); serde_json rejects a BOM before `{`.
-fn strip_bom(input: &str) -> &str {
+pub(crate) fn strip_bom(input: &str) -> &str {
     input.trim_start_matches('\u{feff}')
 }
 

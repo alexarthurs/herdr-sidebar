@@ -730,6 +730,66 @@ fn viewer_pane_in_tab(pane_list_json: &str, my_pane_id: &str) -> Option<(String,
     Some((id, stale))
 }
 
+pub const TOKEN_PATH: &str = "hs-preview-path";
+pub const TOKEN_PINNED: &str = "hs-preview-pinned";
+
+/// A live preview pane and the document it is showing. State lives on the
+/// pane, so it cannot outlive what it describes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewPane {
+    pub pane_id: String,
+    pub tab_id: String,
+    pub doc_key: String,
+    pub pinned: bool,
+}
+
+/// Every preview pane in the session, from one `pane.list` payload.
+fn previews_in(pane_list_json: &str) -> Vec<PreviewPane> {
+    #[derive(serde::Deserialize)]
+    struct Msg {
+        result: Res,
+    }
+    #[derive(serde::Deserialize)]
+    struct Res {
+        #[serde(default)]
+        panes: Vec<Pane>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Pane {
+        pane_id: Option<String>,
+        tab_id: Option<String>,
+        #[serde(default)]
+        tokens: std::collections::BTreeMap<String, serde_json::Value>,
+    }
+    let Ok(msg) = serde_json::from_str::<Msg>(crate::launch::strip_bom(pane_list_json)) else {
+        return Vec::new();
+    };
+    msg.result
+        .panes
+        .into_iter()
+        .filter_map(|p| {
+            let doc_key = p.tokens.get(TOKEN_PATH)?.as_str()?.to_string();
+            Some(PreviewPane {
+                pane_id: p.pane_id?,
+                tab_id: p.tab_id?,
+                doc_key,
+                pinned: p.tokens.contains_key(TOKEN_PINNED),
+            })
+        })
+        .collect()
+}
+
+/// The tab already showing `doc_key`, pinned or not — checked FIRST so
+/// re-selecting an open file jumps instead of clobbering the ephemeral tab.
+fn preview_for_doc(previews: &[PreviewPane], doc_key: &str) -> Option<PreviewPane> {
+    previews.iter().find(|p| p.doc_key == doc_key).cloned()
+}
+
+/// The ephemeral tab, if one exists. Pinned tabs are never overwritten.
+fn reusable_preview(previews: &[PreviewPane]) -> Option<PreviewPane> {
+    previews.iter().find(|p| !p.pinned).cloned()
+}
+
 /// Split a viewer pane directly to the caller's right: split the right
 /// NEIGHBOR and swap the fresh pane into its left slot (split only goes
 /// right/down), so the layout reads sidebar | preview | rest.
@@ -1165,6 +1225,46 @@ mod tests {
     /// the plan by pane id meant the "already parked?" guard never fired for
     /// the new id: each preview parked the same terminals into yet another
     /// new tab and orphaned the previous plan, so nothing ever restored.
+    const PREVIEWS: &str = r#"{"result":{"panes":[
+        {"pane_id":"w4:p1","tab_id":"w4:t1","tokens":{"herdr-sidebar-explorer":"1"}},
+        {"pane_id":"w4:p2","tab_id":"w4:t2",
+         "tokens":{"herdr-sidebar-preview":"9","hs-preview-path":"/r/a.rs","hs-preview-pinned":"1"}},
+        {"pane_id":"w4:p3","tab_id":"w4:t3",
+         "tokens":{"herdr-sidebar-preview":"9","hs-preview-path":"/r/b.rs"}}
+    ]}}"#;
+
+    #[test]
+    fn previews_carry_their_document_and_pin_state() {
+        let ps = previews_in(PREVIEWS);
+        assert_eq!(ps.len(), 2, "only panes with hs-preview-path are previews");
+        let a = ps.iter().find(|p| p.doc_key == "/r/a.rs").unwrap();
+        assert!(a.pinned);
+        assert_eq!(a.tab_id, "w4:t2");
+        assert!(!ps.iter().find(|p| p.doc_key == "/r/b.rs").unwrap().pinned);
+    }
+
+    #[test]
+    fn an_open_document_is_matched_before_anything_is_reused() {
+        let ps = previews_in(PREVIEWS);
+        assert_eq!(preview_for_doc(&ps, "/r/a.rs").unwrap().tab_id, "w4:t2");
+        assert!(preview_for_doc(&ps, "/r/zz.rs").is_none());
+    }
+
+    #[test]
+    fn only_unpinned_previews_are_reusable() {
+        let ps = previews_in(PREVIEWS);
+        assert_eq!(reusable_preview(&ps).unwrap().doc_key, "/r/b.rs");
+
+        let all_pinned = r#"{"result":{"panes":[
+            {"pane_id":"w4:p2","tab_id":"w4:t2",
+             "tokens":{"hs-preview-path":"/r/a.rs","hs-preview-pinned":"1"}}
+        ]}}"#;
+        assert!(
+            reusable_preview(&previews_in(all_pinned)).is_none(),
+            "every tab pinned must force a new tab"
+        );
+    }
+
     #[test]
     fn doc_keys_separate_a_file_from_its_diff_and_its_history() {
         let f = doc_key_for_file(Path::new("/repo/src/main.rs"));
