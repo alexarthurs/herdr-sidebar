@@ -64,13 +64,11 @@ fn write_scratch_file(path: &Path, contents: &str) -> std::io::Result<()> {
     std::fs::write(path, contents)
 }
 
-/// The control file the sidebar writes requests into, unique per sidebar
-/// pane (tab) so tabs don't steer each other's viewers.
-pub fn control_path(sidebar_pane_id: &str) -> PathBuf {
-    scratch_dir().join(format!(
-        "herdr-sidebar-preview-{}.ctl",
-        sidebar_pane_id.replace(':', "_")
-    ))
+/// The control file a tab's viewer watches. Keyed by TAB so a sidebar in
+/// any tab can steer any preview; the spawning sidebar's pane id churns on
+/// every redeploy and ensure-hook heal, the tab does not.
+pub fn control_path_for_tab(tab_id: &str) -> PathBuf {
+    scratch_dir().join(format!("herdr-sidebar-preview-{}.ctl", tab_id.replace(':', "_")))
 }
 
 /// Identity of the document a preview shows, stamped into the preview
@@ -400,13 +398,13 @@ fn report_identity(doc_name: &str) {
 }
 
 /// Close our own pane (ends this process with it), handing focus back to
-/// the sidebar that spawned us — its pane id is baked into the control-file
-/// name, so a full-screen (zoomed) preview drops the user exactly where
-/// they were.
+/// the sidebar in our tab so the user lands where they were clicking.
 fn close_own_pane(control: &Path) {
-    if let Some(owner) = owner_pane_id(control) {
-        restore_parked(&owner);
-        let _ = ipc::call_text("pane.focus", serde_json::json!({ "pane_id": owner }));
+    if let Some(tab) = owner_tab_id(control)
+        && let Ok(list) = ipc::call_text("pane.list", serde_json::json!({}))
+        && let Some(sidebar) = sidebar_in_tab(&list, &tab)
+    {
+        let _ = ipc::call_text("pane.focus", serde_json::json!({ "pane_id": sidebar }));
     }
     if let Ok(pane_id) = std::env::var("HERDR_PANE_ID")
         && !pane_id.is_empty()
@@ -415,12 +413,42 @@ fn close_own_pane(control: &Path) {
     }
 }
 
-/// The sidebar pane that owns this viewer, recovered from the control-file
-/// name (`herdr-sidebar-preview-<id with ':' as '_'>.ctl`).
-fn owner_pane_id(control: &Path) -> Option<String> {
+/// The tab whose control file this is — the inverse of
+/// [`control_path_for_tab`].
+fn owner_tab_id(control: &Path) -> Option<String> {
     let stem = control.file_stem()?.to_str()?;
     let id = stem.strip_prefix("herdr-sidebar-preview-")?.replace('_', ":");
     (!id.is_empty()).then_some(id)
+}
+
+/// The sidebar pane in `tab`, so a closing preview can hand focus back.
+fn sidebar_in_tab(pane_list_json: &str, tab: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Msg {
+        result: Res,
+    }
+    #[derive(serde::Deserialize)]
+    struct Res {
+        #[serde(default)]
+        panes: Vec<Pane>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Pane {
+        pane_id: Option<String>,
+        tab_id: Option<String>,
+        #[serde(default)]
+        tokens: std::collections::BTreeMap<String, serde_json::Value>,
+    }
+    let msg = serde_json::from_str::<Msg>(crate::launch::strip_bom(pane_list_json)).ok()?;
+    msg.result
+        .panes
+        .into_iter()
+        .filter(|p| p.tab_id.as_deref() == Some(tab))
+        .find(|p| {
+            p.tokens.contains_key("herdr-sidebar-explorer")
+                || p.tokens.contains_key("herdr-sidebar-git")
+        })?
+        .pane_id
 }
 
 /// The viewer's event loop; returns when the user closes it.
@@ -597,7 +625,12 @@ fn draw_doc(frame: &mut Frame, doc: &mut Doc, theme: IconTheme) -> usize {
 /// pane exists beside it (spawning one to our right when needed). Errors are
 /// human-readable notices.
 pub fn open_in_pane(my_pane_id: &str, spawn_cwd: &Path, payload: &str) -> Result<(), String> {
-    let control = control_path(my_pane_id);
+    let my_tab = ipc::call_text("pane.list", serde_json::json!({}))
+        .ok()
+        .map(|list| crate::launch::tab_of(&list, my_pane_id))
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| "preview needs a herdr tab".to_string())?;
+    let control = control_path_for_tab(&my_tab);
     write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
     let full = crate::state::load_state().preview_full;
 
@@ -1232,6 +1265,22 @@ mod tests {
         {"pane_id":"w4:p3","tab_id":"w4:t3",
          "tokens":{"herdr-sidebar-preview":"9","hs-preview-path":"/r/b.rs"}}
     ]}}"#;
+
+    #[test]
+    fn control_files_are_addressed_by_tab_not_by_sidebar_pane() {
+        // Any sidebar can drive another tab's preview by naming its tab.
+        assert_eq!(control_path_for_tab("w4:t7"), control_path_for_tab("w4:t7"));
+        assert_ne!(control_path_for_tab("w4:t7"), control_path_for_tab("w4:t8"));
+        assert!(
+            control_path_for_tab("w4:t7").to_string_lossy().contains("w4_t7"),
+            "colons are not filename-safe"
+        );
+        // ...and the viewer can read the tab back off its own control file.
+        assert_eq!(
+            owner_tab_id(&control_path_for_tab("w4:t7")).as_deref(),
+            Some("w4:t7")
+        );
+    }
 
     #[test]
     fn previews_carry_their_document_and_pin_state() {
