@@ -73,6 +73,43 @@ pub fn control_path(sidebar_pane_id: &str) -> PathBuf {
     ))
 }
 
+/// Identity of the document a preview shows, stamped into the preview
+/// pane's `hs-preview-path` token. A file, a diff OF that file, and a
+/// `git show` touching it are three different documents with three tabs.
+pub fn doc_key_for_file(path: &Path) -> String {
+    path.display().to_string()
+}
+
+pub fn doc_key_for_diff(root: &Path, rel: &str, kind: &str) -> String {
+    format!("diff:{}:{kind}", root.join(rel).display())
+}
+
+pub fn doc_key_for_show(root: &Path, spec: &str, path: Option<&str>) -> String {
+    match path {
+        Some(p) => format!("show:{}:{spec}:{p}", root.display()),
+        None => format!("show:{}:{spec}", root.display()),
+    }
+}
+
+/// The tab name for a document. `*` marks pinned — `tab.rename` is the
+/// only display lever herdr gives a plugin.
+pub fn tab_label(doc_key: &str, pinned: bool) -> String {
+    let name = doc_key
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(doc_key);
+    if pinned { format!("*{name}") } else { name.to_string() }
+}
+
+/// Inverse of [`tab_label`]: the displayed name and whether it is pinned.
+pub fn parse_tab_label(label: &str) -> (String, bool) {
+    match label.strip_prefix('*') {
+        Some(rest) => (rest.to_string(), true),
+        None => (label.to_string(), false),
+    }
+}
+
 /// What the sidebar asked the viewer to show.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Request {
@@ -759,10 +796,31 @@ fn spawn_viewer_pane(
 // Full-size mode: park the tab's other panes while a preview is open.
 // ---------------------------------------------------------------------------
 
-/// Park plan for `owner`'s tab, recorded beside the control file so either
-/// process (sidebar or viewer) can restore.
-fn park_path(owner: &str) -> PathBuf {
-    scratch_dir().join(format!("herdr-sidebar-preview-{}.park.json", owner.replace(':', "_")))
+/// Park plan for a TAB, recorded beside the control file so either process
+/// (sidebar or viewer) can restore. Keyed by tab id and never by the
+/// sidebar's pane id: the sidebar respawns with a fresh pane id on redeploy
+/// and on ensure-hook healing, while the tab the parked panes must return to
+/// does not change. A pane-id key made the "already parked?" guard miss, so
+/// every preview re-parked into another new tab and orphaned the old plan.
+fn park_path_for_tab(tab: &str) -> PathBuf {
+    scratch_dir().join(format!("herdr-sidebar-park-{}.json", tab.replace(':', "_")))
+}
+
+/// `owner`'s plan path resolved from a `pane list` payload; `None` when that
+/// pane sits in no tab (it has already gone away).
+fn park_path_in(pane_list_json: &str, owner: &str) -> Option<PathBuf> {
+    let tab = crate::launch::tab_of(pane_list_json, owner);
+    (!tab.is_empty()).then(|| park_path_for_tab(&tab))
+}
+
+/// Live lookup of `owner`'s plan path, falling back to OUR own pane's tab so
+/// the viewer can still restore after the sidebar that spawned it is gone.
+fn park_path(owner: &str) -> Option<PathBuf> {
+    let list = ipc::call_text("pane.list", serde_json::json!({})).ok()?;
+    park_path_in(&list, owner).or_else(|| {
+        let me = std::env::var("HERDR_PANE_ID").ok()?;
+        park_path_in(&list, &me)
+    })
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
@@ -852,15 +910,16 @@ fn our_panes_in_tab(pane_list_json: &str, owner: &str) -> Vec<String> {
 /// record how to put them back. No-op when nothing to park or a plan
 /// already exists.
 fn park_others(owner: &str) {
-    if park_path(owner).exists() {
-        return;
-    }
     let Ok(list) = ipc::call_text("pane.list", serde_json::json!({})) else { return };
-    let ours = our_panes_in_tab(&list, owner);
     let tab = crate::launch::tab_of(&list, owner);
     if tab.is_empty() {
         return;
     }
+    let plan_path = park_path_for_tab(&tab);
+    if plan_path.exists() {
+        return;
+    }
+    let ours = our_panes_in_tab(&list, owner);
     let Ok(layout) = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": owner }))
     else {
         return;
@@ -892,7 +951,7 @@ fn park_others(owner: &str) {
     let mut park_tab = String::new();
     for (i, (id, _)) in others.iter().enumerate() {
         let dest = if i == 0 {
-            serde_json::json!({ "type": "new_tab", "label": "· preview" })
+            serde_json::json!({ "type": "new_tab" })
         } else {
             serde_json::json!({ "type": "tab", "tab_id": park_tab, "split": "right" })
         };
@@ -911,7 +970,7 @@ fn park_others(owner: &str) {
     }
     let plan = ParkPlan { tab, owner_ratio, panes: others };
     if let Ok(json) = serde_json::to_string(&plan) {
-        let _ = write_scratch_file(&park_path(owner), &json);
+        let _ = write_scratch_file(&plan_path, &json);
     }
 }
 
@@ -919,7 +978,7 @@ fn park_others(owner: &str) {
 /// (each pane re-splits the recorded left/top neighbor at the recorded
 /// proportions). Returns whether a plan existed.
 pub fn restore_parked(owner: &str) -> bool {
-    let path = park_path(owner);
+    let Some(path) = park_path(owner) else { return false };
     let Ok(json) = std::fs::read_to_string(&path) else { return false };
     let _ = std::fs::remove_file(&path);
     let Ok(plan) = serde_json::from_str::<ParkPlan>(&json) else { return false };
@@ -1100,6 +1159,51 @@ fn right_neighbor(layout_json: &str, pane_id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sidebar respawns with a FRESH pane id on every redeploy and on
+    /// ensure-hook healing, but the parked panes' way home is the TAB. Keying
+    /// the plan by pane id meant the "already parked?" guard never fired for
+    /// the new id: each preview parked the same terminals into yet another
+    /// new tab and orphaned the previous plan, so nothing ever restored.
+    #[test]
+    fn doc_keys_separate_a_file_from_its_diff_and_its_history() {
+        let f = doc_key_for_file(Path::new("/repo/src/main.rs"));
+        let d = doc_key_for_diff(Path::new("/repo"), "src/main.rs", "staged");
+        let w = doc_key_for_diff(Path::new("/repo"), "src/main.rs", "worktree");
+        let s = doc_key_for_show(Path::new("/repo"), "HEAD~1", Some("src/main.rs"));
+        assert_eq!(f, "/repo/src/main.rs");
+        assert_ne!(f, d, "a file and its diff need their own tabs");
+        assert_ne!(d, w, "staged and worktree diffs are different documents");
+        assert_ne!(d, s, "a diff and a git-show are different documents");
+        assert!(d.starts_with("diff:"), "{d}");
+        assert!(s.starts_with("show:"), "{s}");
+    }
+
+    #[test]
+    fn tab_labels_round_trip_the_pin_marker() {
+        assert_eq!(tab_label("/repo/src/main.rs", false), "main.rs");
+        assert_eq!(tab_label("/repo/src/main.rs", true), "*main.rs");
+        assert_eq!(parse_tab_label("main.rs"), ("main.rs".to_string(), false));
+        assert_eq!(parse_tab_label("*main.rs"), ("main.rs".to_string(), true));
+    }
+
+    #[test]
+    fn park_plan_is_keyed_by_tab_not_by_the_sidebars_pane_id() {
+        let json = r#"{"result":{"panes":[
+            {"pane_id":"w4:p1E","tab_id":"w4:tH"},
+            {"pane_id":"w4:p1R","tab_id":"w4:tH"},
+            {"pane_id":"w4:pM","tab_id":"w4:tP"}
+        ]}}"#;
+        let before_respawn = park_path_in(json, "w4:p1E").expect("sidebar is in a tab");
+        let after_respawn = park_path_in(json, "w4:p1R").expect("sidebar is in a tab");
+        assert_eq!(
+            before_respawn, after_respawn,
+            "a respawned sidebar must find the SAME park plan"
+        );
+        // A different tab keeps its own plan, and an unknown pane has none.
+        assert_ne!(park_path_in(json, "w4:pM").expect("in a tab"), before_respawn);
+        assert!(park_path_in(json, "w4:pZZ").is_none());
+    }
 
     #[cfg(unix)]
     #[test]
