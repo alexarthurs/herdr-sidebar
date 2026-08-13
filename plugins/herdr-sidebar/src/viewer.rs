@@ -95,22 +95,24 @@ pub fn doc_key_for_show(root: &Path, spec: &str, path: Option<&str>) -> String {
     }
 }
 
-/// The tab name for a document. `*` marks pinned — `tab.rename` is the
-/// only display lever herdr gives a plugin.
+/// The tab name for a document. `*` marks the tab as EPHEMERAL — the next
+/// file will overwrite it — so a pinned tab reads as a plain name, the way
+/// a settled document should. `tab.rename` is the only display lever herdr
+/// gives a plugin.
 pub fn tab_label(doc_key: &str, pinned: bool) -> String {
     let name = doc_key
         .rsplit(['/', '\\'])
         .next()
         .filter(|s| !s.is_empty())
         .unwrap_or(doc_key);
-    if pinned { format!("*{name}") } else { name.to_string() }
+    if pinned { name.to_string() } else { format!("*{name}") }
 }
 
 /// Inverse of [`tab_label`]: the displayed name and whether it is pinned.
 pub fn parse_tab_label(label: &str) -> (String, bool) {
     match label.strip_prefix('*') {
-        Some(rest) => (rest.to_string(), true),
-        None => (label.to_string(), false),
+        Some(rest) => (rest.to_string(), false),
+        None => (label.to_string(), true),
     }
 }
 
@@ -643,7 +645,7 @@ pub fn open_in_pane(
     spawn_cwd: &Path,
     doc_key: &str,
     payload: &str,
-) -> Result<(), String> {
+) -> Result<PreviewTarget, String> {
     let list = ipc::call_text("pane.list", serde_json::json!({}))
         .map_err(|e| format!("preview failed: {e}"))?;
     let previews = previews_in(&list);
@@ -651,7 +653,7 @@ pub fn open_in_pane(
     // 1. Already open — jump to it, pinned or not.
     if let Some(p) = preview_for_doc(&previews, doc_key) {
         let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": p.tab_id }));
-        return Ok(());
+        return Ok(PreviewTarget { pane_id: p.pane_id, tab_id: p.tab_id });
     }
 
     // 2. Overwrite the ephemeral tab.
@@ -663,11 +665,37 @@ pub fn open_in_pane(
             serde_json::json!({ "tab_id": p.tab_id, "label": tab_label(doc_key, false) }),
         );
         let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": p.tab_id }));
-        return Ok(());
+        return Ok(PreviewTarget { pane_id: p.pane_id, tab_id: p.tab_id });
     }
 
     // 3. Nothing reusable — a tab of its own.
     spawn_preview_tab(my_pane_id, spawn_cwd, doc_key, payload)
+}
+
+/// Where a preview request landed. Handed back so a double click can pin
+/// exactly the tab its first click used — searching by document key would
+/// race the viewer, which only stamps `hs-preview-path` once it has started.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewTarget {
+    pub pane_id: String,
+    pub tab_id: String,
+}
+
+/// Mark a preview's tab pinned: stamp the token so it stops being reusable,
+/// and prefix its tab name with `*`. Idempotent.
+pub fn pin_target(target: &PreviewTarget, doc_key: &str) {
+    let _ = ipc::call_text(
+        "pane.report_metadata",
+        serde_json::json!({
+            "pane_id": target.pane_id,
+            "source": METADATA_SOURCE,
+            "tokens": { TOKEN_PINNED: "1" },
+        }),
+    );
+    let _ = ipc::call_text(
+        "tab.rename",
+        serde_json::json!({ "tab_id": target.tab_id, "label": tab_label(doc_key, true) }),
+    );
 }
 
 /// Spawn a preview and give it its own tab. The pane is split beside the
@@ -679,7 +707,7 @@ fn spawn_preview_tab(
     spawn_cwd: &Path,
     doc_key: &str,
     payload: &str,
-) -> Result<(), String> {
+) -> Result<PreviewTarget, String> {
     let new_pane = spawn_viewer_pane(my_pane_id, spawn_cwd, payload)?;
     let _ = ipc::call_text(
         "pane.move",
@@ -689,7 +717,10 @@ fn spawn_preview_tab(
             "focus": true,
         }),
     );
-    Ok(())
+    let tab_id = ipc::call_text("pane.list", serde_json::json!({}))
+        .map(|list| crate::launch::tab_of(&list, &new_pane))
+        .unwrap_or_default();
+    Ok(PreviewTarget { pane_id: new_pane, tab_id })
 }
 
 /// The owner pane's share of its tab width right now — `None` when the
@@ -1287,6 +1318,24 @@ mod tests {
     ]}}"#;
 
     #[test]
+    fn a_pinned_tab_is_no_longer_reusable() {
+        let before = r#"{"result":{"panes":[
+            {"pane_id":"w4:p3","tab_id":"w4:t3","tokens":{"hs-preview-path":"/r/b.rs"}}
+        ]}}"#;
+        let after = r#"{"result":{"panes":[
+            {"pane_id":"w4:p3","tab_id":"w4:t3",
+             "tokens":{"hs-preview-path":"/r/b.rs","hs-preview-pinned":"1"}}
+        ]}}"#;
+        assert!(reusable_preview(&previews_in(before)).is_some());
+        assert!(
+            reusable_preview(&previews_in(after)).is_none(),
+            "pinning must push the next file onto a new tab"
+        );
+        // ...and the pinned tab is still reachable by its document.
+        assert!(preview_for_doc(&previews_in(after), "/r/b.rs").is_some());
+    }
+
+    #[test]
     fn control_files_are_addressed_by_the_preview_pane() {
         // The path is argv for the viewer, so it must key on something that
         // survives a tab move: the preview pane itself. Any sidebar can then
@@ -1346,11 +1395,12 @@ mod tests {
     }
 
     #[test]
-    fn tab_labels_round_trip_the_pin_marker() {
-        assert_eq!(tab_label("/repo/src/main.rs", false), "main.rs");
-        assert_eq!(tab_label("/repo/src/main.rs", true), "*main.rs");
-        assert_eq!(parse_tab_label("main.rs"), ("main.rs".to_string(), false));
-        assert_eq!(parse_tab_label("*main.rs"), ("main.rs".to_string(), true));
+    fn tab_labels_mark_the_ephemeral_tab_not_the_pinned_one() {
+        // `*` warns "this one is about to be overwritten".
+        assert_eq!(tab_label("/repo/src/main.rs", false), "*main.rs");
+        assert_eq!(tab_label("/repo/src/main.rs", true), "main.rs");
+        assert_eq!(parse_tab_label("*main.rs"), ("main.rs".to_string(), false));
+        assert_eq!(parse_tab_label("main.rs"), ("main.rs".to_string(), true));
     }
 
     #[test]

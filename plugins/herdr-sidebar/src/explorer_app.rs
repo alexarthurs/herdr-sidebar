@@ -192,6 +192,9 @@ pub struct App {
     mouse_pos: Option<(u16, u16)>,
     /// Last left-click (row index, when) for double-click detection.
     last_click: Option<(usize, std::time::Instant)>,
+    /// Where the most recent preview landed, with its document key — so a
+    /// double click pins that exact tab instead of re-opening it.
+    last_preview: Option<(String, herdr_sidebar::viewer::PreviewTarget)>,
     /// Last heartbeat stamp, throttling the token refresh.
     last_beat: std::time::Instant,
     /// A native folder picker running on a background thread; its result
@@ -257,6 +260,7 @@ impl App {
             last_mouse: None,
             mouse_pos: None,
             last_click: None,
+            last_preview: None,
             last_beat: std::time::Instant::now(),
             picking: None,
         };
@@ -308,13 +312,16 @@ impl App {
         };
         let payload = herdr_sidebar::viewer::file_request(path);
         let doc_key = herdr_sidebar::viewer::doc_key_for_file(path);
-        if let Err(e) = herdr_sidebar::viewer::open_in_pane(
+        match herdr_sidebar::viewer::open_in_pane(
             &pane_id,
             &self.tree.root_path(),
             &doc_key,
             &payload,
         ) {
-            self.notice = Some(e);
+            // Remember where it landed: a double click pins THIS tab rather
+            // than re-opening, which would race the viewer's first stamp.
+            Ok(target) => self.last_preview = Some((doc_key, target)),
+            Err(e) => self.notice = Some(e),
         }
     }
 
@@ -529,8 +536,19 @@ impl App {
                     if on_chevron || double {
                         self.toggle();
                     }
+                } else if double {
+                    // Pin the tab the first click just opened. Re-opening
+                    // here would race the viewer's first token stamp and
+                    // spawn a second tab for the same file.
+                    let doc_key = herdr_sidebar::viewer::doc_key_for_file(&path);
+                    match self.last_preview.as_ref() {
+                        Some((key, target)) if *key == doc_key => {
+                            herdr_sidebar::viewer::pin_target(target, &doc_key);
+                        }
+                        _ => self.open_preview(&path),
+                    }
                 } else {
-                    // A click on a file zooms the pane into its preview.
+                    // A click on a file previews it in the ephemeral tab.
                     self.open_preview(&path);
                 }
             }
