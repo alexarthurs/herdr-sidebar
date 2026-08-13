@@ -434,7 +434,34 @@ fn close_own_pane() {
             let _ = ipc::call_text("pane.focus", serde_json::json!({ "pane_id": sidebar }));
         }
     }
+    // Our control file is named after us, so it dies with us.
+    let _ = std::fs::remove_file(control_path_for_pane(&pane_id));
     let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
+}
+
+/// Delete control files whose pane is gone. `close_own_pane` handles the
+/// clean exit; this catches previews killed from outside (pane closed by
+/// herdr, redeploy, server restart), which never get to run their own
+/// cleanup. Cheap: one readdir against a `pane.list` we already have.
+fn sweep_orphan_controls(pane_list_json: &str) {
+    let live: std::collections::BTreeSet<String> = previews_in(pane_list_json)
+        .into_iter()
+        .map(|p| p.pane_id.replace(':', "_"))
+        .collect();
+    let Ok(entries) = std::fs::read_dir(scratch_dir()) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(id) = name
+            .strip_prefix("herdr-sidebar-preview-")
+            .and_then(|n| n.strip_suffix(".ctl"))
+        else {
+            continue;
+        };
+        if !live.contains(id) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// The sidebar pane in `tab`, so a closing preview can hand focus back.
@@ -648,6 +675,7 @@ pub fn open_in_pane(
 ) -> Result<PreviewTarget, String> {
     let list = ipc::call_text("pane.list", serde_json::json!({}))
         .map_err(|e| format!("preview failed: {e}"))?;
+    sweep_orphan_controls(&list);
     let previews = previews_in(&list);
 
     // 1. Already open — jump to it, pinned or not.
