@@ -108,6 +108,17 @@ pub fn parse_tab_label(label: &str) -> (String, bool) {
     }
 }
 
+impl Request {
+    /// The document identity this request renders.
+    fn doc_key(&self) -> String {
+        match self {
+            Self::File(p) => doc_key_for_file(p),
+            Self::Diff { root, rel, kind } => doc_key_for_diff(root, rel, kind),
+            Self::Show { root, spec, path } => doc_key_for_show(root, spec, path.as_deref()),
+        }
+    }
+}
+
 /// What the sidebar asked the viewer to show.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Request {
@@ -376,9 +387,11 @@ fn read_control(control: &Path) -> Option<Request> {
     parse_request(&buf)
 }
 
-/// Tag our pane (heartbeat-stamped, see launch::HEARTBEAT_STALE_SECS) and
-/// title it with the shown document's name.
-fn report_identity(doc_name: &str) {
+/// Tag our pane (heartbeat-stamped, see launch::HEARTBEAT_STALE_SECS), record
+/// WHICH document we show so any sidebar can route clicks to us, and title the
+/// pane with the document's name. A `None` key clears the token — showing
+/// nothing must not look like a preview of the empty path.
+fn report_identity(doc_name: &str, doc_key: Option<&str>) {
     let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else { return };
     if pane_id.is_empty() {
         return;
@@ -388,7 +401,10 @@ fn report_identity(doc_name: &str) {
         serde_json::json!({
             "pane_id": pane_id,
             "source": METADATA_SOURCE,
-            "tokens": { METADATA_SOURCE: crate::state::unix_now().to_string() },
+            "tokens": {
+                METADATA_SOURCE: crate::state::unix_now().to_string(),
+                TOKEN_PATH: doc_key,
+            },
         }),
     );
     let _ = ipc::call_text(
@@ -468,7 +484,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         numbered: false,
         scroll: 0,
     });
-    report_identity(&doc.name);
+    report_identity(&doc.name, current.as_ref().map(Request::doc_key).as_deref());
 
     // Blank the primary screen so pane handoffs never flash the shell.
     let _ = crossterm::execute!(
@@ -518,14 +534,14 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             // Idle: heartbeat, follow the control file, and live-refresh diffs.
             beat += 1;
             if beat.is_multiple_of(20) {
-                report_identity(&doc.name);
+                report_identity(&doc.name, current.as_ref().map(Request::doc_key).as_deref());
             }
             let target = read_control(control);
             if target != current {
                 current = target;
                 if let Some(request) = &current {
                     doc = load(request);
-                    report_identity(&doc.name);
+                    report_identity(&doc.name, Some(&request.doc_key()));
                 }
             } else if beat.is_multiple_of(8)
                 && let Some(request @ Request::Diff { .. }) = &current
