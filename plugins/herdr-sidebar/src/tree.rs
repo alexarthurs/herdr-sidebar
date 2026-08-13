@@ -62,6 +62,19 @@ impl Tree {
         self.expanded.contains(path)
     }
 
+    /// The expanded set, for persisting so a sidebar opened in a new tab
+    /// comes up showing what the tree already showed.
+    pub fn expanded_paths(&self) -> Vec<PathBuf> {
+        self.expanded.iter().cloned().collect()
+    }
+
+    /// Restore a persisted expanded set. Paths outside this tree's root are
+    /// dropped: one state file is shared by every workspace's sidebars.
+    pub fn set_expanded(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        self.expanded = paths.into_iter().filter(|p| p.starts_with(&self.root)).collect();
+        self.cache.clear();
+    }
+
     pub fn expand(&mut self, path: &Path) {
         self.expanded.insert(path.to_path_buf());
     }
@@ -174,6 +187,20 @@ mod tests {
 
     fn names(rows: &[Row]) -> Vec<(String, usize)> {
         rows.iter().map(|r| (r.name.clone(), r.depth)).collect()
+    }
+
+    #[test]
+    fn restored_expansion_ignores_other_workspaces() {
+        let tmp = TempDir::new("restore");
+        tmp.mkdir("src");
+        let mut tree = Tree::new(tmp.0.clone());
+        assert!(tree.rows().iter().all(|r| !r.expanded));
+
+        // One state file serves every workspace's sidebars, so a foreign
+        // root must be dropped instead of resurrecting as a phantom row.
+        tree.set_expanded(vec![tmp.0.join("src"), PathBuf::from("/somewhere/else/src")]);
+        assert_eq!(tree.expanded_paths(), vec![tmp.0.join("src")]);
+        assert!(tree.rows().iter().any(|r| r.name == "src" && r.expanded));
     }
 
     #[test]

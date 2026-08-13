@@ -224,6 +224,9 @@ impl Default for ActivityZones {
 impl App {
     pub fn new(root: PathBuf) -> Self {
         let mut tree = Tree::new(root);
+        // Mirror the tree the user was already looking at: a sidebar docked
+        // into a brand-new preview tab starts with the same dirs expanded.
+        tree.set_expanded(sidebar::load_expanded());
         let rows = tree.rows();
         let theme = IconTheme::resolve(
             std::env::var("HERDR_SIDEBAR_ICONS")
@@ -1201,6 +1204,9 @@ impl App {
     /// still exists (else the nearest valid index).
     fn rebuild(&mut self) {
         self.hovered = None;
+        // Every expand/collapse funnels through here, so this is the one
+        // place the persisted shape has to be refreshed for new tabs.
+        sidebar::save_expanded(&self.tree.expanded_paths());
         let selected_path = self.selected_row().map(|r| r.path.clone());
         self.rows = self.tree.rows();
         if self.rows.is_empty() {

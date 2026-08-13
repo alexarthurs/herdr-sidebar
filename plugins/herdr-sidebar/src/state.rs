@@ -218,6 +218,36 @@ pub fn save_state(state: State) {
     let _ = std::fs::write(path, json);
 }
 
+/// Which directories are expanded, kept beside `state.json` rather than in
+/// [`State`] so that stays `Copy` (it is passed by value everywhere).
+fn tree_path() -> Option<PathBuf> {
+    Some(state_dir()?.join("tree.json"))
+}
+
+/// The expanded directories a freshly opened sidebar should start with, so a
+/// new tab mirrors the tree the user was already looking at.
+pub fn load_expanded() -> Vec<PathBuf> {
+    let Some(json) = tree_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<String>>(json.trim_start_matches('\u{feff}'))
+        .map(|v| v.into_iter().map(PathBuf::from).collect())
+        .unwrap_or_default()
+}
+
+/// Best-effort persist of the expanded set; losing it only costs the next
+/// sidebar its starting shape.
+pub fn save_expanded(paths: &[PathBuf]) {
+    let Some(path) = tree_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    if let Ok(json) = serde_json::to_string(&names) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
 /// Forgiving parse: any missing/garbled field falls back to the default, so a
 /// hand-edited or truncated file can never wedge the panels.
 pub fn parse_state(json: &str) -> State {
