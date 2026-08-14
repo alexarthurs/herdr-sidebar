@@ -306,6 +306,107 @@ pub fn save_tree_state(root: &Path, state: &TreeState) {
 }
 
 // ---------------------------------------------------------------------------
+// The source-control view's shape, mirrored into new tabs (parallel to
+// the explorer's tree state). Keyed by the sidebar's cwd: a preview tab's
+// sidebar is spawned with the clicked repo as its cwd, so the two share a
+// key when the originating sidebar already lived in that repo.
+// ---------------------------------------------------------------------------
+
+/// The SCM view state worth mirroring into a fresh sidebar: which drawers
+/// are expanded (by title), the active repo's root, a stable id for the
+/// selected row, the FILE HISTORY target, and the scroll offset.
+#[derive(Default)]
+pub struct ScmState {
+    pub drawers: Vec<String>,
+    pub active_root: Option<String>,
+    pub selected: Option<String>,
+    pub history_target: Option<String>,
+    pub scroll: usize,
+}
+
+fn scm_path() -> Option<PathBuf> {
+    Some(state_dir()?.join("scm.json"))
+}
+
+/// Forgiving decode: anything missing, truncated, or shaped before this file
+/// was cwd-keyed yields an empty map rather than wedging the view.
+type ScmFile = serde_json::Map<String, serde_json::Value>;
+
+fn decode_scm_file(json: &str) -> ScmFile {
+    serde_json::from_str::<serde_json::Value>(json.trim_start_matches('\u{feff}'))
+        .ok()
+        .and_then(|v| match v {
+            serde_json::Value::Object(m) => Some(m),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// One cwd's entry, decoded into [`ScmState`]. Unknown/missing fields default.
+fn scm_state_for(file: &ScmFile, cwd: &Path) -> ScmState {
+    let Some(entry) = file.get(&cwd.display().to_string()) else {
+        return ScmState::default();
+    };
+    let drawers = entry
+        .get("drawers")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    ScmState {
+        drawers,
+        active_root: entry
+            .get("active_root")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        selected: entry
+            .get("selected")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        history_target: entry
+            .get("history_target")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        scroll: entry.get("scroll").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+    }
+}
+
+/// The SCM view saved for `cwd`, for a sidebar starting up in it.
+pub fn load_scm_state(cwd: &Path) -> ScmState {
+    let Some(json) = scm_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return ScmState::default();
+    };
+    scm_state_for(&decode_scm_file(&json), cwd)
+}
+
+/// Best-effort persist of `cwd`'s entry, leaving every other cwd's alone.
+pub fn save_scm_state(cwd: &Path, state: &ScmState) {
+    let Some(path) = scm_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut file = std::fs::read_to_string(&path)
+        .map(|json| decode_scm_file(&json))
+        .unwrap_or_default();
+    file.insert(
+        cwd.display().to_string(),
+        serde_json::json!({
+            "drawers": state.drawers,
+            "active_root": state.active_root,
+            "selected": state.selected,
+            "history_target": state.history_target,
+            "scroll": state.scroll,
+        }),
+    );
+    if let Ok(json) = serde_json::to_string(&file) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The root each space's tree is built from.
 // ---------------------------------------------------------------------------
 

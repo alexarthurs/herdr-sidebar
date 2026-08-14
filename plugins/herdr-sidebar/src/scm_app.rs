@@ -248,6 +248,20 @@ fn parse_drawer_ref(kind: Drawer, line: &str) -> DrawerRef {
     }
 }
 
+/// The stable, repo-independent handle a drawer line points at — for mirroring
+/// a selection across tabs. `None` for blank graph-edge rows.
+fn drawer_spec(dref: &DrawerRef) -> Option<String> {
+    match dref {
+        DrawerRef::Commit(h) => Some(h.clone()),
+        DrawerRef::Stash(n) => Some(format!("stash@{n}")),
+        DrawerRef::Branch { name, .. } => Some(name.clone()),
+        DrawerRef::Tag(t) => Some(t.clone()),
+        DrawerRef::Remote { name, .. } => Some(name.clone()),
+        DrawerRef::Worktree(p) => Some(p.clone()),
+        DrawerRef::None => None,
+    }
+}
+
 /// One discovered repository and its per-repo view state — including its own
 /// commit message, so the multi-repo view mirrors VS Code's per-repo inputs.
 struct Repo {
@@ -574,10 +588,29 @@ impl App {
         let other_exe = std::env::current_exe().ok();
         let sidebar_state = sidebar::load_state();
         let pane_ctl = PaneCtl::from_env();
+
+        // Mirror the SCM view the user was already looking at: a sidebar docked
+        // into a brand-new preview tab starts with the same drawers expanded,
+        // the same repo active, and the same row selected. Parallel to the
+        // explorer's tree-state restore.
+        let saved = sidebar::load_scm_state(&cwd);
+        let mut drawers: [DrawerPanel; 8] = Default::default();
+        for kind in Drawer::ALL {
+            drawers[kind.index()].expanded = saved.drawers.iter().any(|d| d == kind.title());
+        }
+        let active = saved
+            .active_root
+            .as_deref()
+            .and_then(|root| repos.iter().position(|r| r.git.root() == std::path::Path::new(root)))
+            .unwrap_or(0);
+        let history_target = saved.history_target;
+        let selected_id = saved.selected;
+        let saved_scroll = saved.scroll;
+
         let mut app = Self {
             repos,
             discover_err,
-            active: 0,
+            active,
             cwd,
             rows: Vec::new(),
             selected: None,
@@ -585,8 +618,8 @@ impl App {
             snap: false,
             focus: Focus::List,
             theme,
-            drawers: Default::default(),
-            history_target: None,
+            drawers,
+            history_target,
             flash: None,
             suggesting: None,
             syncing: None,
@@ -610,6 +643,14 @@ impl App {
         };
         app.apply_identity();
         app.refresh();
+        // Rows are built now: re-find the selected row by its stable id and
+        // restore the scroll the user left it on.
+        if let Some(id) = selected_id
+            && let Some(i) = app.find_row_by_stable_id(&id)
+        {
+            app.selected = Some(i);
+        }
+        app.scroll = saved_scroll.min(app.rows.len().saturating_sub(1));
         app
     }
 
@@ -751,6 +792,7 @@ impl App {
         }
         self.scroll = 0;
         self.rebuild();
+        self.persist_scm();
     }
 
     fn reload_expanded_drawers(&mut self) {
@@ -1786,7 +1828,9 @@ impl App {
             self.flash = Some(("preview needs a herdr pane".into(), true));
             return;
         };
-        let Some(repo) = self.repos.get(self.active) else { return };
+        let Some(repo) = self.repos.get(self.active) else {
+            return;
+        };
         let spec = match self.drawers[kind.index()].refs.get(index) {
             Some(DrawerRef::Commit(h)) => h.clone(),
             Some(DrawerRef::Stash(n)) => format!("stash@{{{n}}}"),
@@ -1802,8 +1846,12 @@ impl App {
         let doc_key =
             herdr_sidebar::viewer::doc_key_for_show(repo.git.root(), &spec, path.as_deref());
         match herdr_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &doc_key, &payload) {
-            Ok(target) => self.last_preview = Some((doc_key, target)),
-            Err(e) => self.flash = Some((e, true)),
+            Ok(target) => {
+                self.last_preview = Some((doc_key, target));
+            }
+            Err(e) => {
+                self.flash = Some((e, true));
+            }
         }
     }
 
@@ -1814,7 +1862,9 @@ impl App {
             self.flash = Some(("diff preview needs a herdr pane".into(), true));
             return;
         };
-        let Some(repo) = self.repos.get(repo) else { return };
+        let Some(repo) = self.repos.get(repo) else {
+            return;
+        };
         let kind = if staged {
             "staged"
         } else if entry.letter == 'U' {
@@ -1827,8 +1877,12 @@ impl App {
         let doc_key =
             herdr_sidebar::viewer::doc_key_for_diff(repo.git.root(), &entry.path, kind);
         match herdr_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &doc_key, &payload) {
-            Ok(target) => self.last_preview = Some((doc_key, target)),
-            Err(e) => self.flash = Some((e, true)),
+            Ok(target) => {
+                self.last_preview = Some((doc_key, target));
+            }
+            Err(e) => {
+                self.flash = Some((e, true));
+            }
         }
     }
 
@@ -1890,6 +1944,77 @@ impl App {
         }
         herdr_sidebar::viewer::pin_target(target, &doc_key);
         true
+    }
+
+    /// A stable, repo-independent id for `index`'s row — survives a rebuild
+    /// so a fresh sidebar can re-find the row the user had selected. `None`
+    /// for non-selectable widget rows and blank graph-edge lines.
+    fn row_stable_id(&self, index: usize) -> Option<String> {
+        let row = self.rows.get(index)?;
+        match row {
+            Row::RepoHeader(r) => self
+                .repos
+                .get(*r)
+                .map(|r| format!("repo:{}", r.git.root().display())),
+            Row::StagedHeader(r) => self
+                .repos
+                .get(*r)
+                .map(|r| format!("staged-h:{}", r.git.root().display())),
+            Row::ChangesHeader(r) => self
+                .repos
+                .get(*r)
+                .map(|r| format!("changes-h:{}", r.git.root().display())),
+            Row::Staged(r, i) => self
+                .repos
+                .get(*r)
+                .and_then(|repo| repo.status.staged.get(*i))
+                .map(|e| format!("staged:{}", e.path)),
+            Row::Unstaged(r, i) => self
+                .repos
+                .get(*r)
+                .and_then(|repo| repo.status.unstaged.get(*i))
+                .map(|e| format!("unstaged:{}", e.path)),
+            Row::DrawerHeader(kind) => Some(format!("drawer-h:{}", kind.title())),
+            Row::DrawerLine(kind, i) => self
+                .drawers
+                [kind.index()]
+                .refs
+                .get(*i)
+                .and_then(drawer_spec)
+                .map(|s| format!("drawer:{}:{}", kind.title(), s)),
+            Row::Message(_) | Row::Commit(_) => None,
+        }
+    }
+
+    /// Inverse of [`row_stable_id`]: the row whose id matches, if any.
+    fn find_row_by_stable_id(&self, id: &str) -> Option<usize> {
+        (0..self.rows.len()).find(|&i| self.row_stable_id(i).as_deref() == Some(id))
+    }
+
+    /// A snapshot of the view state worth mirroring into a new tab.
+    fn snapshot_scm(&self) -> sidebar::ScmState {
+        let drawers = Drawer::ALL
+            .iter()
+            .filter(|k| self.drawers[k.index()].expanded)
+            .map(|k| k.title().to_string())
+            .collect();
+        let active_root = self
+            .repos
+            .get(self.active)
+            .map(|r| r.git.root().display().to_string());
+        let selected = self.selected.and_then(|i| self.row_stable_id(i));
+        sidebar::ScmState {
+            drawers,
+            active_root,
+            selected,
+            history_target: self.history_target.clone(),
+            scroll: self.scroll,
+        }
+    }
+
+    /// Persist the view state for the next sidebar started in this cwd.
+    fn persist_scm(&self) {
+        sidebar::save_scm_state(&self.cwd, &self.snapshot_scm());
     }
 
     /// `o`: open the diff for the currently selected file row.
@@ -2003,12 +2128,14 @@ impl App {
             self.snap = true;
             self.follow_selection();
         }
+        self.persist_scm();
     }
 
     /// Wheel: move the VIEW only — the selection stays where it is.
     fn scroll_view(&mut self, delta: isize) {
         let max = self.rows.len().saturating_sub(1) as isize;
         self.scroll = (self.scroll as isize + delta).clamp(0, max) as usize;
+        self.persist_scm();
     }
 
     fn move_by(&mut self, delta: isize) {
@@ -2068,6 +2195,7 @@ impl App {
             Row::Staged(r, i) => self.run_op(|git, e| git.unstage(e), r, i, true),
             Row::Unstaged(r, i) => self.run_op(|git, e| git.stage(e), r, i, false),
         }
+        self.persist_scm();
     }
 
     fn run_op(
