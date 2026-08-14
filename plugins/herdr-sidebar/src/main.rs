@@ -26,21 +26,42 @@ fn main() -> std::io::Result<()> {
         Some("--launch-decision") => {
             // Optional second arg picks the source-control decision (the
             // open-git launcher); default is the explorer/sidebar decision.
+            // Optional THIRD arg scopes the decision to a tab or workspace —
+            // it must match the scope the hook docks into, or the decision
+            // answers for one tab while the dock lands in another.
             let now = state::unix_now();
+            let scope = std::env::args().nth(3).unwrap_or_default();
             let out = if std::env::args().nth(2).as_deref() == Some("git") {
                 launch::launch_decision_git(&read_stdin()?, now)
             } else {
-                launch::launch_decision(&read_stdin()?, now)
+                launch::launch_decision_in(&read_stdin()?, now, &scope)
             };
             println!("{out}");
             return Ok(());
         }
         Some("--focused-pane") => {
-            println!("{}", launch::focused_pane(&read_stdin()?));
+            // Optional scope (tab or workspace id) confines the lookup to the
+            // tab being docked; without it the globally focused pane wins and
+            // a new tab gets rooted in whatever project was last focused.
+            let scope = std::env::args().nth(2).unwrap_or_default();
+            println!("{}", launch::focused_pane_in(&read_stdin()?, &scope));
+            return Ok(());
+        }
+        Some("--event-scope") => {
+            let payload = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
+            println!("{}", launch::event_scope(&payload));
             return Ok(());
         }
         Some("--open-plan") => {
             println!("{}", launch::open_plan(&read_stdin()?));
+            return Ok(());
+        }
+        Some("--event-kind") => {
+            // Which event ran the ensure hook, so it can treat a brand-new
+            // space differently from an ordinary focus. Empty when herdr
+            // supplies no payload (e.g. a manual invocation).
+            let payload = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
+            println!("{}", launch::event_kind(&payload));
             return Ok(());
         }
         Some("--focused-tab") => {

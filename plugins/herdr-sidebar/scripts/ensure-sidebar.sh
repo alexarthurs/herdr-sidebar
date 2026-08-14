@@ -35,16 +35,27 @@ trap 'rmdir "$lock_dir" 2>/dev/null' EXIT
 panes="$("$herdr_bin" pane list 2>/dev/null || true)"
 [ -n "$panes" ] || exit 0
 
-decision="$(printf '%s' "$panes" | "$bin" --launch-decision 2>/dev/null || true)"
+# The tab THIS event is about. The globally focused pane is still the space
+# you came from during a workspace switch, which rooted new sidebars in the
+# wrong project. Everything below reasons about this one scope — decision,
+# snooze check, and spawn cwd must agree or we dock into the wrong tab.
+scope="$("$bin" --event-scope 2>/dev/null || true)"
+
+decision="$(printf '%s' "$panes" | "$bin" --launch-decision "" "$scope" 2>/dev/null || true)"
 [ "$decision" = "OPEN" ] || exit 0
 
 # Respect a tab the user toggled closed (open-explorer.sh writes the marker) —
 # otherwise the very next focus event would reopen what they just closed.
 snooze_dir="${TMPDIR:-/tmp}/herdr-sidebar-snooze"
-tab="$(printf '%s' "$panes" | "$bin" --focused-tab 2>/dev/null || true)"
+# A scope containing ':' IS a tab id (w4:tY); a bare one is a workspace, and a
+# just-created space has no marker to respect, so global focus is fine there.
+case "$scope" in
+  *:*) tab="$scope" ;;
+  *)   tab="$(printf '%s' "$panes" | "$bin" --focused-tab 2>/dev/null || true)" ;;
+esac
 [ -n "$tab" ] && [ -f "$snooze_dir/${tab//:/_}" ] && exit 0
 
-fp="$(printf '%s' "$panes" | "$bin" --focused-pane 2>/dev/null || true)"
+fp="$(printf '%s' "$panes" | "$bin" --focused-pane "$scope" 2>/dev/null || true)"
 fid="${fp%%	*}"
 fcwd="${fp#*	}"
 [ -n "$fid" ] || exit 0
@@ -63,7 +74,17 @@ np="$(printf '%s' "$out" | sed -n 's/.*"pane_id":"\([^"]*\)".*/\1/p' | head -n1)
 [ -n "$np" ] || exit 0
 
 "$herdr_bin" pane swap --source-pane "$np" --target-pane "$target" >/dev/null 2>&1 || true
-"$herdr_bin" pane run "$np" "exec \"$bin\""
+
+# Tell the sidebar WHICH event docked it. Only a brand-new space offers the
+# root picker; every other focus event must stay quiet (this hook fires on
+# five events, and the tab model docks a sidebar into every preview tab).
+# --event-kind restricts the value to lower_snake, so it is safe to inline.
+kind="$("$bin" --event-kind 2>/dev/null || true)"
+if [ "$kind" = "workspace_created" ]; then
+  "$herdr_bin" pane run "$np" "exec env HERDR_SIDEBAR_SPAWN_EVENT=workspace_created \"$bin\""
+else
+  "$herdr_bin" pane run "$np" "exec \"$bin\""
+fi
 "$herdr_bin" pane rename "$np" Explorer >/dev/null 2>&1 || true
 
 # Hand focus back if the swap left it on the explorer (focus follows the slot).

@@ -40,6 +40,7 @@ struct Pane {
     #[serde(default)]
     focused: bool,
     tab_id: Option<String>,
+    workspace_id: Option<String>,
     /// Metadata tokens reported via `pane.report_metadata`; shape of the
     /// values is host-defined, only key presence matters here.
     #[serde(default)]
@@ -152,11 +153,31 @@ fn token_stale(
 /// focused pane, or an unsafe id all degrade to `OPEN` — the safe default is
 /// a fresh explorer, never acting on a pane in an unknown tab.
 pub fn launch_decision(pane_list_json: &str, now: u64) -> String {
+    launch_decision_in(pane_list_json, now, "")
+}
+
+/// [`launch_decision`] confined to `scope` (a tab or workspace id), so the
+/// decision reasons about the tab the hook is actually docking into. An
+/// empty scope keeps the global behavior.
+///
+/// This MUST use the same scope as [`focused_pane_in`]: deciding against the
+/// focused tab while docking into another one answers OPEN for a tab that
+/// already has a sidebar, and twins it.
+pub fn launch_decision_in(pane_list_json: &str, now: u64, scope: &str) -> String {
     let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
         return "OPEN".to_string();
     };
     let panes = &msg.result.panes;
-    let Some(focused) = panes.iter().find(|p| p.focused) else {
+    let in_scope = |p: &&Pane| {
+        scope.is_empty()
+            || p.tab_id.as_deref() == Some(scope)
+            || p.workspace_id.as_deref() == Some(scope)
+    };
+    let Some(focused) = panes
+        .iter()
+        .find(|p| in_scope(p) && p.focused)
+        .or_else(|| panes.iter().find(in_scope))
+    else {
         return "OPEN".to_string();
     };
     let explorer = panes
@@ -282,6 +303,90 @@ pub fn open_plan(layout_json: &str) -> String {
     };
     let ratio = (TARGET_COLS / rect.width as f64).clamp(0.15, 0.5);
     format!("{id}\t{ratio:.2}")
+}
+
+/// The tab (preferred) or workspace the event concerns, from
+/// `HERDR_PLUGIN_EVENT_JSON`; "" when the payload names neither.
+///
+/// The ensure hook used to root a new sidebar in the GLOBALLY focused pane's
+/// cwd, which during a workspace switch is still the space you came from —
+/// observed live as tremor's sidebar rooted in bedrock. The payload knows
+/// which tab is being docked; this is that answer.
+pub fn event_scope(event_json: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(strip_bom(event_json)) else {
+        return String::new();
+    };
+    let data = value.get("data").unwrap_or(&value);
+    let pick = |key: &str| -> Option<String> {
+        data.get(key)
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                // workspace_created carries a nested WorkspaceInfo.
+                data.get(key.trim_end_matches("_id"))
+                    .and_then(|w| w.get(key))
+                    .and_then(|v| v.as_str())
+            })
+            .map(str::to_string)
+    };
+    pick("tab_id")
+        .or_else(|| pick("workspace_id"))
+        .filter(|s| is_flag_safe(s))
+        .unwrap_or_default()
+}
+
+/// The pane whose cwd a sidebar docked into `scope` should be rooted from:
+/// the focused pane WITHIN that scope, else any pane in it (a brand-new space
+/// may not have a focused pane yet). An empty scope keeps the old global
+/// behavior. Returns `<pane_id>\t<cwd>`, or "" when the scope has no panes.
+pub fn focused_pane_in(pane_list_json: &str, scope: &str) -> String {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return String::new();
+    };
+    let in_scope = |p: &&Pane| {
+        scope.is_empty()
+            || p.tab_id.as_deref() == Some(scope)
+            || p.workspace_id.as_deref() == Some(scope)
+    };
+    let panes = &msg.result.panes;
+    let Some(chosen) = panes
+        .iter()
+        .find(|p| in_scope(p) && p.focused)
+        .or_else(|| panes.iter().find(in_scope))
+    else {
+        return String::new();
+    };
+    let Some(id) = chosen.pane_id.as_deref().filter(|id| is_flag_safe(id)) else {
+        return String::new();
+    };
+    let cwd = chosen.cwd.as_deref().map(strip_verbatim).unwrap_or_default();
+    format!("{id}\t{cwd}")
+}
+
+/// Which event invoked the ensure hook, from `HERDR_PLUGIN_EVENT_JSON`.
+///
+/// All five hooks run the SAME script, so the payload is the only way to
+/// treat space creation differently from an ordinary focus. The envelope
+/// shape is undocumented, so the discriminator is looked for at the top level
+/// and under the usual wrappers.
+///
+/// The result is interpolated into a shell command, so it is restricted to a
+/// plain `lower_snake` identifier; anything else yields "".
+pub fn event_kind(event_json: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(strip_bom(event_json)) else {
+        return String::new();
+    };
+    let kind = ["type", "data", "event"]
+        .iter()
+        .find_map(|key| match value.get(key) {
+            Some(serde_json::Value::String(s)) => Some(s.as_str()),
+            Some(inner) => inner.get("type").and_then(|v| v.as_str()),
+            None => None,
+        })
+        .unwrap_or_default();
+    let safe = !kind.is_empty()
+        && kind.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+        && kind.len() <= 64;
+    if safe { kind.to_string() } else { String::new() }
 }
 
 /// A workspace's label from a `workspace list` JSON, empty when unknown.
@@ -503,6 +608,108 @@ fn strip_verbatim(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decision and the dock must reason about the SAME tab. Scoping only
+    /// the spawn cwd would let the decision see a focused tab with no sidebar,
+    /// answer OPEN, and dock a second sidebar into a scoped tab that already
+    /// had one.
+    #[test]
+    fn the_decision_follows_the_same_scope_as_the_dock() {
+        let json = pane_list(
+            r#"{"pane_id":"w4:pM","tab_id":"w4:tY","workspace_id":"w4","focused":true,"cwd":"/repo/faultline"},
+               {"pane_id":"wH:p1","tab_id":"wH:t1","workspace_id":"wH","cwd":"/repo/tremor"},
+               {"pane_id":"wH:p2","tab_id":"wH:t1","workspace_id":"wH","label":"Explorer",
+                "tokens":{"herdr-sidebar-explorer":"9999999999"}}"#,
+        );
+        // Unscoped: the focused tab has no explorer, so a fresh one is right.
+        assert_eq!(launch_decision_in(&json, 9999999999, ""), "OPEN");
+        // Scoped to wH, whose tab ALREADY has one — docking again would twin it.
+        assert_eq!(launch_decision_in(&json, 9999999999, "wH"), "FOCUS wH:p2");
+    }
+
+    /// The sidebar is rooted from the cwd it is spawned with, so picking the
+    /// globally focused pane roots a new tab's sidebar in whatever project
+    /// the user was last looking at — observed live as tremor's sidebar
+    /// rooted in bedrock. The event payload names the scope; honor it.
+    #[test]
+    fn spawn_cwd_comes_from_the_events_own_scope() {
+        let json = pane_list(
+            r#"{"pane_id":"w4:pM","tab_id":"w4:tY","workspace_id":"w4","focused":true,"cwd":"/repo/faultline"},
+               {"pane_id":"wH:p1","tab_id":"wH:t1","workspace_id":"wH","cwd":"/repo/tremor"},
+               {"pane_id":"wH:p9","tab_id":"wH:t2","workspace_id":"wH","cwd":"/repo/tremor/sub"}"#,
+        );
+        // A workspace scope takes that workspace's pane, NOT the focused one.
+        assert_eq!(focused_pane_in(&json, "wH"), "wH:p1\t/repo/tremor");
+        // A tab scope is more specific still.
+        assert_eq!(focused_pane_in(&json, "wH:t2"), "wH:p9\t/repo/tremor/sub");
+        // No scope keeps the old global behavior.
+        assert_eq!(focused_pane_in(&json, ""), "w4:pM\t/repo/faultline");
+        // A scope whose panes are gone yields nothing rather than guessing.
+        assert_eq!(focused_pane_in(&json, "wQ"), "");
+    }
+
+    /// Within a scope the focused pane still wins; a brand-new space may have
+    /// no focused pane yet, and then any pane in it is the right root.
+    #[test]
+    fn a_scope_prefers_its_focused_pane_but_settles_for_any() {
+        let json = pane_list(
+            r#"{"pane_id":"wH:p1","tab_id":"wH:t1","workspace_id":"wH","cwd":"/repo/a"},
+               {"pane_id":"wH:p2","tab_id":"wH:t1","workspace_id":"wH","focused":true,"cwd":"/repo/b"}"#,
+        );
+        assert_eq!(focused_pane_in(&json, "wH"), "wH:p2\t/repo/b");
+
+        let unfocused = pane_list(
+            r#"{"pane_id":"wH:p1","tab_id":"wH:t1","workspace_id":"wH","cwd":"/repo/a"}"#,
+        );
+        assert_eq!(focused_pane_in(&unfocused, "wH"), "wH:p1\t/repo/a");
+    }
+
+    #[test]
+    fn event_scope_prefers_the_tab_then_the_workspace() {
+        let tab = r#"{"event":"tab_focused","data":{"type":"tab_focused","tab_id":"w4:tY","workspace_id":"w4"}}"#;
+        assert_eq!(event_scope(tab), "w4:tY");
+        let ws = r#"{"event":"workspace_created","data":{"type":"workspace_created","workspace_id":"wH"}}"#;
+        assert_eq!(event_scope(ws), "wH");
+        // Nested workspace object, as workspace_created carries WorkspaceInfo.
+        let nested = r#"{"event":"workspace_created","data":{"type":"workspace_created","workspace":{"workspace_id":"wH"}}}"#;
+        assert_eq!(event_scope(nested), "wH");
+        assert_eq!(event_scope("garbage"), "");
+        // Shell-unsafe ids are dropped, same as the event kind.
+        assert_eq!(event_scope(r#"{"data":{"workspace_id":"a b; rm -rf /"}}"#), "");
+    }
+
+    /// The hook fires for five different events into ONE script, so the only
+    /// way to treat space creation specially is the payload. The envelope
+    /// shape isn't documented, so the discriminator is looked for at the top
+    /// level and under the usual wrappers.
+    #[test]
+    fn event_kind_is_found_whatever_the_envelope() {
+        assert_eq!(event_kind(r#"{"type":"workspace_created"}"#), "workspace_created");
+        assert_eq!(
+            event_kind(r#"{"data":{"type":"workspace_created"}}"#),
+            "workspace_created"
+        );
+        assert_eq!(
+            event_kind(r#"{"event":{"type":"tab_focused"}}"#),
+            "tab_focused"
+        );
+    }
+
+    /// The kind is interpolated into a shell command, so anything that is not
+    /// a plain lower_snake identifier is dropped rather than passed along.
+    #[test]
+    fn event_kind_refuses_anything_shell_unsafe() {
+        for hostile in [
+            r#"{"type":"a; rm -rf /"}"#,
+            r#"{"type":"$(whoami)"}"#,
+            r#"{"type":"a b"}"#,
+            r#"{"type":42}"#,
+            r#"{"type":""}"#,
+            "garbage",
+        ] {
+            assert_eq!(event_kind(hostile), "", "{hostile}");
+        }
+    }
 
     #[test]
     fn workspace_labels_resolve_by_id_and_degrade_quietly() {
