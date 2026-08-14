@@ -680,6 +680,7 @@ pub fn open_in_pane(
     // project's ephemeral tab and focus jumped there, which reads as the
     // tree refusing to change.
     let my_workspace = crate::launch::workspace_of(&list, my_pane_id);
+    let my_tab = crate::launch::tab_of(&list, my_pane_id);
     let previews: Vec<PreviewPane> = previews_in(&list)
         .into_iter()
         .filter(|p| p.workspace_id == my_workspace)
@@ -687,7 +688,7 @@ pub fn open_in_pane(
 
     // 1. Already open — jump to it, pinned or not.
     if let Some(p) = preview_for_doc(&previews, doc_key) {
-        let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": p.tab_id }));
+        focus_for_preview(&p.tab_id, my_pane_id, &my_tab);
         return Ok(PreviewTarget { pane_id: p.pane_id, tab_id: p.tab_id });
     }
 
@@ -699,12 +700,31 @@ pub fn open_in_pane(
             "tab.rename",
             serde_json::json!({ "tab_id": p.tab_id, "label": tab_label(doc_key, false) }),
         );
-        let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": p.tab_id }));
+        focus_for_preview(&p.tab_id, my_pane_id, &my_tab);
         return Ok(PreviewTarget { pane_id: p.pane_id, tab_id: p.tab_id });
     }
 
     // 3. Nothing reusable — a tab of its own.
     spawn_preview_tab(my_pane_id, spawn_cwd, doc_key, payload)
+}
+
+/// Focus after routing a preview.
+///
+/// When the preview already lives in the caller's OWN tab (you are standing
+/// in the preview tab and click its file in the sidebar), keep the SIDEBAR
+/// focused: `tab.focus` would hand pane focus to the viewer, and then the
+/// second click of a double-click-to-pin lands on the viewer instead of the
+/// sidebar and the pin never fires. Browsing several files in a row needs the
+/// same — every click must keep reaching the sidebar.
+///
+/// When the preview is in a DIFFERENT tab (you clicked from your terminal
+/// tab), jump to it so the content is shown.
+fn focus_for_preview(preview_tab: &str, my_pane_id: &str, my_tab: &str) {
+    if preview_tab == my_tab {
+        let _ = ipc::call_text("pane.focus", serde_json::json!({ "pane_id": my_pane_id }));
+    } else {
+        let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": preview_tab }));
+    }
 }
 
 /// Where a preview request landed. Handed back so a double click can pin
