@@ -284,6 +284,41 @@ pub fn open_plan(layout_json: &str) -> String {
     format!("{id}\t{ratio:.2}")
 }
 
+/// A workspace's label from a `workspace list` JSON, empty when unknown.
+///
+/// The label is how a remembered tree root is keyed: workspace IDs identify a
+/// space *instance* and get reassigned when a space is closed and recreated,
+/// so they cannot carry a choice across that boundary.
+pub fn workspace_label(workspace_list_json: &str, workspace_id: &str) -> String {
+    #[derive(Deserialize)]
+    struct Msg {
+        result: Res,
+    }
+    #[derive(Deserialize)]
+    struct Res {
+        #[serde(default)]
+        workspaces: Vec<Ws>,
+    }
+    #[derive(Deserialize)]
+    struct Ws {
+        workspace_id: Option<String>,
+        label: Option<String>,
+    }
+    if workspace_id.is_empty() {
+        return String::new();
+    }
+    serde_json::from_str::<Msg>(strip_bom(workspace_list_json))
+        .ok()
+        .and_then(|msg| {
+            msg.result
+                .workspaces
+                .into_iter()
+                .find(|w| w.workspace_id.as_deref() == Some(workspace_id))
+                .and_then(|w| w.label)
+        })
+        .unwrap_or_default()
+}
+
 /// The focused pane's tab id from a `pane list` JSON (flag-safe, else empty).
 pub fn focused_tab(pane_list_json: &str) -> String {
     let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
@@ -468,6 +503,23 @@ fn strip_verbatim(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_labels_resolve_by_id_and_degrade_quietly() {
+        let json = r#"{"result":{"workspaces":[
+            {"workspace_id":"wG","label":"tremor"},
+            {"workspace_id":"w4","label":"faultline"},
+            {"workspace_id":"wZ"}
+        ]}}"#;
+        assert_eq!(workspace_label(json, "wG"), "tremor");
+        assert_eq!(workspace_label(json, "w4"), "faultline");
+        // A space with no label, an id that is gone, and a missing id all
+        // yield "" so the caller falls back to the pane's cwd.
+        assert_eq!(workspace_label(json, "wZ"), "");
+        assert_eq!(workspace_label(json, "wQ"), "");
+        assert_eq!(workspace_label(json, ""), "");
+        assert_eq!(workspace_label("garbage", "wG"), "");
+    }
 
     fn pane_list(panes: &str) -> String {
         format!(r#"{{"id":"cli:pane:list","result":{{"panes":[{panes}]}}}}"#)

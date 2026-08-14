@@ -130,10 +130,35 @@ fn read_stdin() -> std::io::Result<String> {
     Ok(buf)
 }
 
+/// The label of the space this pane lives in, or "" when it can't be
+/// resolved — the caller then falls back to the pane's cwd.
+fn workspace_label() -> String {
+    let Ok(ws_id) = std::env::var("HERDR_WORKSPACE_ID") else { return String::new() };
+    herdr_sidebar::ipc::call_text("workspace.list", serde_json::json!({}))
+        .map(|json| herdr_sidebar::launch::workspace_label(&json, &ws_id))
+        .unwrap_or_default()
+}
+
+/// The directory the tree is built from: the root this space remembers,
+/// else the cwd the pane was spawned with.
+///
+/// The spawn cwd is only a guess — the ensure hook takes it from whichever
+/// pane happened to be focused — so a remembered choice always wins. A
+/// remembered root that has since been deleted is ignored rather than
+/// yielding an empty tree.
+fn resolve_root() -> std::io::Result<std::path::PathBuf> {
+    if let Some(root) = herdr_sidebar::state::load_root(&workspace_label())
+        && root.is_dir()
+    {
+        return Ok(root);
+    }
+    std::env::current_dir()
+}
+
 /// The explorer's event loop: short poll so the liveness heartbeat keeps
 /// stamping even while idle.
 fn run_explorer(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<Exit> {
-    let root = std::env::current_dir()?;
+    let root = resolve_root()?;
     let mut app = explorer_app::App::new(root);
     loop {
         terminal.draw(|frame| app.draw(frame))?;

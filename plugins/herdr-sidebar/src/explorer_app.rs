@@ -227,7 +227,7 @@ impl App {
         // Mirror the tree the user was already looking at: a sidebar docked
         // into a brand-new preview tab starts with the same dirs expanded
         // and the same row selected.
-        let saved = sidebar::load_tree_state();
+        let saved = sidebar::load_tree_state(&tree.root_path());
         tree.set_expanded(saved.expanded);
         let rows = tree.rows();
         let restored_selection = saved
@@ -1136,10 +1136,13 @@ impl App {
     /// a tab opened for a preview comes up mirroring this one. Not a live
     /// sync: already-open tabs are never revisited.
     fn persist_tree(&self) {
-        sidebar::save_tree_state(&sidebar::TreeState {
-            expanded: self.tree.expanded_paths(),
-            selected: self.selected_row().map(|r| r.path.clone()),
-        });
+        sidebar::save_tree_state(
+            &self.tree.root_path(),
+            &sidebar::TreeState {
+                expanded: self.tree.expanded_paths(),
+                selected: self.selected_row().map(|r| r.path.clone()),
+            },
+        );
     }
 
     fn move_by(&mut self, delta: isize) {

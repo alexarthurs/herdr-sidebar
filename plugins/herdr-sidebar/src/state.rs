@@ -11,7 +11,7 @@
 //! separated panes are the same binary pinned to a starting view with
 //! `--view`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Pane label (and metadata identity) of the unified pane.
 pub const SIDEBAR_LABEL: &str = "Sidebar";
@@ -235,43 +235,137 @@ fn tree_path() -> Option<PathBuf> {
     Some(state_dir()?.join("tree.json"))
 }
 
-/// Forgiving read: a missing, truncated, or older array-shaped file yields
-/// defaults rather than wedging the tree.
-pub fn load_tree_state() -> TreeState {
-    let Some(json) = tree_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
-        return TreeState::default();
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(json.trim_start_matches('\u{feff}'))
-    else {
-        return TreeState::default();
-    };
+/// The whole file: tree state per workspace ROOT. One file serves every
+/// sidebar in the session, and each agent's tab is rooted somewhere
+/// different, so a single unkeyed entry let one project's expansion and
+/// selection load under another project's root.
+type TreeFile = serde_json::Map<String, serde_json::Value>;
+
+/// Forgiving decode: anything missing, truncated, or written before this file
+/// was root-keyed yields an empty map rather than wedging the tree.
+fn decode_tree_file(json: &str) -> TreeFile {
+    serde_json::from_str::<serde_json::Value>(json.trim_start_matches('\u{feff}'))
+        .ok()
+        .and_then(|v| match v {
+            // Pre-root-keyed shapes (a bare array, then a flat
+            // {expanded, selected}) cannot be attributed to a root, so they
+            // are dropped instead of applied to whoever opens first.
+            serde_json::Value::Object(m) if !m.contains_key("expanded") => Some(m),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// One root's entry.
+fn tree_state_for(file: &TreeFile, root: &Path) -> TreeState {
     let paths = |v: Option<&serde_json::Value>| -> Vec<PathBuf> {
         v.and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|s| s.as_str()).map(PathBuf::from).collect())
             .unwrap_or_default()
     };
-    // The first version of this file was a bare array of expanded dirs.
-    if value.is_array() {
-        return TreeState { expanded: paths(Some(&value)), selected: None };
-    }
+    let Some(entry) = file.get(&root.display().to_string()) else {
+        return TreeState::default();
+    };
     TreeState {
-        expanded: paths(value.get("expanded")),
-        selected: value.get("selected").and_then(|v| v.as_str()).map(PathBuf::from),
+        expanded: paths(entry.get("expanded")),
+        selected: entry.get("selected").and_then(|v| v.as_str()).map(PathBuf::from),
     }
 }
 
-/// Best-effort persist; losing it only costs the next sidebar its starting
-/// shape.
-pub fn save_tree_state(state: &TreeState) {
+/// The tree state saved for `root`, for a sidebar starting up in it.
+pub fn load_tree_state(root: &Path) -> TreeState {
+    let Some(json) = tree_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return TreeState::default();
+    };
+    tree_state_for(&decode_tree_file(&json), root)
+}
+
+/// Best-effort persist of `root`'s entry, leaving every other root's alone.
+/// Losing it only costs the next sidebar its starting shape.
+pub fn save_tree_state(root: &Path, state: &TreeState) {
     let Some(path) = tree_path() else { return };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let json = serde_json::json!({
-        "expanded": state.expanded.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-        "selected": state.selected.as_ref().map(|p| p.display().to_string()),
-    });
-    let _ = std::fs::write(path, json.to_string());
+    // Read-modify-write: concurrent sidebars in DIFFERENT roots must not
+    // erase each other's entries. Two sidebars in the SAME root race, and
+    // last-writer-wins is fine — they hold the same tree.
+    let mut file = std::fs::read_to_string(&path)
+        .map(|json| decode_tree_file(&json))
+        .unwrap_or_default();
+    file.insert(
+        root.display().to_string(),
+        serde_json::json!({
+            "expanded": state.expanded.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            "selected": state.selected.as_ref().map(|p| p.display().to_string()),
+        }),
+    );
+    if let Ok(json) = serde_json::to_string(&file) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The root each space's tree is built from.
+// ---------------------------------------------------------------------------
+
+/// Remembered tree roots, keyed by workspace LABEL.
+///
+/// Not by workspace id: ids identify a space *instance*, not a project —
+/// closing and recreating `tremor` moved it from `wG` to `wH` within one
+/// session — so an id key would hand a new space a root chosen for an
+/// unrelated one. The label is intrinsic to the project and survives a server
+/// restart; renaming a space forgets its root, which is the accepted cost.
+type RootsFile = serde_json::Map<String, serde_json::Value>;
+
+fn roots_path() -> Option<PathBuf> {
+    Some(state_dir()?.join("roots.json"))
+}
+
+/// Forgiving decode: anything missing or garbled yields an empty map, so a
+/// hand-edited file forgets a choice rather than wedging the tree.
+fn decode_roots_file(json: &str) -> RootsFile {
+    serde_json::from_str::<serde_json::Value>(json.trim_start_matches('\u{feff}'))
+        .ok()
+        .and_then(|v| match v {
+            serde_json::Value::Object(m) => Some(m),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The root remembered for `label`, if any. An empty label never matches —
+/// it would collide across every space that failed to report one.
+fn root_for_label(file: &RootsFile, label: &str) -> Option<PathBuf> {
+    if label.is_empty() {
+        return None;
+    }
+    file.get(label).and_then(|v| v.as_str()).map(PathBuf::from)
+}
+
+/// The root this space's tree should use, or `None` to fall back to the
+/// pane's cwd.
+pub fn load_root(label: &str) -> Option<PathBuf> {
+    let json = roots_path().and_then(|p| std::fs::read_to_string(p).ok())?;
+    root_for_label(&decode_roots_file(&json), label)
+}
+
+/// Remember `root` for `label`, leaving other spaces' choices alone.
+pub fn save_root(label: &str, root: &Path) {
+    if label.is_empty() {
+        return;
+    }
+    let Some(path) = roots_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut file = std::fs::read_to_string(&path)
+        .map(|json| decode_roots_file(&json))
+        .unwrap_or_default();
+    file.insert(label.to_string(), serde_json::json!(root.display().to_string()));
+    if let Ok(json) = serde_json::to_string(&file) {
+        let _ = std::fs::write(path, json);
+    }
 }
 
 /// Forgiving parse: any missing/garbled field falls back to the default, so a
@@ -312,41 +406,68 @@ pub fn parse_state(json: &str) -> State {
 mod tests {
     use super::*;
 
-    /// `load_tree_state` parses whatever is on disk. The first release wrote
-    /// a bare array of expanded dirs; those files are still out there and
-    /// must not wipe the tree or panic.
+    /// Workspace IDs are per-space-INSTANCE, not per-project: closing and
+    /// recreating `tremor` moved it from `wG` to `wH` inside one session.
+    /// Keying a remembered root on the id would hand a future space the root
+    /// picked for an unrelated one, so the label is the key.
     #[test]
-    fn tree_state_reads_both_the_array_and_object_shapes() {
-        fn parse(json: &str) -> TreeState {
-            // Mirrors load_tree_state's decoding, minus the file read.
-            let value: serde_json::Value = match serde_json::from_str(json) {
-                Ok(v) => v,
-                Err(_) => return TreeState::default(),
-            };
-            let paths = |v: Option<&serde_json::Value>| -> Vec<PathBuf> {
-                v.and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|s| s.as_str()).map(PathBuf::from).collect())
-                    .unwrap_or_default()
-            };
-            if value.is_array() {
-                return TreeState { expanded: paths(Some(&value)), selected: None };
-            }
-            TreeState {
-                expanded: paths(value.get("expanded")),
-                selected: value.get("selected").and_then(|v| v.as_str()).map(PathBuf::from),
-            }
+    fn remembered_roots_are_keyed_by_workspace_label() {
+        let file = decode_roots_file(
+            r#"{"tremor":"/repo/tremor","faultline":"/repo/faultline"}"#,
+        );
+        assert_eq!(root_for_label(&file, "tremor"), Some(PathBuf::from("/repo/tremor")));
+        assert_eq!(root_for_label(&file, "faultline"), Some(PathBuf::from("/repo/faultline")));
+        // An unknown space has made no choice yet — the caller falls back to cwd.
+        assert_eq!(root_for_label(&file, "bedrock"), None);
+        // An empty label must never match; it would collide across spaces.
+        assert_eq!(root_for_label(&file, ""), None);
+    }
+
+    #[test]
+    fn a_garbled_roots_file_forgets_rather_than_wedges() {
+        for junk in ["garbage", "[]", r#"{"tremor":42}"#, ""] {
+            assert_eq!(root_for_label(&decode_roots_file(junk), "tremor"), None, "{junk}");
         }
+    }
 
-        let legacy = parse(r#"["/r/src"]"#);
-        assert_eq!(legacy.expanded, vec![PathBuf::from("/r/src")]);
-        assert_eq!(legacy.selected, None);
+    /// One state file serves every sidebar in the session, so it has to be
+    /// keyed by tree ROOT. Keyed globally, a sidebar spawned in another
+    /// agent's tab loaded whatever project the user last touched — their
+    /// expansion and selection appeared under a different agent's root.
+    #[test]
+    fn tree_state_is_per_root_so_agents_do_not_bleed_into_each_other() {
+        let a = PathBuf::from("/repo/faultline");
+        let b = PathBuf::from("/repo/tremor");
+        let file = decode_tree_file(
+            r#"{"/repo/faultline":{"expanded":["/repo/faultline/src"],
+                                   "selected":"/repo/faultline/src/main.rs"},
+                "/repo/tremor":{"expanded":["/repo/tremor/lib"],"selected":null}}"#,
+        );
+        assert_eq!(tree_state_for(&file, &a).expanded, vec![a.join("src")]);
+        assert_eq!(tree_state_for(&file, &a).selected, Some(a.join("src/main.rs")));
+        assert_eq!(tree_state_for(&file, &b).expanded, vec![b.join("lib")]);
+        assert_eq!(tree_state_for(&file, &b).selected, None, "tremor has no selection");
+        // An unknown root starts fresh instead of inheriting someone else's.
+        assert_eq!(tree_state_for(&file, Path::new("/repo/other")), TreeState::default());
+    }
 
-        let current = parse(r#"{"expanded":["/r/src"],"selected":"/r/src/main.rs"}"#);
-        assert_eq!(current.expanded, vec![PathBuf::from("/r/src")]);
-        assert_eq!(current.selected, Some(PathBuf::from("/r/src/main.rs")));
-
-        assert_eq!(parse(r#"{"expanded":["/r/src"],"selected":null}"#).selected, None);
-        assert_eq!(parse("garbage"), TreeState::default());
+    /// Older files were a bare array, then a flat object. Both predate
+    /// root-keying and cannot be attributed to a root, so they are dropped
+    /// rather than applied to whichever project opens first.
+    #[test]
+    fn pre_root_keyed_tree_files_are_discarded_not_misapplied() {
+        for legacy in [
+            r#"["/r/src"]"#,
+            r#"{"expanded":["/r/src"],"selected":"/r/src/main.rs"}"#,
+            "garbage",
+        ] {
+            let file = decode_tree_file(legacy);
+            assert_eq!(
+                tree_state_for(&file, Path::new("/r")),
+                TreeState::default(),
+                "{legacy}"
+            );
+        }
     }
 
     #[test]
