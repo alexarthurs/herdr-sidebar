@@ -451,6 +451,21 @@ pub fn tab_of(pane_list_json: &str, pane_id: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The workspace a pane belongs to, empty when the pane is unknown. Preview
+/// routing is scoped by it so one project's ephemeral tab is never reused
+/// from another.
+pub fn workspace_of(pane_list_json: &str, pane_id: &str) -> String {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return String::new();
+    };
+    msg.result
+        .panes
+        .iter()
+        .find(|p| p.pane_id.as_deref() == Some(pane_id))
+        .and_then(|p| p.workspace_id.clone())
+        .unwrap_or_default()
+}
+
 /// All tab ids present in a `pane list` JSON — the live-tab set the snooze
 /// cleanup checks markers against.
 pub fn live_tabs(pane_list_json: &str) -> std::collections::BTreeSet<String> {

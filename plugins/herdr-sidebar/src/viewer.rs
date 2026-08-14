@@ -676,7 +676,14 @@ pub fn open_in_pane(
     let list = ipc::call_text("pane.list", serde_json::json!({}))
         .map_err(|e| format!("preview failed: {e}"))?;
     sweep_orphan_controls(&list);
-    let previews = previews_in(&list);
+    // Route only within OUR space. A session-wide search reused another
+    // project's ephemeral tab and focus jumped there, which reads as the
+    // tree refusing to change.
+    let my_workspace = crate::launch::workspace_of(&list, my_pane_id);
+    let previews: Vec<PreviewPane> = previews_in(&list)
+        .into_iter()
+        .filter(|p| p.workspace_id == my_workspace)
+        .collect();
 
     // 1. Already open — jump to it, pinned or not.
     if let Some(p) = preview_for_doc(&previews, doc_key) {
@@ -819,6 +826,10 @@ pub const TOKEN_PINNED: &str = "hs-preview-pinned";
 pub struct PreviewPane {
     pub pane_id: String,
     pub tab_id: String,
+    /// The space this preview belongs to. Routing is scoped to it: the
+    /// ephemeral tab is per project, and reusing another workspace's would
+    /// yank focus into a different project.
+    pub workspace_id: String,
     pub doc_key: String,
     pub pinned: bool,
 }
@@ -838,6 +849,7 @@ fn previews_in(pane_list_json: &str) -> Vec<PreviewPane> {
     struct Pane {
         pane_id: Option<String>,
         tab_id: Option<String>,
+        workspace_id: Option<String>,
         #[serde(default)]
         tokens: std::collections::BTreeMap<String, serde_json::Value>,
     }
@@ -852,6 +864,7 @@ fn previews_in(pane_list_json: &str) -> Vec<PreviewPane> {
             Some(PreviewPane {
                 pane_id: p.pane_id?,
                 tab_id: p.tab_id?,
+                workspace_id: p.workspace_id.unwrap_or_default(),
                 doc_key,
                 pinned: p.tokens.contains_key(TOKEN_PINNED),
             })
@@ -1021,6 +1034,34 @@ mod tests {
             control_path_for_pane("w4:p9").to_string_lossy().contains("w4_p9"),
             "colons are not filename-safe"
         );
+    }
+
+    /// The ephemeral tab is per WORKSPACE. Session-wide, opening a file in
+    /// tremor found learnings' unpinned preview, rewrote it, and focus jumped
+    /// to the other project — the tree "stayed" on learnings because you were
+    /// teleported there.
+    #[test]
+    fn the_ephemeral_tab_is_not_shared_between_workspaces() {
+        let json = r#"{"result":{"panes":[
+            {"pane_id":"wB:pE","tab_id":"wB:t3","workspace_id":"wB",
+             "tokens":{"hs-preview-path":"/learnings/a.md"}},
+            {"pane_id":"wH:p9","tab_id":"wH:t4","workspace_id":"wH",
+             "tokens":{"hs-preview-path":"/tremor/b.rs","hs-preview-pinned":"1"}}
+        ]}}"#;
+        let all = previews_in(json);
+        assert_eq!(all.len(), 2);
+
+        let tremor: Vec<_> = all.iter().filter(|p| p.workspace_id == "wH").cloned().collect();
+        assert!(
+            reusable_preview(&tremor).is_none(),
+            "learnings' ephemeral tab must not be reusable from tremor"
+        );
+        let learnings: Vec<_> = all.iter().filter(|p| p.workspace_id == "wB").cloned().collect();
+        assert_eq!(reusable_preview(&learnings).unwrap().pane_id, "wB:pE");
+
+        // Matching an already-open document is scoped too: jumping to another
+        // workspace's tab is the same teleport by a different route.
+        assert!(preview_for_doc(&tremor, "/learnings/a.md").is_none());
     }
 
     #[test]
