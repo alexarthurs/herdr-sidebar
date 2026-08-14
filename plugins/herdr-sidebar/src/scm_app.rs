@@ -50,6 +50,10 @@ const HOVER_BG: Color = Color::Rgb(48, 52, 60);
 /// How many log lines the history-ish drawers fetch.
 const DRAWER_LIMIT: usize = 30;
 
+/// How long two clicks on the same row still count as a double click (to pin
+/// a diff/show tab), matching the file explorer.
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(450);
+
 fn letter_color(letter: char) -> Color {
     match letter {
         'M' => MODIFIED,
@@ -527,6 +531,12 @@ pub struct App {
     last_mouse: Option<std::time::Instant>,
     /// Last known mouse position, for the button hover highlight.
     mouse_pos: Option<(u16, u16)>,
+    /// Last left-click (row index, when) for double-click detection.
+    last_click: Option<(usize, std::time::Instant)>,
+    /// Where the most recent preview landed, with its document key — so a
+    /// double click pins that exact tab instead of re-opening it (mirrors the
+    /// file explorer's pin).
+    last_preview: Option<(String, herdr_sidebar::viewer::PreviewTarget)>,
     page: usize,
     last_width: u16,
     last_height: u16,
@@ -587,6 +597,8 @@ impl App {
             title_zones: Vec::new(),
             last_mouse: None,
             mouse_pos: None,
+            last_click: None,
+            last_preview: None,
             page: 20,
             last_width: 40,
             last_height: 24,
@@ -1063,6 +1075,14 @@ impl App {
         }
         if let Some((index, line)) = self.row_hit(y) {
             let _ = line;
+            // Double click = second click on the same row inside the window;
+            // for preview rows it pins the tab the first click opened.
+            let now = std::time::Instant::now();
+            let double = self
+                .last_click
+                .take()
+                .is_some_and(|(i, at)| i == index && now.duration_since(at) < DOUBLE_CLICK);
+            self.last_click = Some((index, now));
             match self.rows[index] {
                 // Clicking a changed file shows its diff, like VS Code —
                 // except on the hover − / + zone, which unstages/stages it.
@@ -1075,6 +1095,8 @@ impl App {
                                 self.flash = Some((e, true));
                             }
                             self.refresh();
+                        } else if double && self.pin_if_open(index) {
+                            // pinned the first click's tab
                         } else {
                             self.open_diff(r, &entry, true);
                         }
@@ -1089,6 +1111,8 @@ impl App {
                                 self.flash = Some((e, true));
                             }
                             self.refresh();
+                        } else if double && self.pin_if_open(index) {
+                            // pinned the first click's tab
                         } else {
                             self.open_diff(r, &entry, false);
                         }
@@ -1162,7 +1186,11 @@ impl App {
                 Row::DrawerLine(kind, i) => {
                     self.focus = Focus::List;
                     self.select(index);
-                    self.open_drawer_ref(kind, i);
+                    if double && self.pin_if_open(index) {
+                        // pinned the first click's show/diff tab
+                    } else {
+                        self.open_drawer_ref(kind, i);
+                    }
                 }
             }
         }
@@ -1773,10 +1801,9 @@ impl App {
             herdr_sidebar::viewer::show_request(repo.git.root(), &spec, path.as_deref());
         let doc_key =
             herdr_sidebar::viewer::doc_key_for_show(repo.git.root(), &spec, path.as_deref());
-        if let Err(e) =
-            herdr_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &doc_key, &payload)
-        {
-            self.flash = Some((e, true));
+        match herdr_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &doc_key, &payload) {
+            Ok(target) => self.last_preview = Some((doc_key, target)),
+            Err(e) => self.flash = Some((e, true)),
         }
     }
 
@@ -1799,11 +1826,70 @@ impl App {
             herdr_sidebar::viewer::diff_request(repo.git.root(), &entry.path, kind);
         let doc_key =
             herdr_sidebar::viewer::doc_key_for_diff(repo.git.root(), &entry.path, kind);
-        if let Err(e) =
-            herdr_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &doc_key, &payload)
-        {
-            self.flash = Some((e, true));
+        match herdr_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &doc_key, &payload) {
+            Ok(target) => self.last_preview = Some((doc_key, target)),
+            Err(e) => self.flash = Some((e, true)),
         }
+    }
+
+    /// The document key a click on `index` would open, for the rows that
+    /// preview (changed files and drawer refs). `None` for non-preview rows.
+    fn doc_key_for_row(&self, index: usize) -> Option<String> {
+        match self.rows.get(index)? {
+            Row::Staged(r, i) => {
+                let repo = self.repos.get(*r)?;
+                let entry = repo.status.staged.get(*i)?;
+                Some(herdr_sidebar::viewer::doc_key_for_diff(
+                    repo.git.root(),
+                    &entry.path,
+                    "staged",
+                ))
+            }
+            Row::Unstaged(r, i) => {
+                let repo = self.repos.get(*r)?;
+                let entry = repo.status.unstaged.get(*i)?;
+                let kind = if entry.letter == 'U' { "untracked" } else { "worktree" };
+                Some(herdr_sidebar::viewer::doc_key_for_diff(repo.git.root(), &entry.path, kind))
+            }
+            Row::DrawerLine(kind, i) => {
+                let repo = self.repos.get(self.active)?;
+                let spec = match self.drawers[kind.index()].refs.get(*i)? {
+                    DrawerRef::Commit(h) => h.clone(),
+                    DrawerRef::Stash(n) => format!("stash@{{{n}}}"),
+                    DrawerRef::Branch { name, .. } => name.clone(),
+                    DrawerRef::Tag(t) => t.clone(),
+                    // No `git show` target — these rows don't open a preview.
+                    DrawerRef::None | DrawerRef::Remote { .. } | DrawerRef::Worktree(_) => {
+                        return None;
+                    }
+                };
+                let path = (*kind == Drawer::FileHistory)
+                    .then(|| self.history_target.clone())
+                    .flatten();
+                Some(herdr_sidebar::viewer::doc_key_for_show(
+                    repo.git.root(),
+                    &spec,
+                    path.as_deref(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// On a double click, pin the tab the first click opened — if this row's
+    /// document is the one currently previewing. Returns true when it pinned.
+    fn pin_if_open(&mut self, index: usize) -> bool {
+        let Some(doc_key) = self.doc_key_for_row(index) else {
+            return false;
+        };
+        let Some((key, target)) = self.last_preview.as_ref() else {
+            return false;
+        };
+        if *key != doc_key {
+            return false;
+        }
+        herdr_sidebar::viewer::pin_target(target, &doc_key);
+        true
     }
 
     /// `o`: open the diff for the currently selected file row.
