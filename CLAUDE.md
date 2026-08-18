@@ -465,9 +465,10 @@ HACKING.md — budget time for that before promising a patched build.
   `git diff` (dual old/new gutters, full-width red/green row tints padded at draw time,
   darker word-level tint on paired changed lines, syntax-highlighted code through two
   stateful `LineHighlighter`s for old/new contexts). The body Paragraph wraps long lines
-  (`Wrap { trim: false }` in `viewer.rs`) — default ratatui clips. Scroll stays
-  per source-line, so a wrapped line's continuation rows can drift out of sync. `ansi.rs`
-  (SGR parser) still renders
+  (`Wrap { trim: false }` in `viewer.rs`, default) — default ratatui clips. `w` toggles
+  wrap off for the current doc (long-line files like `.jsonl`), footer shows the state.
+  Scroll stays per source-line, so a wrapped line's continuation rows can drift out of
+  sync (wrap off = exact). `ansi.rs` (SGR parser) still renders
   `git show` output (ansi-to-tui pins an older ratatui — don't add it), and diffs re-run
   every ~2s so they live-update.
   Staged rows show `--cached`; untracked files render via `diff --no-index NUL <file>`.

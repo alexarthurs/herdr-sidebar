@@ -140,6 +140,8 @@ struct Doc {
     /// File previews get a line-number gutter; diffs carry their own +/-.
     numbered: bool,
     scroll: usize,
+    /// Long lines wrap unless the user toggles them off (`w`).
+    wrap: bool,
 }
 
 fn load(request: &Request) -> Doc {
@@ -190,6 +192,7 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
         lines,
         numbered: false,
         scroll: 0,
+        wrap: true,
     }
 }
 
@@ -279,6 +282,7 @@ fn load_file(target: &Path) -> Doc {
         lines,
         numbered,
         scroll: 0,
+        wrap: true,
     }
 }
 
@@ -332,6 +336,7 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         lines,
         numbered: false,
         scroll: 0,
+        wrap: true,
     }
 }
 
@@ -402,6 +407,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         lines: vec![Line::raw("(waiting for a click in the sidebar)")],
         numbered: false,
         scroll: 0,
+        wrap: true,
     });
     report_identity(&doc.name);
 
@@ -436,6 +442,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                     KeyCode::PageDown => doc.scroll = (doc.scroll + page).min(max),
                     KeyCode::Home | KeyCode::Char('g') => doc.scroll = 0,
                     KeyCode::End | KeyCode::Char('G') => doc.scroll = max,
+                    KeyCode::Char('w') => doc.wrap = !doc.wrap,
                     _ => {}
                 },
                 Event::Mouse(mouse) => match mouse.kind {
@@ -543,10 +550,18 @@ fn draw_doc(frame: &mut Frame, doc: &mut Doc, theme: IconTheme) -> usize {
             }
         })
         .collect();
-    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), body);
+    let body_paragraph = if doc.wrap {
+        Paragraph::new(text).wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new(text)
+    };
+    frame.render_widget(body_paragraph, body);
 
+    let wrap_hint = if doc.wrap { "w: wrap on " } else { "w: wrap off " };
     frame.render_widget(
-        Paragraph::new(Line::from(" ↑↓ scroll  ⇞⇟ page  g G ends  q close".dim())),
+        Paragraph::new(Line::from(
+            format!(" ↑↓ scroll  ⇞⇟ page  g G ends  {wrap_hint} q close").dim(),
+        )),
         footer,
     );
     usize::from(body.height).saturating_sub(1).max(1)
