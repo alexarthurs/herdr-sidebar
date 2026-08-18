@@ -21,7 +21,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::ansi;
 use crate::icons::{IconTheme, icon};
@@ -543,7 +543,7 @@ fn draw_doc(frame: &mut Frame, doc: &mut Doc, theme: IconTheme) -> usize {
             }
         })
         .collect();
-    frame.render_widget(Paragraph::new(text), body);
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), body);
 
     frame.render_widget(
         Paragraph::new(Line::from(" ↑↓ scroll  ⇞⇟ page  g G ends  q close".dim())),
