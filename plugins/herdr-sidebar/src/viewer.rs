@@ -473,8 +473,10 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 && let Some(request @ Request::Diff { .. }) = &current
             {
                 let keep = doc.scroll;
+                let keep_wrap = doc.wrap;
                 doc = load(request);
                 doc.scroll = keep.min(doc.lines.len().saturating_sub(1));
+                doc.wrap = keep_wrap;
             }
         }
     };
