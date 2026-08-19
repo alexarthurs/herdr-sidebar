@@ -197,6 +197,10 @@ pub struct App {
     /// A native folder picker running on a background thread; its result
     /// arrives here (None = cancelled).
     picking: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
+    /// The neighbour pane's cwd as last sampled, so a `cd` there re-roots us
+    /// but a folder the user picked by hand is not sampled back over.
+    /// Survives the re-root rebuild (see `change_folder`).
+    seen_sibling_cwd: Option<String>,
 }
 
 /// How long two clicks on the same row still count as a double click.
@@ -259,6 +263,7 @@ impl App {
             last_click: None,
             last_beat: std::time::Instant::now(),
             picking: None,
+            seen_sibling_cwd: None,
         };
         app.apply_identity();
         app
@@ -275,6 +280,32 @@ impl App {
         if let Some(ctl) = &self.pane_ctl {
             ctl.report_tokens(MY_VIEW, self.merged());
         }
+        self.follow_sibling_cwd();
+    }
+
+    /// Track the folder of the pane we are docked beside: re-root when it
+    /// moves (a `cd`, an agent switching project), and once at startup when
+    /// the pane had already moved before we were spawned. Only a CHANGE
+    /// re-roots, so a folder the user picked by hand stays put.
+    fn follow_sibling_cwd(&mut self) {
+        if self.overlay.is_some() || self.picking.is_some() {
+            return; // never yank the tree out from under an open dialog
+        }
+        let Some(ctl) = &self.pane_ctl else { return };
+        let Ok(panes) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) else {
+            return;
+        };
+        let Some(cwd) = herdr_sidebar::launch::sibling_cwd(&panes, &ctl.pane_id) else {
+            return;
+        };
+        if self.seen_sibling_cwd.as_deref() == Some(cwd.as_str()) {
+            return;
+        }
+        self.seen_sibling_cwd = Some(cwd.clone());
+        if Path::new(&cwd) == self.tree.root_path() {
+            return;
+        }
+        self.change_folder(&cwd);
     }
 
     /// The merged sidebar is on and actually usable (other plugin present).
@@ -1058,7 +1089,9 @@ impl App {
             return;
         }
         let root = std::env::current_dir().unwrap_or(target);
+        let seen = self.seen_sibling_cwd.take();
         *self = App::new(root);
+        self.seen_sibling_cwd = seen;
         self.notice = Some(format!("folder: {}", self.tree.root_name()));
     }
 

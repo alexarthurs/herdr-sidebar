@@ -303,6 +303,22 @@ HACKING.md — budget time for that before promising a patched build.
   terminal emulators and break column alignment — the shared icon map avoids them; keep it
   that way when adding icons.
 
+### Following the neighbour pane's folder
+
+- **A pane's `cwd` is where it was SPAWNED; `foreground_cwd` is where it IS** (verified
+  live: a `cd ~/Projects/cozy` in a shell moved `foreground_cwd` only). The sidebar roots
+  itself at its own process cwd at startup, so without re-reading the neighbour it shows
+  the launch folder forever — the pane beside it can `cd`, or an agent can switch project,
+  and the tree never notices.
+- The fix rides the existing ~5s heartbeat: `launch::sibling_cwd` picks the non-sidebar
+  pane of OUR tab (the focused one when several qualify) out of `pane.list` and returns
+  its `foreground_cwd`; both views re-root when that value CHANGES. Edge-triggered, not
+  level-triggered, so a folder the user picked by hand (`c` / the native picker) is not
+  sampled back over on the next beat — which is also why the sampled value has to survive
+  the `*self = App::new(root)` rebuild that re-rooting does.
+- Sidebar panes are excluded from the candidate scan: two of them in one tab would
+  otherwise chase each other's roots.
+
 ### Pane liveness (heartbeat tokens)
 
 - **You cannot detect a dead TUI from outside**: `pane.process_info` shows only the shell

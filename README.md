@@ -61,6 +61,9 @@ A real tree, not a directory dump:
   **Ctrl+right-click context menu**: New File, New Folder, Open with Default App (files
   only — hands the file to the OS-associated app, like a double click in the file
   manager), Rename, Delete, Copy Path / Relative Path, Reveal in File Explorer.
+- **Follows the pane it is docked beside** — `cd` in that shell (or point an agent at
+  another project) and the tree re-roots to the new folder within ~5s. A folder you
+  picked yourself (`c`) stays until the pane moves again.
 - Dotfiles toggle, live refresh, and a collapse-to-sliver mode when you want the columns back.
 - Prefer the sidebar closed? Toggle "Auto-open sidebar" off in ⚙ Settings and it stays
   closed until you invoke the open-sidebar action yourself.

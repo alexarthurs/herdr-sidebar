@@ -37,6 +37,10 @@ struct Pane {
     pane_id: Option<String>,
     label: Option<String>,
     cwd: Option<String>,
+    /// The live cwd of the pane's foreground process — what a `cd` in a
+    /// shell (or an agent switching project) actually moves; `cwd` alone is
+    /// the spawn directory and goes stale.
+    foreground_cwd: Option<String>,
     #[serde(default)]
     focused: bool,
     tab_id: Option<String>,
@@ -251,6 +255,35 @@ pub fn focused_pane(pane_list_json: &str) -> String {
         .map(strip_verbatim)
         .unwrap_or_default();
     format!("{id}\t{cwd}")
+}
+
+/// The folder the sidebar in `my_pane_id` should be rooted at: the live cwd
+/// of the neighbour pane sharing our tab (the focused one when several
+/// qualify). Other sidebar panes are skipped, so two sidebars never chase
+/// each other. `None` when nothing usable is there.
+pub fn sibling_cwd(pane_list_json: &str, my_pane_id: &str) -> Option<String> {
+    let msg = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)).ok()?;
+    let panes = &msg.result.panes;
+    let me = panes.iter().find(|p| p.pane_id.as_deref() == Some(my_pane_id))?;
+    let mut candidates = panes.iter().filter(|p| {
+        p.tab_id.as_deref() == me.tab_id.as_deref()
+            && p.pane_id.as_deref() != Some(my_pane_id)
+            && !p.is_explorer()
+            && !p.tokens.contains_key(SC_METADATA_SOURCE)
+            && p.label.as_deref() != Some(SC_PANE_LABEL)
+    });
+    let first = candidates.next()?;
+    let pick = if first.focused {
+        first
+    } else {
+        candidates.find(|p| p.focused).unwrap_or(first)
+    };
+    pick.foreground_cwd
+        .as_deref()
+        .or(pick.cwd.as_deref())
+        .map(strip_verbatim)
+        .filter(|cwd| !cwd.is_empty())
+        .map(str::to_string)
 }
 
 /// `<pane_id>\t<ratio>` for the left dock: the leftmost pane of the layout (the
@@ -471,6 +504,27 @@ mod tests {
 
     fn pane_list(panes: &str) -> String {
         format!(r#"{{"id":"cli:pane:list","result":{{"panes":[{panes}]}}}}"#)
+    }
+
+    #[test]
+    fn sibling_cwd_tracks_the_live_folder_of_the_neighbour_pane() {
+        let json = pane_list(
+            r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar","cwd":"/home/me","tokens":{"herdr-sidebar-explorer":"1"}},
+               {"pane_id":"w1:p1","tab_id":"w1:t1","cwd":"/home/me","foreground_cwd":"/home/me/Projects/cozy"},
+               {"pane_id":"w1:p9","tab_id":"w1:t2","cwd":"/other/tab"}"#,
+        );
+        // The neighbour's LIVE cwd wins over its stale spawn cwd...
+        assert_eq!(sibling_cwd(&json, "w1:p3").as_deref(), Some("/home/me/Projects/cozy"));
+        // ...only from our own tab, and never from another sidebar.
+        assert_eq!(sibling_cwd(&pane_list(r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"},
+               {"pane_id":"w1:p9","tab_id":"w1:t2","cwd":"/other/tab"}"#), "w1:p3"), None);
+        // The focused pane wins when the tab holds several.
+        let many = pane_list(
+            r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"},
+               {"pane_id":"w1:p1","tab_id":"w1:t1","cwd":"/a"},
+               {"pane_id":"w1:p2","tab_id":"w1:t1","cwd":"/b","focused":true}"#,
+        );
+        assert_eq!(sibling_cwd(&many, "w1:p3").as_deref(), Some("/b"));
     }
 
     const FOCUSED: &str = r#"{"pane_id":"w1:p1","focused":true,"tab_id":"w1:t1","cwd":"C:\\work\\my repo"}"#;

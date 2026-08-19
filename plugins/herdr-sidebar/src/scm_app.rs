@@ -540,6 +540,9 @@ pub struct App {
     /// A native folder picker running on a background thread; its result
     /// arrives here (None = cancelled).
     picking: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
+    /// The neighbour pane's cwd as last sampled; only a CHANGE re-roots us,
+    /// so a folder picked by hand is not sampled back over.
+    seen_sibling_cwd: Option<String>,
 }
 
 const MY_VIEW: View = View::SourceControl;
@@ -596,6 +599,7 @@ impl App {
             pane_ctl,
             last_beat: std::time::Instant::now(),
             picking: None,
+            seen_sibling_cwd: None,
         };
         app.apply_identity();
         app.refresh();
@@ -673,6 +677,36 @@ impl App {
         if let Some(ctl) = &self.pane_ctl {
             ctl.report_tokens(MY_VIEW, self.merged());
         }
+        self.follow_sibling_cwd();
+    }
+
+    /// Track the folder of the pane we are docked beside: re-root on a `cd`
+    /// there, and once at startup when it had already moved before we were
+    /// spawned. Mirrors the explorer view.
+    fn follow_sibling_cwd(&mut self) {
+        if self.overlay.is_some() || self.picking.is_some() || self.suggesting.is_some()
+            || self.syncing.is_some()
+        {
+            return;
+        }
+        let Some(ctl) = &self.pane_ctl else { return };
+        let Ok(panes) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) else {
+            return;
+        };
+        let Some(cwd) = herdr_sidebar::launch::sibling_cwd(&panes, &ctl.pane_id) else {
+            return;
+        };
+        if self.seen_sibling_cwd.as_deref() == Some(cwd.as_str()) {
+            return;
+        }
+        self.seen_sibling_cwd = Some(cwd.clone());
+        let target = std::path::PathBuf::from(&cwd);
+        if target == self.cwd || !target.is_dir() || std::env::set_current_dir(&target).is_err() {
+            return;
+        }
+        let root = std::env::current_dir().unwrap_or(target);
+        *self = App::new(root);
+        self.seen_sibling_cwd = Some(cwd);
     }
 
     /// Periodic timer tick: retry repo discovery if we started outside one,
@@ -1561,7 +1595,9 @@ impl App {
                 self.picking = None;
                 if std::env::set_current_dir(&path).is_ok() {
                     let root = std::env::current_dir().unwrap_or(path);
+                    let seen = self.seen_sibling_cwd.take();
                     *self = App::new(root);
+                    self.seen_sibling_cwd = seen;
                 } else {
                     self.flash = Some((format!("cannot open {}", path.display()), true));
                 }
