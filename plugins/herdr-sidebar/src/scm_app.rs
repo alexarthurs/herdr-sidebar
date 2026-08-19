@@ -1538,11 +1538,7 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         let start = self.cwd.clone();
         std::thread::spawn(move || {
-            let picked = rfd::FileDialog::new()
-                .set_title("Open Folder")
-                .set_directory(&start)
-                .pick_folder();
-            let _ = tx.send(picked);
+            let _ = tx.send(herdr_sidebar::actions::pick_folder(&start));
         });
         self.picking = Some(rx);
         self.flash = Some(("folder picker open… (check your other windows)".into(), false));

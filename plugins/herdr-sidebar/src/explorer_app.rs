@@ -990,11 +990,7 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         let start = self.tree.root_path();
         std::thread::spawn(move || {
-            let picked = rfd::FileDialog::new()
-                .set_title("Open Folder")
-                .set_directory(&start)
-                .pick_folder();
-            let _ = tx.send(picked);
+            let _ = tx.send(actions::pick_folder(&start));
         });
         self.picking = Some(rx);
         self.notice = Some("folder picker open… (check your other windows)".into());

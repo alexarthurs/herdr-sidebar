@@ -638,6 +638,27 @@ First clean install of both plugins on a Mac (driven over SSH), findings:
 - The `merged` (unified sidebar) default was still `false` from the experiment era — fresh
   installs came up as a pinned separate Explorer. Flipped to `true` (existing users keep
   their persisted value).
+- **`rfd` CANNOT be called from a background thread on macOS — it aborts the pane.** Every
+  rfd dialog routes through `run_on_main` (`rfd-0.17.2/src/backend/macos/utils.rs:29`), which
+  needs either the main thread or a running `NSApplication`; a terminal TUI has neither, so
+  `change_folder_dialog`'s background-thread `pick_folder()` panicked 100% of the time with
+  "You are running RFD in NonWindowed environment, it is impossible to spawn dialog from
+  thread different than main in this env." The picker was only ever verified on Windows,
+  whose `IFileDialog` has no main-thread rule, so this shipped in v0.7.0 unnoticed. Moving the
+  call to the main thread is NOT a fix — it freezes the TUI and the liveness heartbeat stops,
+  so the launcher REPLACE-kills the pane as a corpse after 20s (the exact reason it was
+  backgrounded). Fix: `actions::pick_folder` shells out to
+  `osascript -e 'POSIX path of (choose folder …)'` on macOS — a subprocess has no main-thread
+  constraint, keeps the dialog native, and leaves the heartbeat beating. rfd is now a
+  `cfg(windows)`-only dependency. Gotchas: `default location` pointing at a path that no
+  longer exists makes osascript error instead of opening (guard with `is_dir()`); `POSIX path
+  of` returns a TRAILING SLASH; a user cancel exits non-zero ("User canceled. (-128)") and
+  must map to `None`; and folder names may contain `"` or `\`, so escape before interpolating
+  into the AppleScript literal.
+- **A panicking TUI leaves the pane's mouse tracking ON.** The shell underneath then echoes
+  raw SGR mouse reports (`^[[<35;17;32M`) on every pointer move, which looks like a second,
+  unrelated bug. `reset` in that pane clears it — or just close it and let the ensure hook
+  re-dock a fresh sidebar.
 - Everything else verified working on macOS unchanged: ensure hook docks on tab focus,
   unified view switch, SCM drawers/commit box in a real repo, full-size diff preview with
   park/restore round-trip, first-run Nerd Font prompt (curl+unzip path), heartbeat tokens,
