@@ -123,16 +123,22 @@ pub fn delete(path: &Path, is_dir: bool) -> io::Result<()> {
     }
 }
 
-/// Copy text to the system clipboard by piping to the platform's clipboard
-/// tool (a console child of the TUI's own pty — no window is created).
+/// Copy text to the system clipboard.
+///
+/// Tries native CLI tools first (clip on Windows, pbcopy / wl-copy / xclip on Unix).
+/// Also emits an OSC 52 terminal escape sequence to stdout so clipboard copy
+/// works across terminal multiplexers, remote/SSH sessions, and headless environments.
 pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
     use std::io::Write;
+    use base64::Engine;
+
+    // 1. Try native platform CLI tool.
     #[cfg(windows)]
     let candidates: &[&[&str]] = &[&["clip"]];
     #[cfg(not(windows))]
     let candidates: &[&[&str]] = &[&["pbcopy"], &["wl-copy"], &["xclip", "-selection", "clipboard"]];
 
-    let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no clipboard tool found");
+    let mut cli_ok = false;
     for argv in candidates {
         let spawned = std::process::Command::new(argv[0])
             .args(&argv[1..])
@@ -140,18 +146,42 @@ pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
-        match spawned {
-            Ok(mut child) => {
-                if let Some(stdin) = child.stdin.as_mut() {
-                    stdin.write_all(text.as_bytes())?;
-                }
-                child.wait()?;
-                return Ok(());
+        if let Ok(mut child) = spawned {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(text.as_bytes());
             }
-            Err(err) => last_err = err,
+            if let Ok(status) = child.wait() {
+                if status.success() {
+                    cli_ok = true;
+                    break;
+                }
+            }
         }
     }
-    Err(last_err)
+
+    // 2. Emit OSC 52 escape sequence to stdout.
+    // Handles terminal multiplexers (tmux/screen DCS passthrough) and standard ANSI terminals.
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let osc52 = format!("\x1b]52;c;{}\x07", encoded);
+    let tmux_osc52 = format!("\x1bPtmux;\x1b\x1b]52;c;{}\x07\x1b\\", encoded);
+    let screen_osc52 = format!("\x1bP\x1b]52;c;{}\x07\x1b\\", encoded);
+
+    let mut stdout = io::stdout().lock();
+    let term = std::env::var("TERM").unwrap_or_default();
+    let osc_res = if term.starts_with("tmux") || term.starts_with("screen") {
+        stdout.write_all(tmux_osc52.as_bytes())
+            .and_then(|_| stdout.write_all(screen_osc52.as_bytes()))
+            .and_then(|_| stdout.write_all(osc52.as_bytes()))
+    } else {
+        stdout.write_all(osc52.as_bytes())
+    };
+    let _ = stdout.flush();
+
+    if cli_ok || osc_res.is_ok() {
+        Ok(())
+    } else {
+        Err(io::Error::new(io::ErrorKind::NotFound, "no working clipboard tool or terminal escape channel"))
+    }
 }
 
 /// Read text from the system clipboard when a platform clipboard command is
