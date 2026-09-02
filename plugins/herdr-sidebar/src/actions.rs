@@ -154,7 +154,9 @@ pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
 fn osc52_copy(text: &str) -> io::Result<()> {
     use std::io::Write;
 
-    let payload = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    // ST (`\x1b\\`) terminator over BEL: some nested multiplexers/terminals
+    // (e.g. herdr's own OSC 52 handling) only reliably recognize ST.
+    let payload = format!("\x1b]52;c;{}\x1b\\", base64_encode(text.as_bytes()));
     let sequence = if std::env::var_os("TMUX").is_some() {
         format!("\x1bPtmux;{}\x1b\\", payload.replace('\x1b', "\x1b\x1b"))
     } else {
