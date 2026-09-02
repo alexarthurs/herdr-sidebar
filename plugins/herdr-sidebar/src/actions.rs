@@ -124,7 +124,13 @@ pub fn delete(path: &Path, is_dir: bool) -> io::Result<()> {
 }
 
 /// Copy text to the system clipboard by piping to the platform's clipboard
-/// tool (a console child of the TUI's own pty — no window is created).
+/// tool (a console child of the TUI's own pty — no window is created). These
+/// tools only ever reach the clipboard of the machine this process runs on,
+/// so over SSH they either fail (no `xclip`/`wl-copy` on a headless remote)
+/// or silently write to a clipboard the user can never see. Falling back to
+/// an OSC 52 escape sequence hands the job to the terminal emulator itself,
+/// which runs on the user's machine and receives the sequence over the same
+/// SSH stream, so it reaches the clipboard the user actually expects.
 pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
     #[cfg(windows)]
     let candidates: &[&[&str]] = &[&["clip"]];
@@ -138,7 +144,49 @@ pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
             Err(err) => last_err = err,
         }
     }
-    Err(last_err)
+    osc52_copy(text).or(Err(last_err))
+}
+
+/// Ask the terminal itself to set the clipboard via OSC 52. `TMUX` selects
+/// tmux's DCS passthrough wrapping (plain OSC 52 never reaches the outer
+/// terminal through tmux); other multiplexers/terminals take the sequence
+/// as-is, and one that doesn't understand OSC 52 simply ignores it.
+fn osc52_copy(text: &str) -> io::Result<()> {
+    use std::io::Write;
+
+    let payload = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    let sequence = if std::env::var_os("TMUX").is_some() {
+        format!("\x1bPtmux;{}\x1b\\", payload.replace('\x1b', "\x1b\x1b"))
+    } else {
+        payload
+    };
+    let mut stdout = io::stdout();
+    stdout.write_all(sequence.as_bytes())?;
+    stdout.flush()
+}
+
+/// Minimal RFC 4648 base64 encoder — OSC 52's payload is the only user, so a
+/// dependency isn't worth pulling in for it.
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied();
+        let b2 = chunk.get(2).copied();
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1.unwrap_or(0) >> 4)) as usize] as char);
+        out.push(match b1 {
+            Some(b1) => TABLE[(((b1 & 0x0f) << 2) | (b2.unwrap_or(0) >> 6)) as usize] as char,
+            None => '=',
+        });
+        out.push(match b2 {
+            Some(b2) => TABLE[(b2 & 0x3f) as usize] as char,
+            None => '=',
+        });
+    }
+    out
 }
 
 fn copy_with(argv: &[&str], text: &str) -> io::Result<()> {
@@ -373,6 +421,16 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("exited with"), "{error}");
+    }
+
+    #[test]
+    fn base64_matches_rfc_4648_padding_cases() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode("/path/héllo".as_bytes()), "L3BhdGgvaMOpbGxv");
     }
 
     #[test]
