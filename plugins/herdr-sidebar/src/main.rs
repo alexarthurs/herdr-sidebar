@@ -4,19 +4,19 @@
 //! separated mode the same binary runs one pane per view, pinned with
 //! `--view explorer|git`. `--preview <ctl>` runs the file-preview pane.
 //!
-//! The `--*` stdin→stdout helper modes serve the launcher scripts — see
-//! launch.rs.
+//! The native `--ensure` / `--toggle*` modes drive pane lifecycle; the other
+//! `--*` stdin→stdout helpers expose the unit-tested launch calculations.
 
 mod explorer_app;
 mod scm_app;
 
-use std::io::Read;
 use std::cell::RefCell;
+use std::io::Read;
 use std::rc::Rc;
 use std::time::Duration;
 
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
-use herdr_sidebar::{launch, state, viewer};
+use herdr_sidebar::{ensure, launch, state, viewer};
 use state::{Exit, View};
 
 /// How often the source-control view re-reads `git status` while idle.
@@ -25,9 +25,16 @@ const REFRESH_EVERY: Duration = Duration::from_millis(1500);
 fn main() -> std::io::Result<()> {
     let mode = std::env::args().nth(1);
     match mode.as_deref() {
+        Some("--ensure") => return ensure::run(ensure::Mode::Ensure),
+        Some("--toggle") => {
+            return ensure::run(ensure::Mode::Toggle(View::Explorer));
+        }
+        Some("--toggle-git") => {
+            return ensure::run(ensure::Mode::Toggle(View::SourceControl));
+        }
         Some("--launch-decision") => {
-            // Optional second arg picks the source-control decision (the
-            // open-git launcher); default is the explorer/sidebar decision.
+            // Optional second arg picks the source-control decision; default
+            // is the explorer/sidebar decision.
             // Optional THIRD arg scopes the decision to a tab or workspace —
             // it must match the scope the hook docks into, or the decision
             // answers for one tab while the dock lands in another.
@@ -122,7 +129,7 @@ fn main() -> std::io::Result<()> {
         Some(other) => {
             eprintln!("herdr-sidebar: unknown argument `{other}`");
             eprintln!(
-                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--auto-open|--focus-on-open|--dock-right]"
+                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--ensure|--toggle|--toggle-git|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--auto-open|--focus-on-open|--dock-right]"
             );
             std::process::exit(2);
         }
@@ -143,6 +150,25 @@ fn main() -> std::io::Result<()> {
     } else {
         View::Explorer
     });
+
+    // Unix launchers use plugin.pane.open so Herdr starts this argv directly,
+    // with no shell prompt between the split and the TUI. Keep the host's cwd
+    // at the plugin root for relative-command resolution, then adopt the
+    // requested project cwd inside the process.
+    if let Some(cwd) = std::env::var_os(state::SPAWN_CWD_ENV).filter(|cwd| !cwd.is_empty()) {
+        std::env::set_current_dir(cwd)?;
+    }
+    // Mark the short interval before App::new applies its live identity. The
+    // launcher also writes a live stamp after plugin.pane.open returns, so any
+    // ordering between the two ends with App::new clearing this marker before
+    // the TUI can accept edits.
+    if let Some(pane_id) = std::env::var_os("HERDR_PANE_ID").filter(|id| !id.is_empty()) {
+        let _ = herdr_sidebar::ipc::report_starting_identity(
+            &pane_id.to_string_lossy(),
+            view,
+            view == View::Explorer && persisted.merged,
+        );
+    }
 
     // ONE terminal session for every view: switching drops the old view's
     // state and draws the other in the same alternate screen — instant, and

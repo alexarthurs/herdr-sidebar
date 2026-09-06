@@ -681,6 +681,9 @@ impl App {
         let (Some(ctl), Some(_)) = (&self.pane_ctl, &self.other_exe) else {
             return;
         };
+        let Some(_lock) = herdr_sidebar::ensure::LaunchLock::acquire(true) else {
+            return;
+        };
         // Grow to double width FIRST, then split 50/50 — each separated panel
         // keeps the width the unified sidebar had, instead of halving.
         ctl.resize_to(
@@ -688,33 +691,51 @@ impl App {
             self.last_width.saturating_mul(2).saturating_add(1),
             self.sidebar_state.dock_right,
         );
-        let response = herdr_sidebar::ipc::call_text(
-            "pane.split",
-            serde_json::json!({
-                "target_pane_id": ctl.pane_id,
-                "direction": "right",
-                "ratio": 0.5,
-                "focus": false,
-                "cwd": self.tree.root_path().display().to_string(),
-                "env": sidebar::spawn_env(),
-            }),
+        let other = MY_VIEW.other();
+        #[cfg(unix)]
+        let _ = herdr_sidebar::ipc::open_plugin_pane(
+            &ctl.pane_id,
+            other,
+            &self.tree.root_path(),
+            false,
         );
-        let Some(new_pane) = response
-            .ok()
-            .and_then(|r| herdr_sidebar::launch::split_pane_id(&r))
-        else {
-            return;
-        };
-        let flag = MY_VIEW.other().view_flag();
-        let command = format!("{} --view {flag}", sidebar::EXECUTABLE_NAME);
-        let _ = herdr_sidebar::ipc::call_text(
-            "pane.send_input",
-            serde_json::json!({ "pane_id": new_pane, "text": command, "keys": ["Enter"] }),
-        );
-        let _ = herdr_sidebar::ipc::call_text(
-            "pane.rename",
-            serde_json::json!({ "pane_id": new_pane, "label": MY_VIEW.other().label() }),
-        );
+        #[cfg(windows)]
+        {
+            let response = herdr_sidebar::ipc::call_text(
+                "pane.split",
+                serde_json::json!({
+                    "target_pane_id": ctl.pane_id,
+                    "direction": "right",
+                    "ratio": 0.5,
+                    "focus": false,
+                    "cwd": self.tree.root_path().display().to_string(),
+                    "env": sidebar::spawn_env(),
+                }),
+            );
+            let Some(new_pane) = response
+                .ok()
+                .and_then(|r| herdr_sidebar::launch::split_pane_id(&r))
+            else {
+                return;
+            };
+            if herdr_sidebar::ipc::report_starting_identity(&new_pane, other, false).is_err() {
+                let _ = herdr_sidebar::ipc::call_text(
+                    "pane.close",
+                    serde_json::json!({ "pane_id": new_pane }),
+                );
+                return;
+            }
+            let flag = other.view_flag();
+            let command = format!("{} --view {flag}", sidebar::EXECUTABLE_NAME);
+            let _ = herdr_sidebar::ipc::call_text(
+                "pane.send_input",
+                serde_json::json!({ "pane_id": new_pane, "text": command, "keys": ["Enter"] }),
+            );
+            let _ = herdr_sidebar::ipc::call_text(
+                "pane.rename",
+                serde_json::json!({ "pane_id": new_pane, "label": other.label() }),
+            );
+        }
     }
 
     /// Handle one key press; `Some(exit)` ends the event loop.
@@ -726,7 +747,8 @@ impl App {
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
         {
-            return Some(Exit::Quit);
+            self.hide();
+            return None;
         }
         if key.code == KeyCode::Char('p')
             && key.modifiers.contains(KeyModifiers::CONTROL)

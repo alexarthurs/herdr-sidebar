@@ -14,6 +14,7 @@
 //! separated panes are the same binary pinned to a starting view with
 //! `--view`.
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 /// Pane label (and metadata identity) of the unified pane.
@@ -41,6 +42,11 @@ pub fn step_sidebar_width(width: u16, wider: bool) -> u16 {
 /// prepends this binary's directory to PATH, so PowerShell, cmd, sh, bash,
 /// nushell, and pwsh all resolve the same bare executable name.
 pub const EXECUTABLE_NAME: &str = "herdr-sidebar";
+
+/// Desired working directory for a directly spawned plugin pane. Herdr 0.8.2
+/// resolves relative pane commands against the requested cwd, so launchers
+/// keep the process cwd at the plugin root and let the TUI move here itself.
+pub const SPAWN_CWD_ENV: &str = "HERDR_SIDEBAR_SPAWN_CWD";
 
 /// The viewer's control path travels in the pane environment rather than in
 /// a shell-quoted argv. Paths can contain spaces and every supported shell
@@ -104,6 +110,15 @@ impl View {
         match self {
             View::Explorer => "explorer",
             View::SourceControl => "git",
+        }
+    }
+
+    /// Manifest pane entrypoint that starts this view without an intermediary
+    /// shell, avoiding a prompt flash while the TUI boots.
+    pub fn entrypoint(self) -> &'static str {
+        match self {
+            View::Explorer => "sidebar",
+            View::SourceControl => "source-control",
         }
     }
 
@@ -445,41 +460,21 @@ fn write_state(path: &Path, state: State) {
 }
 
 struct StateWriteLock {
-    path: PathBuf,
+    _file: File,
 }
 
 impl StateWriteLock {
     fn acquire(state_path: &Path) -> Option<Self> {
         let path = state_path.with_extension("lock");
-        for _ in 0..50 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Some(Self { path }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = std::fs::metadata(&path)
-                        .and_then(|meta| meta.modified())
-                        .ok()
-                        .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age > std::time::Duration::from_secs(5));
-                    if stale {
-                        let _ = std::fs::remove_file(&path);
-                    } else {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                }
-                Err(_) => return None,
-            }
-        }
-        None
-    }
-}
-
-impl Drop for StateWriteLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .ok()?;
+        file.lock().ok()?;
+        Some(Self { _file: file })
     }
 }
 
@@ -1102,6 +1097,8 @@ mod tests {
         assert_eq!(View::SourceControl.other(), View::Explorer);
         assert_eq!(View::Explorer.label(), "Explorer");
         assert_eq!(View::SourceControl.plugin_id(), "herdr-sidebar-git");
+        assert_eq!(View::Explorer.entrypoint(), "sidebar");
+        assert_eq!(View::SourceControl.entrypoint(), "source-control");
     }
 
     #[test]

@@ -1,6 +1,6 @@
-//! Launcher helpers behind `scripts/open-explorer.{sh,ps1}` — kept in Rust so the
-//! logic is unit-tested and so ids/paths extracted from herdr's JSON are validated
-//! before they reach an argv (option-injection guard). Three stdin→stdout modes:
+//! Pure decision/layout helpers used by the native launcher and exposed through
+//! stdin→stdout diagnostic modes. Keeping the parsing here makes the behavior
+//! unit-testable and validates ids/paths before they reach an API request.
 //!
 //! - `--launch-decision`: `herdr pane list` JSON → `OPEN` | `FOCUS <pane_id>` |
 //!   `CLOSE <pane_id>`, scoped to the focused pane's tab (toggle behavior).
@@ -20,6 +20,12 @@ pub const PANE_LABEL: &str = "Explorer";
 /// Source id for `pane.report_metadata`; its token marks a pane as the
 /// Explorer independently of the (cosmetic, clearable) label.
 pub const METADATA_SOURCE: &str = "herdr-sidebar-explorer";
+
+/// Present only while a TUI is starting. Windows launchers stamp it after a
+/// raw split; directly spawned Unix TUIs stamp it at process startup. The
+/// first full identity report clears it, so a pane carrying this token cannot
+/// hold unsaved in-memory state yet.
+pub const STARTING_TOKEN: &str = "herdr-sidebar-starting";
 
 const MIN_SIDEBAR_SHARE: f64 = 0.15;
 const MAX_SIDEBAR_SHARE: f64 = 0.5;
@@ -142,8 +148,8 @@ fn pick_sibling<'a>(
 impl Pane {
     /// An Explorer is recognized by its metadata token (reported by the TUI at
     /// startup — survives the label being cleared while collapsed) or by the
-    /// "Explorer" label (present from the moment the launcher renames the
-    /// fresh pane, before the TUI has reported its token).
+    /// "Explorer" label (retained for restored panes whose metadata does not
+    /// survive a Herdr server restart).
     fn is_explorer(&self) -> bool {
         self.tokens.contains_key(METADATA_SOURCE)
             || self.label.as_deref() == Some(PANE_LABEL)
@@ -153,10 +159,9 @@ impl Pane {
     /// One of OUR labels with NO heartbeat token is a corpse. The main way
     /// this happens: herdr resumes a restarted server's panes with their
     /// labels and scrollback, but the process inside is a fresh shell and
-    /// metadata tokens do not survive. (A launcher does rename a pane
-    /// moments before the TUI stamps its first token, so this can race a
-    /// fresh spawn for ~a second — REPLACE just respawns, and the next pass
-    /// sees a live token, so the race self-heals.)
+    /// metadata tokens do not survive. Native launches hold the shared lock
+    /// until identity is stamped, so queued hooks never mistake a fresh pane
+    /// for one of these restored corpses.
     fn our_label_without_token(&self) -> bool {
         matches!(self.label.as_deref(), Some("Sidebar" | "Explorer"))
             && !self.tokens.contains_key(METADATA_SOURCE)
@@ -340,10 +345,7 @@ pub fn launch_decision_git(pane_list_json: &str, now: u64) -> String {
     }
 }
 
-/// Whether `pane_id` carries any of our identity tokens yet — the spawn
-/// wait polls this so hook invocations queued behind the lock always see a
-/// LIVE pane (without it, the label-without-token corpse rule replaces the
-/// fresh spawn before its TUI boots: an infinite replace loop, seen live).
+/// Whether `pane_id` carries any of our identity tokens.
 pub fn pane_has_token(pane_list_json: &str, pane_id: &str) -> bool {
     let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
         return false;
@@ -355,6 +357,19 @@ pub fn pane_has_token(pane_list_json: &str, pane_id: &str) -> bool {
         .any(|p| {
             p.tokens.contains_key(METADATA_SOURCE) || p.tokens.contains_key(SC_METADATA_SOURCE)
         })
+}
+
+/// Whether `pane_id` has started but not yet reached the TUI event loop. The
+/// first full identity report clears this marker.
+pub fn pane_is_starting(pane_list_json: &str, pane_id: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return false;
+    };
+    msg.result
+        .panes
+        .iter()
+        .find(|p| p.pane_id.as_deref() == Some(pane_id))
+        .is_some_and(|p| p.tokens.contains_key(STARTING_TOKEN))
 }
 
 /// `<pane_id>\t<cwd>` of the focused pane, or empty on any failure. The cwd
@@ -555,7 +570,7 @@ pub fn focused_pane_in(pane_list_json: &str, scope: &str) -> String {
 
 /// Which event invoked the ensure hook, from `HERDR_PLUGIN_EVENT_JSON`.
 ///
-/// All five hooks run the SAME script, so the payload is the only way to
+/// All launcher hooks run the same native implementation, so the payload is the only way to
 /// treat space creation differently from an ordinary focus. The envelope
 /// `EventEnvelope` currently serializes the discriminator as lower_snake in
 /// `event`, while manifest hook names use dotted form. Both are accepted, and
@@ -692,6 +707,34 @@ pub fn split_pane_id(response_json: &str) -> Option<String> {
         .ok()?
         .result
         .pane?
+        .pane_id
+        .filter(|id| is_flag_safe(id))
+}
+
+/// The created pane id from a `plugin.pane.open` response. Direct plugin-pane
+/// spawning starts the manifest argv without showing an intermediary shell.
+pub fn plugin_pane_id(response_json: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Msg {
+        result: Res,
+    }
+    #[derive(Deserialize)]
+    struct Res {
+        plugin_pane: PluginPane,
+    }
+    #[derive(Deserialize)]
+    struct PluginPane {
+        pane: Info,
+    }
+    #[derive(Deserialize)]
+    struct Info {
+        pane_id: Option<String>,
+    }
+    serde_json::from_str::<Msg>(strip_bom(response_json))
+        .ok()?
+        .result
+        .plugin_pane
+        .pane
         .pane_id
         .filter(|id| is_flag_safe(id))
 }
@@ -974,7 +1017,7 @@ mod tests {
         assert_eq!(event_scope(event), "w4");
     }
 
-    /// The hook fires for five different events into ONE script, so the only
+    /// The launcher handles several event kinds through one implementation, so the only
     /// way to treat space creation specially is the payload. The envelope
     /// shape isn't documented, so the discriminator is looked for at the top
     /// level and under the usual wrappers.
@@ -1149,14 +1192,27 @@ mod tests {
     #[test]
     fn pane_token_probe_distinguishes_starting_and_live_sidebars() {
         let starting = pane_list(
-            r#"{"pane_id":"w1:p1","tab_id":"w1:t1","label":"Explorer","tokens":{}}"#,
+            r#"{"pane_id":"w1:p1","tab_id":"w1:t1","label":"Explorer","focused":true,"tokens":{"herdr-sidebar-explorer":"100","herdr-sidebar-starting":"1"}}"#,
         );
         let live = pane_list(
             r#"{"pane_id":"w1:p1","tab_id":"w1:t1","label":"Explorer","tokens":{"herdr-sidebar-explorer":"100"}}"#,
         );
-        assert!(!pane_has_token(&starting, "w1:p1"));
+        // Synchronous pre-stamping makes the pane live to re-entrant hooks,
+        // while retaining enough state for an immediate second toggle to
+        // close it directly before its event loop starts.
+        assert_eq!(launch_decision(&starting, 100), "CLOSE w1:p1");
+        assert!(pane_has_token(&starting, "w1:p1"));
         assert!(pane_has_token(&live, "w1:p1"));
         assert!(!pane_has_token(&live, "w1:p2"));
+        assert!(pane_is_starting(&starting, "w1:p1"));
+        assert!(!pane_is_starting(&live, "w1:p1"));
+        assert!(!pane_is_starting(&starting, "w1:p2"));
+
+        let source_control = pane_list(
+            r#"{"pane_id":"w1:p1","tab_id":"w1:t1","label":"Source Control","focused":true,"tokens":{"herdr-sidebar-git":"100","herdr-sidebar-starting":"1"}}"#,
+        );
+        assert_eq!(launch_decision_git(&source_control, 100), "CLOSE w1:p1");
+        assert!(pane_is_starting(&source_control, "w1:p1"));
     }
 
     #[test]
@@ -1293,6 +1349,15 @@ mod tests {
         assert_eq!(split_pane_id(evil), None);
         assert_eq!(split_pane_id("not json"), None);
         assert_eq!(split_pane_id(r#"{"id":"x","result":{"type":"ok"}}"#), None);
+    }
+
+    #[test]
+    fn plugin_pane_id_extracts_and_validates() {
+        let json = r#"{"result":{"plugin_pane":{"plugin_id":"herdr-sidebar","entrypoint":"sidebar","pane":{"pane_id":"w3:p5"}}}}"#;
+        assert_eq!(plugin_pane_id(json), Some("w3:p5".to_string()));
+        let evil = r#"{"result":{"plugin_pane":{"pane":{"pane_id":"--evil"}}}}"#;
+        assert_eq!(plugin_pane_id(evil), None);
+        assert_eq!(plugin_pane_id("not json"), None);
     }
 
     fn layout_with_splits(panes: &str, splits: &str) -> String {

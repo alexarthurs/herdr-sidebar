@@ -8,9 +8,9 @@
 #    use `-windows`-suffixed ids; both variants gate with the item-level
 #    `platforms` key.
 #  - Relative action/event commands resolve from the plugin root since herdr
-#    0.8, so Windows invokes the GUI-subsystem ensure sidecar directly. The
-#    sidecar still matters: any console process in a hook chain flashes a
-#    Windows Terminal window per focus event on Windows 11.
+#    0.8. Unix invokes the main binary's native launcher modes; Windows uses
+#    the GUI-subsystem sidecar because any console process in a hook chain
+#    flashes a Windows Terminal window per focus event on Windows 11.
 #  - Relative [[panes]] commands still fail on Windows (a separate herdr code
 #    path), so the declarative pane below serves linux/macos only.
 #  - Launchers dock on the persisted left/right edge. A left dock needs a
@@ -39,6 +39,16 @@ id = "sidebar"
 title = "Sidebar"
 placement = "split"
 command = ["./target/release/herdr-sidebar"]
+platforms = ["linux", "macos"]
+
+# Internal entrypoint used when unified mode is off. plugin.pane.open launches
+# it directly, without an intermediary shell or a visible prompt.
+[[panes]]
+id = "source-control"
+title = "Source Control"
+placement = "split"
+command = ["./target/release/herdr-sidebar", "--view", "git"]
+platforms = ["linux", "macos"]
 
 # Toggle the sidebar: open at the configured dock edge / focus / close.
 [[actions]]
@@ -46,7 +56,7 @@ id = "open-sidebar"
 platforms = ["linux", "macos"]
 title = "Toggle sidebar"
 description = "Open the sidebar at its configured dock edge (focus it if open; close it if focused)."
-command = ["bash", "scripts/open-sidebar.sh"]
+command = ["./target/release/herdr-sidebar", "--toggle"]
 
 [[actions]]
 id = "open-sidebar-windows"
@@ -63,17 +73,14 @@ id = "open-git"
 platforms = ["linux", "macos"]
 title = "Toggle source control"
 description = "Open a separate Source Control pane (focus it if open; close it if focused)."
-command = ["bash", "scripts/open-git.sh"]
+command = ["./target/release/herdr-sidebar", "--toggle-git"]
 
 [[actions]]
 id = "open-git-windows"
 platforms = ["windows"]
 title = "Toggle source control"
 description = "Open a separate Source Control pane (focus it if open; close it if focused)."
-command = [
-  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-sidebar'}).plugin_root; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'scripts') 'open-git.ps1')''',
-]
+command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--toggle-git"]
 
 # Refresh every workspace onto the latest builds after a rebuild.
 [[actions]]
@@ -101,13 +108,13 @@ command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "s
 # metadata tokens do not) sitting unhealed until the user switched tabs.
 # pane.focused heals resumed corpses the moment the user interacts with the
 # restored session (client attach emits no tab/workspace events at all).
-# Hooking pane.* from a pane-creating script is only safe because the ensure
-# holds its lock until the spawned TUI stamps its token — re-entrant focus
-# invocations skip while locked, and later ones observe a LIVE pane.
+# The native launcher stamps identity before any layout operation can re-enter
+# these hooks. Re-entrant focus invocations skip while its OS-backed lock is
+# held; later ones observe a live pane.
 [[events]]
 on = "pane.focused"
 platforms = ["linux", "macos"]
-command = ["bash", "scripts/ensure-sidebar.sh"]
+command = ["./target/release/herdr-sidebar", "--ensure"]
 
 [[events]]
 on = "pane.focused"
@@ -117,7 +124,7 @@ command = [".\\target\\release\\herdr-sidebar-ensure.exe"]
 [[events]]
 on = "tab.created"
 platforms = ["linux", "macos"]
-command = ["bash", "scripts/ensure-sidebar.sh"]
+command = ["./target/release/herdr-sidebar", "--ensure"]
 
 [[events]]
 on = "tab.created"
@@ -127,7 +134,7 @@ command = [".\\target\\release\\herdr-sidebar-ensure.exe"]
 [[events]]
 on = "workspace.created"
 platforms = ["linux", "macos"]
-command = ["bash", "scripts/ensure-sidebar.sh"]
+command = ["./target/release/herdr-sidebar", "--ensure"]
 
 [[events]]
 on = "workspace.created"
@@ -137,7 +144,7 @@ command = [".\\target\\release\\herdr-sidebar-ensure.exe"]
 [[events]]
 on = "tab.focused"
 platforms = ["linux", "macos"]
-command = ["bash", "scripts/ensure-sidebar.sh"]
+command = ["./target/release/herdr-sidebar", "--ensure"]
 
 [[events]]
 on = "tab.focused"

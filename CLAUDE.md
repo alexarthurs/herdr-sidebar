@@ -103,9 +103,15 @@ executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launch
   Explorer/Source Control/Sidebar panes in every workspace, reaps only the ensure sidecar, and
   re-docks the focused workspace; preview/editor panes survive so unsaved buffers are preserved.
   The others re-dock via the focus hook the moment they're next visited.
-- Toggle-behavior settings have three platform launch paths to keep aligned: the Windows unified
-  sidecar (`ensure.rs`), the Windows separated Source Control launcher (`open-git.ps1`), and both
-  Unix launchers. Updating only the sidecar makes the same setting behave differently by view.
+- Toggle/ensure behavior has ONE implementation (`ensure.rs`). Unix actions/hooks enter it through
+  `herdr-sidebar --ensure|--toggle|--toggle-git`; Windows uses the GUI-subsystem
+  `herdr-sidebar-ensure` sidecar with the same mode flags. Do not reintroduce shell launchers whose
+  locking, liveness, or settings behavior can drift from the native path.
+- Unix opens sidebar TUIs through `plugin.pane.open`, which starts the manifest argv directly and
+  never exposes an intermediary shell prompt. Herdr 0.8.2 resolves a relative pane executable
+  against the requested cwd, not the plugin root, so omit the API `cwd`: pass the project path in
+  `HERDR_SIDEBAR_SPAWN_CWD` and let `main` change directory after process start. Windows retains the
+  raw split + PATH-injected shell launch because relative declarative pane commands do not work there.
 - **os error 5 can come from ANOTHER Windows account**: if a second account's herdr session
   runs sidebar panes from this same checkout, its processes show empty Path/StartTime in
   `Get-Process`, `Stop-Process` fails silently on them, and redeploy from this account can't
@@ -195,20 +201,24 @@ Manifest `[[events]]` hooks (undocumented in CLI help; see herdr `src/api/schema
   allowed list); the event payload arrives in the `HERDR_PLUGIN_EVENT_JSON` env var.
 - **Focus events fire in bursts** (one tab switch emits `tab.focused` AND `workspace.focused`,
   sometimes more) and hook invocations run concurrently: an unguarded ensure-pane hook opened
-  FOUR duplicate panes on one switch. Serialize hook bodies with an atomic `mkdir` lock (with a
-  stale-lock timeout) and snapshot `pane list` only after acquiring it.
+  FOUR duplicate panes on one switch. Serialize native launcher bodies with
+  `File::lock`/`try_lock` (Rust 1.89+, OS-backed and crash-released) and snapshot `pane list` only
+  after acquiring it. Focus hooks may skip a busy lock; explicit toggles and `tab.created` block
+  in the kernel so those discrete actions are not dropped. Do not poll a mkdir lock with sleeps.
 - The manifest hooks `tab.focused`, NOT `workspace.focused`: Herdr 0.8's workspace event
   carries only `workspace_id`, so a multi-tab workspace cannot identify the active tab and
   its snooze marker safely. `tab.focused` is emitted on the same switch and is unambiguous.
 - Workspace-scoped create events have no tab-level snooze to respect. Never borrow the
   globally focused tab's marker for a different workspace; an empty/legacy scope may still
   fall back to the focused tab.
-- Never hook `pane.*` events from a script that itself creates panes — feedback loop.
+- A launcher that hooks `pane.*` and also creates panes must pre-stamp identity while holding
+  the shared launcher lock; otherwise its own layout/focus events form a duplicate-pane loop.
 
-Pane environment: `HERDR_PANE_ID` is set inside every pane's shell; `HERDR_BIN_PATH` is injected
-for **actions/hooks but not panes** — fall back to `herdr` on PATH. A binary started via
-`pane run` gets no `HERDR_PLUGIN_CONTEXT_JSON`; root it from its cwd (pass `--cwd` at split).
-Our split env forwards `HERDR_PLUGIN_STATE_DIR` and prepends the binary directory to `PATH`.
+Pane environment: `HERDR_PANE_ID` is set inside every pane; `HERDR_BIN_PATH` is injected for
+**actions/hooks but not panes** — fall back to `herdr` on PATH. A binary started via terminal input
+gets no `HERDR_PLUGIN_CONTEXT_JSON`. Raw split paths root it with the split `cwd`; direct Unix
+plugin panes use `HERDR_SIDEBAR_SPAWN_CWD` for the resolution reason above. Spawn env always
+forwards `HERDR_PLUGIN_STATE_DIR` and prepends the binary directory to `PATH`.
 
 Console flashes from hooks (Windows 11, verified live):
 
@@ -412,7 +422,7 @@ HACKING.md — budget time for that before promising a patched build.
   forever. The fix: every TUI **re-stamps its identity token with the unix time** (string!)
   every ~5s; launch decisions treat a stamp older than `HEARTBEAT_STALE_SECS` (20s) — or a
   "Sidebar" label with no token at all — as a corpse and return `REPLACE <id>`: close the
-  pane, dock a fresh one. Ensure hook and all launcher scripts handle it.
+  pane, dock a fresh one. The native ensure/toggle launcher handles it.
 - **Server-restart resume creates corpses that NO event heals by itself**: herdr
   restores panes with their labels and scrollback, but the process inside is a fresh
   shell and metadata tokens are gone; restore and client attach emit NO hookable events
@@ -420,35 +430,29 @@ HACKING.md — budget time for that before promising a patched build.
   The fix is two-part: (1) label-without-token now counts as a corpse for ALL our
   labels (Sidebar/Explorer/Source Control/Preview), and (2) the ensure hook also runs
   on `pane.focused` + `tab.created` + `workspace.created`, so the user's FIRST
-  interaction after attach heals the tab. Hooking pane.* from a pane-creating script
-  is only safe because `open()` now HOLDS ITS LOCK until the spawned TUI stamps its
-  token — without that wait, queued hook invocations see the fresh label-only pane and
-  replace it before it boots: an infinite replace loop (observed live, dozens of panes
-  churned). The separated-pane launcher scripts carry the same wait.
-  Cleaner alternative (herdr-notes v0.1.1 does this): the LAUNCHER stamps the
-  identity token itself, synchronously, right after `pane.split` and BEFORE
-  `pane run` — there is then no token-less window at all, so no wait/poll is
-  needed. Worth adopting if the launchers are ever reworked.
-- A focus event may yield when the ensure lock is held because another focus event follows, but
-  `tab.created` is discrete. Unix AND the Windows sidecar must wait for the lock (the same
-  20 × 0.5 s budget as a manual toggle), or a preview tab created during the first-token wait
-  can permanently miss its sidebar (issue #32). Herdr's `EventEnvelope` serializes the JSON
-  discriminator as `tab_created`; manifest hook names remain dotted (`tab.created`).
+  interaction after attach heals the tab. Hooking `pane.*` is safe because every native launch
+  holds the shared lock until it has reported a fresh heartbeat, before swap/focus can release
+  queued hooks. A directly spawned Unix TUI also stamps `herdr-sidebar-starting` at process entry;
+  the Windows raw-split launcher stamps it before starting the command. The first full identity
+  report clears that marker. A toggle may close a still-starting pane directly because it cannot
+  contain unsaved in-memory state yet. Label-only panes remain unambiguously restored corpses.
+- A focus event may yield when the launcher lock is held because another focus event follows, but
+  `tab.created` is discrete and must block for the OS lock or a preview tab can permanently miss
+  its sidebar (issue #32). Herdr's `EventEnvelope` serializes the JSON discriminator as
+  `tab_created`; manifest hook names remain dotted (`tab.created`).
 - **Stamp the heartbeat on EVERY event-loop iteration, not only in the poll-timeout
   branch**: sustained input with <500ms gaps (held-key auto-repeat, a long paste) keeps
   `event::poll` returning true, starving a timeout-branch heartbeat until the launcher
   deems the live pane stale and REPLACE-kills it mid-edit. Same for a debounced autosave
   flush. Both self-throttle, so calling them unconditionally each iteration is free.
 - **`pane close` kills the TUI process with no chance to flush** (no signal/console-close
-  it can catch in practice) — any debounced-autosave state inside the debounce window dies
-  with it. Toggle-off launchers should first drive a graceful save+quit via
-  `pane send-keys <id> ctrl+q`, poll until the identity token disappears, THEN
-  `pane close` as cleanup. Probe errors and save failures keep the live pane open rather
-  than treating uncertainty as acknowledgement, and explicit toggles surface a notification
-  instead of failing silently. Ctrl+Q is a
-  dedicated quit chord handled before overlays/focus modes; do not use Escape, which closes
-  a tab-scoped preview/editor. SCM snapshots include commit drafts keyed by repo root, so
-  graceful quit and ordinary `q` restore unfinished text on the next Source Control pane.
+  it can catch in practice). A live-pane toggle sends Ctrl+Q and returns immediately; Ctrl+Q is
+  handled before overlays/focus modes, persists any SCM draft, and makes the TUI close its own
+  pane. A save failure keeps the live pane open with its error notice. The launcher directly
+  closes only `herdr-sidebar-starting` panes, which have not reached an event loop and cannot own
+  a draft. Do not reintroduce launcher-side acknowledgement polling. Escape remains reserved for
+  a tab-scoped preview/editor. SCM snapshots include commit drafts keyed by repo root, so graceful
+  close and ordinary `q` restore unfinished text on the next Source Control pane.
 
 ### Unified sidebar (see `src/state.rs`)
 
@@ -470,6 +474,8 @@ HACKING.md — budget time for that before promising a patched build.
   resize path; a pane-only divider resize is respected for the current layout instead of
   snapping back. The existing 15%–50% share bounds still win at extreme tab widths.
 - Every Settings action uses `state::update_state`, a lock-protected read-modify-write.
+  State/tree/SCM/root writers use persistent sibling `.lock` files with OS-backed locks; the
+  kernel releases ownership on process death, so do not poll, age, or delete those files.
   Never write an app's startup snapshot wholesale: preview tabs run independent sidebar
   processes, and a stale snapshot silently reverts newer settings from another tab.
 - Separated Explorer and Source Control panes periodically re-read shared display settings,
@@ -717,10 +723,10 @@ setting are all gone.
   only when the remembered path contains the tab's spawn cwd. Every successful manual or
   followed re-root is written to `roots.json`; a read-only `load_root` API is dead behavior.
 - The ensure hook roots a docked sidebar from **the event's own tab**
-  (`--event-scope` → `launch_decision_in` / `focused_pane_in`): during a workspace
-  switch the globally focused pane is still the space you came from. The Windows
-  ensure SIDECAR (`src/ensure.rs`) carries the same scoping — PR #15 scoped only the
-  unix `ensure-sidebar.sh`, so without this Windows kept the old cross-space bug.
+  (`event_scope_in` → `launch_decision_in` / `focused_pane_in`): during a workspace
+  switch the globally focused pane is still the space you came from. Both the Unix main-binary
+  entrypoint and Windows sidecar enter the same `ensure.rs` implementation. (Historically PR #15
+  scoped only the removed Unix shell path, leaving the Windows cross-space bug.)
   `pane.focused` has no `tab_id`, so resolve its `pane_id` through the same `pane.list`
   snapshot; a workspace scope with several tabs is ambiguous and must not pick one.
   Spawn roots prefer `foreground_cwd` but fall back to `cwd` because Windows herdr 0.8 does
@@ -975,16 +981,15 @@ First clean install of both plugins on a Mac (driven over SSH), findings:
   `nohup script -q /dev/null /bin/zsh -c 'stty rows 54 cols 220; exec herdr' &`.
   The server survives client death, restoring the session on next attach — but
   `pkill -f 'herdr$'` matches the SERVER too; workspace ids change across that restart.
-- **Unix launcher vs ensure-hook race**: `open-sidebar.sh` / `open-git.sh` originally took
-  no lock, so a user toggle racing a focus-burst ensure docked TWO sidebars (seen live).
-  They now take the SAME `herdr-sidebar-ensure.lock` mkdir lock as the hook — waiting
-  (20×0.5s) instead of yielding so the toggle isn't dropped. Post-lock terminal commands
-  must NOT `exec`: exec skips the EXIT trap and leaks the lock until the 30s stale-break.
-- **Unix ensure must hold its lock through the first TUI token stamp**: left-docking calls
-  `pane swap` and restores focus, and both operations re-emit focus events. Releasing the
-  lock immediately after `pane run` exposes a label-only pane that the corpse rule replaces,
-  creating an unbounded close/spawn loop (issue #29). Poll the new pane's identity token while
-  locked, matching the Windows ensure; do not replace this with a fixed startup sleep.
+- **Unix launcher vs ensure-hook race**: the former shell launchers could race focus-burst hooks
+  and dock two sidebars. Unix now runs the same native `ensure.rs` implementation as Windows;
+  its OS-backed file lock serializes toggles with hooks without retry sleeps or stale-lock cleanup.
+- **Stamp identity before releasing the launch lock**: left-docking calls `pane swap` and restores
+  focus, and both operations re-emit focus events. A fresh label-only pane is indistinguishable
+  from a server-restored corpse and caused the issue #29 unbounded close/spawn loop. Direct Unix
+  plugin panes start the TUI atomically and the launcher reports a heartbeat before layout/focus;
+  the Windows raw-split path stamps starting metadata before typing the command. No hook needs to
+  wait for process startup.
 - The `merged` (unified sidebar) default was still `false` from the experiment era — fresh
   installs came up as a pinned separate Explorer. Flipped to `true` (existing users keep
   their persisted value).

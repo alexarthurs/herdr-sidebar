@@ -5,8 +5,16 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 fn main() {
-    let toggle = std::env::args().any(|arg| arg == "--toggle");
+    let mode = match std::env::args().nth(1).as_deref() {
+        Some("--toggle") => {
+            herdr_sidebar::ensure::Mode::Toggle(herdr_sidebar::state::View::Explorer)
+        }
+        Some("--toggle-git") => {
+            herdr_sidebar::ensure::Mode::Toggle(herdr_sidebar::state::View::SourceControl)
+        }
+        _ => herdr_sidebar::ensure::Mode::Ensure,
+    };
     // Errors are deliberately silent: there is no console to print to, herdr
     // logs the exit, and the next focus event retries anyway.
-    let _ = herdr_sidebar::ensure::run(toggle);
+    let _ = herdr_sidebar::ensure::run(mode);
 }

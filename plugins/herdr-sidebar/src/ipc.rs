@@ -64,31 +64,125 @@ pub fn call_text(method: &str, params: serde_json::Value) -> std::io::Result<Str
 /// null VALUE — `pane.report_metadata` MERGES the token map, so an empty
 /// map is a no-op (verified live, herdr 0.7.1).
 pub fn report_identity(pane_id: &str, my: crate::state::View, merged: bool) {
+    let _ = report_identity_checked(pane_id, my, merged);
+}
+
+/// Checked form used by launchers before they perform focus-emitting layout
+/// operations. A TUI heartbeat uses [`report_identity`] because a transient
+/// reporting failure should not end its event loop.
+pub fn report_identity_checked(
+    pane_id: &str,
+    my: crate::state::View,
+    merged: bool,
+) -> std::io::Result<()> {
     let now = crate::state::unix_now().to_string();
-    let mine = serde_json::json!({ my.plugin_id(): now });
-    let _ = call_text(
+    let mine = serde_json::json!({
+        my.plugin_id(): now,
+        crate::launch::STARTING_TOKEN: serde_json::Value::Null,
+    });
+    call_text(
         "pane.report_metadata",
         serde_json::json!({ "pane_id": pane_id, "source": my.plugin_id(), "tokens": mine }),
-    );
+    )?;
     let other = my.other();
     let other_tokens = if merged {
         serde_json::json!({ other.plugin_id(): now })
     } else {
         serde_json::json!({ other.plugin_id(): serde_json::Value::Null })
     };
-    let _ = call_text(
+    call_text(
         "pane.report_metadata",
         serde_json::json!({
             "pane_id": pane_id,
             "source": other.plugin_id(),
             "tokens": other_tokens,
         }),
-    );
+    )?;
+    Ok(())
+}
+
+/// Mark the brief interval before a TUI reaches its event loop. Windows calls
+/// this after a raw split; directly spawned Unix TUIs call it immediately on
+/// process startup. The first full identity report clears the marker.
+pub fn report_starting_identity(
+    pane_id: &str,
+    my: crate::state::View,
+    merged: bool,
+) -> std::io::Result<()> {
+    let now = crate::state::unix_now().to_string();
+    call_text(
+        "pane.report_metadata",
+        serde_json::json!({
+            "pane_id": pane_id,
+            "source": my.plugin_id(),
+            "tokens": {
+                my.plugin_id(): now,
+                crate::launch::STARTING_TOKEN: "1",
+            },
+        }),
+    )?;
+    if merged {
+        let other = my.other();
+        call_text(
+            "pane.report_metadata",
+            serde_json::json!({
+                "pane_id": pane_id,
+                "source": other.plugin_id(),
+                "tokens": { other.plugin_id(): now },
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+/// Spawn a Unix plugin pane directly from its manifest argv. Unlike a raw
+/// `pane.split` followed by terminal input, this never renders an interactive
+/// shell prompt before the TUI. Herdr 0.8.2 resolves relative pane commands
+/// against the process cwd, so the requested project cwd travels in an env
+/// var and `main` changes directory after the direct spawn.
+#[cfg(unix)]
+pub fn open_plugin_pane(
+    target_pane_id: &str,
+    view: crate::state::View,
+    cwd: &std::path::Path,
+    merged: bool,
+) -> std::io::Result<String> {
+    let mut env = crate::state::spawn_env();
+    if !cwd.as_os_str().is_empty()
+        && let Some(env) = env.as_object_mut()
+    {
+        env.insert(
+            crate::state::SPAWN_CWD_ENV.to_string(),
+            serde_json::Value::String(cwd.display().to_string()),
+        );
+    }
+    let response = call_text(
+        "plugin.pane.open",
+        serde_json::json!({
+            "plugin_id": "herdr-sidebar",
+            "entrypoint": view.entrypoint(),
+            "placement": "split",
+            "target_pane_id": target_pane_id,
+            "direction": "right",
+            "focus": false,
+            "env": env,
+        }),
+    )?;
+    let pane_id = crate::launch::plugin_pane_id(&response).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("plugin.pane.open returned no pane id: {response}"),
+        )
+    })?;
+    if let Err(error) = report_identity_checked(&pane_id, view, merged) {
+        let _ = call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
+        return Err(error);
+    }
+    Ok(pane_id)
 }
 
 /// Clear both sidebar identity tokens after the event loop has finished its
-/// final persistence. Launchers poll this acknowledgement before removing the
-/// now-idle shell pane.
+/// final persistence.
 pub fn clear_identity(pane_id: &str) {
     for view in [
         crate::state::View::Explorer,
@@ -99,7 +193,10 @@ pub fn clear_identity(pane_id: &str) {
             serde_json::json!({
                 "pane_id": pane_id,
                 "source": view.plugin_id(),
-                "tokens": { view.plugin_id(): serde_json::Value::Null },
+                "tokens": {
+                    view.plugin_id(): serde_json::Value::Null,
+                    crate::launch::STARTING_TOKEN: serde_json::Value::Null,
+                },
             }),
         );
     }

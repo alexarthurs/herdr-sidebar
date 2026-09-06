@@ -763,6 +763,12 @@ impl App {
     /// immediately re-dock a fresh one) and close our own pane. The herdr
     /// prefix+b keybinding (→ the toggle action) brings it back.
     fn hide(&mut self) {
+        // A direct pane close kills the process without a Drop/signal hook.
+        // Persist drafts first; failure keeps the live pane open with the
+        // existing error notice from persist_scm().
+        if !self.persist_scm() {
+            return;
+        }
         let Some(ctl) = &self.pane_ctl else { return };
         if let Ok(json) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) {
             let tab = herdr_sidebar::launch::tab_of(&json, &ctl.pane_id);
@@ -1113,7 +1119,8 @@ impl App {
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
         {
-            return Some(Exit::Quit);
+            self.hide();
+            return None;
         }
         self.flash = None;
         if self.overlay.is_some() {
@@ -2455,7 +2462,10 @@ impl App {
             self.persisted_draft_roots
                 .extend(snapshot.drafts.keys().cloned());
         } else {
-            self.flash = Some(("Could not save Source Control state; action cancelled.".into(), true));
+            self.flash = Some((
+                "Could not save Source Control state; action cancelled.".into(),
+                true,
+            ));
         }
         saved
     }
@@ -2538,6 +2548,9 @@ impl App {
         let (Some(ctl), Some(_)) = (&self.pane_ctl, &self.other_exe) else {
             return;
         };
+        let Some(_lock) = herdr_sidebar::ensure::LaunchLock::acquire(true) else {
+            return;
+        };
         // Grow to double width FIRST, then split 50/50 — each separated panel
         // keeps the width the unified sidebar had, instead of halving.
         ctl.resize_to(
@@ -2545,33 +2558,46 @@ impl App {
             self.last_width.saturating_mul(2).saturating_add(1),
             self.sidebar_state.dock_right,
         );
-        let response = herdr_sidebar::ipc::call_text(
-            "pane.split",
-            serde_json::json!({
-                "target_pane_id": ctl.pane_id,
-                "direction": "right",
-                "ratio": 0.5,
-                "focus": false,
-                "cwd": self.cwd.display().to_string(),
-                "env": sidebar::spawn_env(),
-            }),
-        );
-        let Some(new_pane) = response
-            .ok()
-            .and_then(|r| herdr_sidebar::launch::split_pane_id(&r))
-        else {
-            return;
-        };
-        let flag = MY_VIEW.other().view_flag();
-        let command = format!("{} --view {flag}", sidebar::EXECUTABLE_NAME);
-        let _ = herdr_sidebar::ipc::call_text(
-            "pane.send_input",
-            serde_json::json!({ "pane_id": new_pane, "text": command, "keys": ["Enter"] }),
-        );
-        let _ = herdr_sidebar::ipc::call_text(
-            "pane.rename",
-            serde_json::json!({ "pane_id": new_pane, "label": MY_VIEW.other().label() }),
-        );
+        let other = MY_VIEW.other();
+        #[cfg(unix)]
+        let _ = herdr_sidebar::ipc::open_plugin_pane(&ctl.pane_id, other, &self.cwd, false);
+        #[cfg(windows)]
+        {
+            let response = herdr_sidebar::ipc::call_text(
+                "pane.split",
+                serde_json::json!({
+                    "target_pane_id": ctl.pane_id,
+                    "direction": "right",
+                    "ratio": 0.5,
+                    "focus": false,
+                    "cwd": self.cwd.display().to_string(),
+                    "env": sidebar::spawn_env(),
+                }),
+            );
+            let Some(new_pane) = response
+                .ok()
+                .and_then(|r| herdr_sidebar::launch::split_pane_id(&r))
+            else {
+                return;
+            };
+            if herdr_sidebar::ipc::report_starting_identity(&new_pane, other, false).is_err() {
+                let _ = herdr_sidebar::ipc::call_text(
+                    "pane.close",
+                    serde_json::json!({ "pane_id": new_pane }),
+                );
+                return;
+            }
+            let flag = other.view_flag();
+            let command = format!("{} --view {flag}", sidebar::EXECUTABLE_NAME);
+            let _ = herdr_sidebar::ipc::call_text(
+                "pane.send_input",
+                serde_json::json!({ "pane_id": new_pane, "text": command, "keys": ["Enter"] }),
+            );
+            let _ = herdr_sidebar::ipc::call_text(
+                "pane.rename",
+                serde_json::json!({ "pane_id": new_pane, "label": other.label() }),
+            );
+        }
     }
 
     // ---- Git operations ----

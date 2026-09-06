@@ -1,49 +1,52 @@
 //! Sidebar ensure/toggle, driven entirely over the socket API (see `ipc`) so a
-//! focus-event hook never spawns a console process. Mirrors the unix shell
-//! scripts' flow; the decision/plan parsing is the unit-tested `launch` module,
-//! fed the socket responses (same JSON the CLI prints).
+//! focus-event hook never spawns a console process. Unix actions/hooks call
+//! this through the main binary; Windows uses the GUI-subsystem sidecar. The
+//! decision/plan parsing is the unit-tested `launch` module, fed the socket
+//! responses (same JSON the CLI prints).
 
-use std::path::PathBuf;
+use std::fs::File;
 
-use crate::{ipc, launch};
+use crate::{ipc, launch, state::View};
 
-/// Serialize concurrent runs (pane/tab events arrive in bursts; unguarded,
-/// one switch opened four panes).
-/// Losing the race skips this run; the next event re-fires it.
-struct Lock(PathBuf);
-
-impl Lock {
-    fn acquire(wait: bool) -> Option<Self> {
-        let dir = std::env::temp_dir().join("herdr-sidebar-ensure.lock");
-        let attempts = if wait { 20 } else { 0 };
-        for attempt in 0..=attempts {
-            if std::fs::create_dir(&dir).is_ok() {
-                return Some(Self(dir));
-            }
-            // Break locks older than 30s (a crashed run), otherwise yield or
-            // wait for a discrete action that must not be dropped.
-            let stale = std::fs::metadata(&dir)
-                .and_then(|m| m.created().or_else(|_| m.modified()))
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age.as_secs() > 30);
-            if stale {
-                let _ = std::fs::remove_dir_all(&dir);
-                if std::fs::create_dir(&dir).is_ok() {
-                    return Some(Self(dir));
-                }
-            }
-            if attempt < attempts {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-        }
-        None
-    }
+/// Why the native launcher was invoked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// A focus/create hook quietly ensures the Explorer exists.
+    Ensure,
+    /// An explicit user action toggles the requested view.
+    Toggle(View),
 }
 
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir(&self.0);
+/// Serialize concurrent runs (pane/tab events arrive in bursts; unguarded,
+/// one switch opened four panes). The OS releases this lock if a launcher
+/// crashes, so no retry timer or stale-lock cleanup is needed.
+pub struct LaunchLock {
+    _file: File,
+}
+
+impl LaunchLock {
+    /// Acquire the shared launcher lock. Discrete user actions should wait;
+    /// redundant focus hooks should use a non-blocking attempt and yield.
+    pub fn acquire(wait: bool) -> Option<Self> {
+        let path = crate::state::state_path()
+            .map(|path| path.with_file_name("launcher.lock"))
+            .unwrap_or_else(|| std::env::temp_dir().join("herdr-sidebar-launcher.lock"));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok()?;
+        }
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .ok()?;
+        let acquired = if wait {
+            file.lock().is_ok()
+        } else {
+            file.try_lock().is_ok()
+        };
+        acquired.then_some(Self { _file: file })
     }
 }
 
@@ -52,25 +55,28 @@ use crate::snooze;
 /// Quiet mode (hooks): make sure the focused tab has an Explorer, never moving
 /// focus, and respecting a tab the user toggled closed. Toggle mode (the
 /// action): open-or-focus-or-close, like VS Code's explorer shortcut.
-pub fn run(toggle: bool) -> std::io::Result<()> {
+pub fn run(mode: Mode) -> std::io::Result<()> {
+    let toggle = matches!(mode, Mode::Toggle(_));
+    let view = match mode {
+        Mode::Ensure => View::Explorer,
+        Mode::Toggle(view) => view,
+    };
     let state = crate::state::load_state();
     // Auto-open off (⚙ Settings): hooks leave closed tabs alone; the user's
-    // explicit toggle still works. The unix hook script makes the same check
-    // via `herdr-sidebar --auto-open`.
+    // explicit toggle still works.
     if !toggle && !state.auto_open {
         return Ok(());
     }
     let event_json = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
     let wait_for_lock = must_wait_for_lock(toggle, &event_json);
-    let Some(_lock) = Lock::acquire(wait_for_lock) else {
+    let Some(_lock) = LaunchLock::acquire(wait_for_lock) else {
         return Ok(());
     };
     let mut panes = ipc::call_text("pane.list", serde_json::json!({}))?;
     // The tab THIS event is about. During a workspace switch the globally
     // focused pane is still the space you came from, which docked sidebars
-    // into the wrong project (the unix hook script scopes the same way, via
-    // `--event-scope`). A toggle is a deliberate act on the focused tab, so
-    // it stays unscoped.
+    // into the wrong project. A toggle is a deliberate act on the focused
+    // tab, so it stays unscoped.
     let scope = if toggle {
         String::new()
     } else {
@@ -80,24 +86,28 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
     let snooze_dir = snooze::dir();
     snooze::sweep(&snooze_dir, &launch::live_tabs(&panes));
     let now = crate::state::unix_now();
-    match launch::launch_decision_in(&panes, now, &scope).split_once(' ') {
+    let decision = match view {
+        View::Explorer => launch::launch_decision_in(&panes, now, &scope),
+        View::SourceControl => launch::launch_decision_git(&panes, now),
+    };
+    let decision = if toggle && state.strict_toggle {
+        launch::focus_as_close(&decision)
+    } else {
+        decision
+    };
+    let tracks_snooze = view == View::Explorer;
+    match decision.split_once(' ') {
         Some(("FOCUS", id)) => {
             if toggle {
-                if state.strict_toggle {
-                    // Strict toggle (⚙ Settings): one press opens, the next
-                    // press closes, wherever focus is. The unix launchers get
-                    // the same mapping from the --launch-decision CLI mode.
-                    graceful_close(id);
-                    snooze::set(&snooze_dir, &tab);
-                } else {
-                    focus(id)?;
-                }
+                focus(id)?;
             }
         }
         Some(("CLOSE", id)) => {
             if toggle {
-                graceful_close(id);
-                snooze::set(&snooze_dir, &tab);
+                request_close(&panes, id)?;
+                if tracks_snooze {
+                    snooze::set(&snooze_dir, &tab);
+                }
             }
         }
         Some(("REPLACE", id)) => {
@@ -108,50 +118,38 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
             // id. Re-plan from a fresh snapshot rather than splitting a pane
             // that no longer exists.
             panes = ipc::call_text("pane.list", serde_json::json!({}))?;
-            open(&panes, toggle && state.focus_on_open, &scope)?;
+            open(&panes, toggle && state.focus_on_open, &scope, view)?;
         }
         _ => {
             if toggle {
-                snooze::clear(&snooze_dir, &tab);
+                if tracks_snooze {
+                    snooze::clear(&snooze_dir, &tab);
+                }
                 // "Focus on open: off" (⚙ Settings) docks in the background:
                 // open()'s quiet path already hands focus back after the swap.
-                open(&panes, state.focus_on_open, &scope)?;
+                open(&panes, state.focus_on_open, &scope, view)?;
             } else if !snooze::is_set(&snooze_dir, &tab) {
-                open(&panes, false, &scope)?;
+                open(&panes, false, &scope, view)?;
             }
         }
     }
     Ok(())
 }
 
-fn graceful_close(pane_id: &str) {
-    let _ = ipc::call_text(
-        "pane.send_input",
-        serde_json::json!({ "pane_id": pane_id, "text": "", "keys": ["ctrl+q"] }),
-    );
-    let mut acknowledged = false;
-    for _ in 0..20 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if let Ok(json) = ipc::call_text("pane.list", serde_json::json!({}))
-            && !launch::pane_has_token(&json, pane_id)
-        {
-            acknowledged = true;
-            break;
-        }
-    }
-    if acknowledged {
-        let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
+fn request_close(panes_json: &str, pane_id: &str) -> std::io::Result<()> {
+    if launch::pane_is_starting(panes_json, pane_id) {
+        // No TUI event loop or in-memory draft exists yet.
+        ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }))?;
     } else {
-        let _ = ipc::call_text(
-            "notification.show",
-            serde_json::json!({
-                "title": "Sidebar close cancelled",
-                "body": "The pane did not acknowledge a safe shutdown; try again shortly.",
-                "position": "bottom-right",
-                "sound": "none",
-            }),
-        );
+        // Ctrl+Q is handled before overlays/focus modes. The TUI persists any
+        // Source Control draft and closes its own pane; this launcher does not
+        // poll for an acknowledgement.
+        ipc::call_text(
+            "pane.send_input",
+            serde_json::json!({ "pane_id": pane_id, "text": "", "keys": ["ctrl+q"] }),
+        )?;
     }
+    Ok(())
 }
 
 fn snooze_tab_for_scope(panes_json: &str, scope: &str) -> String {
@@ -170,7 +168,7 @@ fn focus(pane_id: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn open(panes_json: &str, focus_new: bool, scope: &str) -> std::io::Result<()> {
+fn open(panes_json: &str, focus_new: bool, scope: &str, view: View) -> std::io::Result<()> {
     // Root the new sidebar from a pane in the scope we are docking into —
     // the decision above answered for that scope, and the two must agree or
     // we dock into one tab with another tab's cwd.
@@ -198,19 +196,36 @@ fn open(panes_json: &str, focus_new: bool, scope: &str) -> std::io::Result<()> {
         .and_then(|s| s.parse::<bool>().ok())
         .unwrap_or(!dock_right);
 
-    let mut split = serde_json::json!({
-        "target_pane_id": target,
-        "direction": "right",
-        "ratio": ratio,
-        "focus": false,
-    });
-    if !fcwd.is_empty() {
-        split["cwd"] = serde_json::Value::String(fcwd.to_string());
-    }
-    split["env"] = crate::state::spawn_env();
-    let response = ipc::call_text("pane.split", split)?;
-    let Some(new_pane) = launch::split_pane_id(&response) else {
-        return Ok(());
+    #[cfg(unix)]
+    let new_pane = ipc::open_plugin_pane(
+        &target,
+        view,
+        std::path::Path::new(fcwd),
+        view == View::Explorer && state.merged,
+    )?;
+    #[cfg(windows)]
+    let new_pane = {
+        let mut split = serde_json::json!({
+            "target_pane_id": target,
+            "direction": "right",
+            "ratio": ratio,
+            "focus": false,
+        });
+        if !fcwd.is_empty() {
+            split["cwd"] = serde_json::Value::String(fcwd.to_string());
+        }
+        split["env"] = crate::state::spawn_env();
+        let response = ipc::call_text("pane.split", split)?;
+        let Some(new_pane) = launch::split_pane_id(&response) else {
+            return Ok(());
+        };
+        if let Err(error) =
+            ipc::report_starting_identity(&new_pane, view, view == View::Explorer && state.merged)
+        {
+            let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": new_pane }));
+            return Err(error);
+        }
+        new_pane
     };
 
     if needs_swap {
@@ -219,31 +234,33 @@ fn open(panes_json: &str, focus_new: bool, scope: &str) -> std::io::Result<()> {
             serde_json::json!({ "source_pane_id": new_pane, "target_pane_id": target }),
         )?;
     }
-    ipc::call_text(
-        "pane.send_input",
-        serde_json::json!({
-            "pane_id": new_pane,
-            "text": crate::state::EXECUTABLE_NAME,
-            "keys": ["Enter"]
-        }),
-    )?;
-    ipc::call_text(
-        "pane.rename",
-        serde_json::json!({ "pane_id": new_pane, "label": launch::PANE_LABEL }),
-    )?;
-    full_height_repair(&new_pane, dock_right);
-
-    // Hold the lock until the TUI stamps its identity token (~1-2s): hook
-    // invocations queued behind us must observe a LIVE pane, or the
-    // corpse rule would replace this spawn before it finishes booting.
-    for _ in 0..30 {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        if let Ok(json) = ipc::call_text("pane.list", serde_json::json!({}))
-            && launch::pane_has_token(&json, &new_pane)
-        {
-            break;
-        }
+    #[cfg(unix)]
+    resize_direct_spawn(&new_pane, dock_right, ratio);
+    #[cfg(windows)]
+    {
+        let command = if view == View::Explorer {
+            crate::state::EXECUTABLE_NAME.to_string()
+        } else {
+            format!(
+                "{} --view {}",
+                crate::state::EXECUTABLE_NAME,
+                view.view_flag()
+            )
+        };
+        ipc::call_text(
+            "pane.send_input",
+            serde_json::json!({
+                "pane_id": new_pane,
+                "text": command,
+                "keys": ["Enter"]
+            }),
+        )?;
+        ipc::call_text(
+            "pane.rename",
+            serde_json::json!({ "pane_id": new_pane, "label": view.label() }),
+        )?;
     }
+    full_height_repair(&new_pane, dock_right);
 
     if focus_new {
         focus(&new_pane)?;
@@ -254,6 +271,26 @@ fn open(panes_json: &str, focus_new: bool, scope: &str) -> std::io::Result<()> {
         focus(fid)?;
     }
     Ok(())
+}
+
+/// `plugin.pane.open` starts a direct process but currently exposes no split
+/// ratio. It creates a 50/50 split; after any left-dock swap, move the TUI's
+/// interior edge to the ratio already computed by `open_plan`.
+#[cfg(unix)]
+fn resize_direct_spawn(pane_id: &str, dock_right: bool, ratio: f64) {
+    let amount = (ratio - 0.5).abs();
+    if amount < 0.005 {
+        return;
+    }
+    let direction = if dock_right { "right" } else { "left" };
+    let _ = ipc::call_text(
+        "pane.resize",
+        serde_json::json!({
+            "pane_id": pane_id,
+            "direction": direction,
+            "amount": amount,
+        }),
+    );
 }
 
 /// Grow the freshly-opened explorer into a full-height edge column. When the

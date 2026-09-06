@@ -2,6 +2,7 @@
 name = "herdr-sidebar"
 version = "0.11.0"
 edition = "2024"
+rust-version = "1.89"
 description = "VS Code-style sidebar for herdr: file explorer + source control in one pane"
 license = "MIT"
 
