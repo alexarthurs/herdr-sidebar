@@ -685,6 +685,28 @@ pub fn tab_of(pane_list_json: &str, pane_id: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The sidebar pane living in `tab_id` ("" when there is no known sidebar).
+/// Prefer metadata tokens over the cosmetic label so collapsed panes and the
+/// unified Sidebar are handled without relying on layout order.
+pub fn sidebar_pane_in_tab(pane_list_json: &str, tab_id: &str) -> String {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return String::new();
+    };
+    msg.result
+        .panes
+        .iter()
+        .find(|p| {
+            p.tab_id.as_deref() == Some(tab_id)
+                && (p.tokens.contains_key(METADATA_SOURCE)
+                    || p.tokens.contains_key(SC_METADATA_SOURCE)
+                    || p.label.as_deref() == Some(SIDEBAR_LABEL)
+                    || p.label.as_deref() == Some(PANE_LABEL)
+                    || p.label.as_deref() == Some(SC_PANE_LABEL))
+        })
+        .and_then(|p| p.pane_id.clone())
+        .unwrap_or_default()
+}
+
 /// Any pane living in `tab_id` ("" when the tab is empty or unknown). The
 /// preview flow needs one because herdr 0.9 moves the VIEWING client only on
 /// `pane.focus`; `tab.focus` updates the session-wide record and nothing else.
@@ -1108,6 +1130,31 @@ mod tests {
             event_scope(r#"{"data":{"workspace_id":"a b; rm -rf /"}}"#),
             ""
         );
+    }
+
+    #[test]
+    fn sidebar_pane_in_tab_prefers_sidebar_over_layout_order() {
+        let right_docked = pane_list(
+            r#"{"pane_id":"w1:p1","tab_id":"w1:t1","label":"zsh"},
+               {"pane_id":"w1:p2","tab_id":"w1:t1","label":"Sidebar","tokens":{"herdr-sidebar-explorer":"1","herdr-sidebar-git":"1"}},
+               {"pane_id":"w1:p3","tab_id":"w1:t2","label":"Sidebar","tokens":{"herdr-sidebar-explorer":"1"}}"#,
+        );
+        assert_eq!(pane_in_tab(&right_docked, "w1:t1"), "w1:p1");
+        assert_eq!(sidebar_pane_in_tab(&right_docked, "w1:t1"), "w1:p2");
+    }
+
+    #[test]
+    fn sidebar_pane_in_tab_recognizes_source_control_token() {
+        let separate_source_control = pane_list(
+            r#"{"pane_id":"w1:p1","tab_id":"w1:t1","label":"zsh"},
+               {"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{"herdr-sidebar-git":"1"}}"#,
+        );
+        assert_eq!(
+            sidebar_pane_in_tab(&separate_source_control, "w1:t1"),
+            "w1:p2"
+        );
+        assert_eq!(sidebar_pane_in_tab(&separate_source_control, "w1:t2"), "");
+        assert_eq!(sidebar_pane_in_tab("garbage", "w1:t1"), "");
     }
 
     #[test]

@@ -1437,9 +1437,16 @@ pub(crate) fn focus_tab_for_client(tab_id: &str, pane_id: Option<&str>) {
 
 fn close_preview_tab(preview: &PreviewPane) {
     // Focus first: closing our own tab kills this process, so code after a
-    // successful tab.close is not guaranteed to run.
+    // successful tab.close is not guaranteed to run. Return to the sidebar
+    // that opened the preview rather than whichever pane happens to be first
+    // in the origin tab's pane list (right-docked sidebars appear last).
     if !preview.origin_tab_id.is_empty() {
-        focus_tab_for_client(&preview.origin_tab_id, None);
+        let list = ipc::call_text("pane.list", serde_json::json!({})).unwrap_or_default();
+        let sidebar = crate::launch::sidebar_pane_in_tab(&list, &preview.origin_tab_id);
+        focus_tab_for_client(
+            &preview.origin_tab_id,
+            (!sidebar.is_empty()).then_some(sidebar.as_str()),
+        );
     }
     let _ = ipc::call_text("tab.close", serde_json::json!({ "tab_id": preview.tab_id }));
 }
