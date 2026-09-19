@@ -864,10 +864,15 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
 /// Pipes via stdin (`-`) to avoid treating filenames starting with `-` as
 /// flags. Width is a best-effort approximation; the ideal fix would pass
 /// `body.width` from `draw_doc` once that is available at load time.
+///
+/// `--style` follows the same light/dark signal `syntax.rs` already uses
+/// for non-markdown files (`crate::ui::is_light()`) — glow's dark-style
+/// foreground colors are unreadable against a light background.
 fn glow_markdown(text: &str, width: u16) -> Option<Vec<Line<'static>>> {
     use std::io::Write as _;
+    let style = if crate::ui::is_light() { "light" } else { "dark" };
     let mut child = std::process::Command::new("glow")
-        .args(["--style", "dark", "--width", &width.to_string(), "-"])
+        .args(["--style", style, "--width", &width.to_string(), "-"])
         .env("CLICOLOR_FORCE", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
