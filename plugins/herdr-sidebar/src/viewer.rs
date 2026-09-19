@@ -43,6 +43,14 @@ const LOAD_POLL: Duration = Duration::from_millis(16);
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_LINES: usize = 5000;
 
+/// Body width from the most recent `draw_doc` call. `load_file` runs on a
+/// background thread before layout is known, so glow renders markdown
+/// (tables especially) against this best-effort snapshot instead of the
+/// full terminal size — which is wrong once the sidebar is docked to less
+/// than the whole window. Steady-state accurate; only stale for the one
+/// frame between a resize and the next draw.
+static LAST_BODY_WIDTH: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(80);
+
 /// Directory for the sidebar's private scratch files (viewer control files).
 /// `std::env::temp_dir()` can be a shared, world-writable directory (unix
 /// `/tmp`) where our filenames are predictable from the pane id; scope our
@@ -1160,28 +1168,29 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
         return load_media_file(target, name, true);
     }
     let is_markdown = lower.ends_with(".md") || lower.ends_with(".markdown");
-    let (lines, numbered) = match std::fs::read(target) {
-        Err(e) => (vec![Line::raw(format!("(unreadable: {e})"))], true),
+    let (lines, numbered, is_glow) = match std::fs::read(target) {
+        Err(e) => (vec![Line::raw(format!("(unreadable: {e})"))], true, false),
         Ok(bytes) => {
             if bytes.contains(&0) {
                 (
                     vec![Line::raw(format!("(binary file — {} bytes)", bytes.len()))],
+                    false,
                     false,
                 )
             } else {
                 let truncated = bytes.len() > MAX_BYTES;
                 let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_BYTES)]);
                 // Markdown: render via glow; fall back to syntax highlight on failure.
-                // Width is approximated by subtracting 6 for the sidebar share and
-                // line-number gutter; ideal fix is to pass body.width from draw_doc.
-                let glow_width = crossterm::terminal::size()
-                    .map(|(w, _)| w.saturating_sub(6))
-                    .unwrap_or(74);
+                // glow lays out fixed-width content (tables especially) for this
+                // exact width, so the pane's own width must match or the table
+                // borders/columns land wrong.
+                let glow_width = LAST_BODY_WIDTH.load(std::sync::atomic::Ordering::Relaxed).max(20);
                 let glow_rendered = (is_markdown && target_line.is_none())
                     .then(|| glow_markdown(&text, glow_width))
                     .flatten();
                 // Glow-rendered markdown gets no line numbers (it formats its own layout).
                 let numbered = glow_rendered.is_none();
+                let is_glow = glow_rendered.is_some();
                 let mut lines: Vec<Line<'static>> = if let Some(rendered) = glow_rendered {
                     rendered
                 } else {
@@ -1198,7 +1207,7 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
                 if lines.is_empty() {
                     lines.push(Line::raw("(empty file)"));
                 }
-                (lines, numbered)
+                (lines, numbered, is_glow)
             }
         }
     };
@@ -1209,7 +1218,9 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
         numbered,
         media: None,
         scroll: 0,
-        wrap: true,
+        // glow already wraps/formats to LAST_BODY_WIDTH; re-wrapping its output
+        // generically would cut table rows and borders mid-cell.
+        wrap: !is_glow,
         rows: Vec::new(),
         rows_key: None,
         pending_src: target_line.map(|line| line.saturating_sub(1)),
@@ -1979,6 +1990,7 @@ fn draw_doc(
 
     // Lay the body out for THIS width first: everything below (the clamp,
     // the slice, the page stride) counts rendered rows.
+    LAST_BODY_WIDTH.store(body.width, std::sync::atomic::Ordering::Relaxed);
     doc.relayout(body.width, body.height);
     doc.scroll = doc.scroll.min(
         doc.rows
@@ -4041,6 +4053,38 @@ mod tests {
             has_styled,
             "glow_markdown returned no styled spans — ANSI not parsed"
         );
+    }
+
+    /// A table row glow lays out for `LAST_BODY_WIDTH` must reach the pane
+    /// unmodified: `build_rows`' generic word-wrap doesn't understand table
+    /// borders, so re-wrapping a glow-rendered line breaks its columns.
+    #[test]
+    fn glow_rendered_markdown_disables_generic_rewrap() {
+        if std::process::Command::new("glow")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "herdr-sidebar-glow-table-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("table.md");
+        std::fs::write(&path, "| a | b |\n|---|---|\n| 1 | 2 |\n").unwrap();
+
+        LAST_BODY_WIDTH.store(80, std::sync::atomic::Ordering::Relaxed);
+        let doc = load_file(&path, None);
+        assert!(
+            !doc.wrap,
+            "glow-rendered markdown must not be re-wrapped by build_rows"
+        );
+        assert!(!doc.numbered, "glow formats its own layout, no gutter");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
