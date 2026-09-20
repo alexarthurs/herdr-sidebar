@@ -32,6 +32,10 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
+`git::tests::ignored_scan_lock_is_single_flight` fails intermittently under the default
+parallel runner on macOS (also on an untouched `origin/main`); `cargo test -- --test-threads=1`
+passes. Don't chase it as a regression of unrelated changes.
+
 `plugins/herdr-sidebar/scripts/.gitattributes` pins every shell script to LF. The
 repository has Windows contributors and `core.autocrlf` is common, but these files are
 executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launcher runs.
