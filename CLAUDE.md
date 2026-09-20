@@ -32,6 +32,10 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
+`git::tests::ignored_scan_lock_is_single_flight` fails intermittently under the default
+parallel runner on macOS (also on an untouched `origin/main`); `cargo test -- --test-threads=1`
+passes. Don't chase it as a regression of unrelated changes.
+
 `plugins/herdr-sidebar/scripts/.gitattributes` pins every shell script to LF. The
 repository has Windows contributors and `core.autocrlf` is common, but these files are
 executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launcher runs.
@@ -895,6 +899,56 @@ setting are all gone.
   otherwise searches cwd first), and extraction has a 4s timeout plus a 16 MiB output cap.
   Images stop at 32 MiB encoded / 12 megapixels / 64 MiB decoder allocation. Without `ffmpeg`,
   the pane shows a capability message rather than launching an external app. Media stays read-only.
+- PDFs (`pdftoppm`, page sizes/count from `pdfinfo`) and SVGs (`rsvg-convert`) are rasterized
+  through the same bounded-helper path (`run_bounded`, absolute-PATH lookup via
+  `executable_in_path`) to fit the body's pixel box, then enter the media pipeline. Without the
+  rasterizer they keep the old preview (PDF: binary notice, SVG: source text); an SVG that
+  rsvg-convert rejects also falls back to text. Page turns and "pane outgrew the raster"
+  re-renders run on a worker, and three rules keep that path honest:
+  - ONE rasterizer at a time. A held `n` fires key repeat ~30×/s; starting a job per repeat
+    put 50+ `pdftoppm` processes on the machine, each decoding up to 12 Mpx. The key sets a
+    goal (`RasterGoal`) and the loop starts the job only when none is in flight, so a burst
+    renders the page the user landed on and nothing in between (measured: max 1 concurrent).
+  - Cached pages are keyed by page, raster box AND the file's length + mtime, and the cache
+    is bounded by BYTES (decoded pages are megabytes each). A PDF rebuilt while it is open
+    would otherwise serve page 1 from the old build next to page 3 from the new one.
+  - Leaving a preview cancels its helpers (`Cancel`, checked before spawn and while waiting):
+    clicking through a folder of PDFs left a `pdfinfo` and a `pdftoppm` running per click.
+- **Full-resolution media uses herdr's pane graphics API** (`src/pane_graphics.rs`, needs
+  `[experimental] kitty_graphics = true`); half blocks remain the fallback. Half blocks are only
+  2 px per cell, so a 1280-px screenshot or a PDF page is an unreadable mosaic (verified live on
+  Ghostty). Findings (herdr 0.8.2, verified live on macOS):
+  - `pane.graphics.info` returns the client's `cell_width_px`/`cell_height_px`, or
+    `feature_disabled`. Re-query it on every resize; never guess cell pixels.
+  - `pane.graphics.set` is unusable for real images: the API rejects any request LINE over
+    1 MiB, base64 included. Use `pane.graphics.stream`: one JSON header line + raw bytes per
+    frame, up to 16 MiB (`PANE_GRAPHICS_STREAM_MAX_BYTES`). herdr answers a frame ONLY to
+    reject it (error line, then close), so a reader thread flags failure and the viewer falls
+    back to half blocks.
+  - Closing the stream socket removes the layer — including on process death (verified with
+    SIGTERM). The reader thread holds a `try_clone`, so `Drop` must `shutdown(Both)`, not just
+    drop one handle, or herdr never sees EOF and the image outlives the preview.
+  - Placements map to kitty `c=<cols>,r=<rows>`, which STRETCHES the frame over the cells. The
+    frame is therefore padded (transparent) to the exact aspect of its cell rectangle.
+  - Send frames only when (media id, body rect) changes, never per 250 ms tick. herdr replays
+    placements on redraw, tab switch and zoom by itself.
+  - Streams are unix-only: a synchronous Windows named-pipe handle serializes a blocked read
+    with writes, so the failure reader would stall frames. Windows keeps half blocks.
+  - Every herdr roundtrip (info, stream open) runs on a WORKER thread: `ipc.rs` waits up to
+    5 s for a reply, and a resize drag would otherwise freeze the TUI for that long with
+    nothing on screen. The cell size and the stream therefore arrive asynchronously and the
+    frame goes out on the first draw after they do; a resize burst is debounced.
+  - herdr answers `stream_conflict` while a previous stream's layer is still being torn
+    down, which is exactly what a quick image → text → image switch does — so the open is
+    retried a few times on the worker. A refused frame must disable the layer for THAT
+    document only, never latch for the session: otherwise one transient conflict leaves the
+    pane mosaicked until the next resize.
+  - `pane read` cannot see images. Verify with `screencapture -x -o -l <ghostty window id>`
+    (CGWindowList id; captures the window even when occluded — never full-screen captures,
+    they grab whatever app is in front) cropped to the pane rect × cell pixels. The capture
+    fails outright ("could not create image from window") while the window is minimized or
+    on another Space, and macOS `pgrep` has no `-c`, so count helper processes with
+    `ps -A -o comm= | grep -c <tool>` when checking for subprocess fan-out.
 
 ### Syntax highlighting (file preview)
 

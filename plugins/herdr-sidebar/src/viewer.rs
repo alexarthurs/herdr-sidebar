@@ -280,8 +280,10 @@ struct Doc {
     lines: Vec<Line<'static>>,
     /// File previews get a line-number gutter; diffs carry their own +/-.
     numbered: bool,
-    /// Decoded raster media, rendered portably with true-color half blocks.
-    /// Video files carry the poster frame extracted by ffmpeg.
+    /// Decoded raster media: herdr's pane graphics layer paints it at full
+    /// resolution when available, true-color half blocks otherwise. Video
+    /// files carry the poster frame extracted by ffmpeg; PDF pages and SVGs
+    /// are rasterized by pdftoppm / rsvg-convert.
     media: Option<MediaPreview>,
     /// Offset into [`Doc::rows`] — RENDERED rows, not source lines, so a
     /// wrapped line's continuations are scrolled to like anything else.
@@ -302,10 +304,268 @@ struct Doc {
 }
 
 struct MediaPreview {
+    /// Identifies these pixels: a new image, page, or rasterization gets a
+    /// new id, and only then is the pane graphics layer re-sent.
+    id: u64,
     pixels: image::RgbaImage,
     source_width: u32,
     source_height: u32,
-    video_poster: bool,
+    kind: MediaKind,
+    /// The pixel box a vector source (PDF page, SVG) was rasterized for, so a
+    /// pane that grows past it can be re-rasterized instead of upscaled.
+    raster: Option<RasterBox>,
+    /// The rasterizer that produced these pixels, resolved once per document
+    /// so a page turn does not walk `PATH` again.
+    tool: Option<PathBuf>,
+    /// The file these pixels came from. Pages rasterized from a different
+    /// revision must never be mixed into one document.
+    stamp: FileStamp,
+    /// Painted by herdr's pane graphics layer: the text body stays blank
+    /// underneath instead of drawing half blocks.
+    overlay: bool,
+    /// Recently shown PDF pages, so paging back and forth is instant.
+    page_cache: Vec<CachedPage>,
+}
+
+struct CachedPage {
+    page: usize,
+    raster: RasterBox,
+    stamp: FileStamp,
+    pixels: image::RgbaImage,
+}
+
+/// What a file looked like when it was rasterized. A rebuilt PDF changes its
+/// length or its modification time, and every cached page of the old revision
+/// is dropped rather than shown next to a new one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn file_stamp(target: &Path) -> FileStamp {
+    std::fs::metadata(target).map_or_else(
+        |_| FileStamp::default(),
+        |metadata| FileStamp {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        },
+    )
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum MediaKind {
+    Image,
+    VideoPoster,
+    Svg,
+    /// One-based `page`; `pages` is empty when pdfinfo could not count them.
+    Pdf {
+        page: usize,
+        pages: std::sync::Arc<[PageSize]>,
+    },
+}
+
+/// Pixel box a vector document is rasterized to fit.
+type RasterBox = (u32, u32);
+
+/// A PDF page's displayed size in points (rotation applied).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PageSize {
+    width: f64,
+    height: f64,
+}
+
+/// Decoded pages are megabytes each: cap the cache by bytes, not by count.
+const PAGE_CACHE_MAX_BYTES: u64 = 48 * 1024 * 1024;
+
+fn next_media_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl MediaPreview {
+    fn new(
+        pixels: image::RgbaImage,
+        kind: MediaKind,
+        raster: Option<RasterBox>,
+        tool: Option<PathBuf>,
+        stamp: FileStamp,
+    ) -> Self {
+        let (source_width, source_height) = pixels.dimensions();
+        Self {
+            id: next_media_id(),
+            pixels,
+            source_width,
+            source_height,
+            kind,
+            raster,
+            tool,
+            stamp,
+            overlay: false,
+            page_cache: Vec::new(),
+        }
+    }
+
+    fn page(&self) -> Option<usize> {
+        match self.kind {
+            MediaKind::Pdf { page, .. } => Some(page),
+            _ => None,
+        }
+    }
+
+    /// Swap in a newly rasterized page (or re-rasterized SVG), keeping the
+    /// outgoing PDF page for a quick turn back. Pages of another revision or
+    /// another raster box can never be shown again, so they are dropped.
+    fn replace(
+        &mut self,
+        pixels: image::RgbaImage,
+        kind: MediaKind,
+        raster: RasterBox,
+        stamp: FileStamp,
+    ) {
+        if let (Some(page), Some(old_raster)) = (self.page(), self.raster) {
+            let old = std::mem::replace(&mut self.pixels, image::RgbaImage::new(0, 0));
+            self.page_cache.push(CachedPage {
+                page,
+                raster: old_raster,
+                stamp: self.stamp,
+                pixels: old,
+            });
+        }
+        self.page_cache
+            .retain(|cached| cached.stamp == stamp && cached.raster == raster);
+        let mut bytes: u64 = self
+            .page_cache
+            .iter()
+            .map(|cached| u64::from(cached.pixels.width()) * u64::from(cached.pixels.height()) * 4)
+            .sum();
+        while bytes > PAGE_CACHE_MAX_BYTES && !self.page_cache.is_empty() {
+            let dropped = self.page_cache.remove(0);
+            bytes = bytes.saturating_sub(
+                u64::from(dropped.pixels.width()) * u64::from(dropped.pixels.height()) * 4,
+            );
+        }
+        (self.source_width, self.source_height) = pixels.dimensions();
+        self.pixels = pixels;
+        self.kind = kind;
+        self.raster = Some(raster);
+        self.stamp = stamp;
+        self.id = next_media_id();
+    }
+
+    /// A cached page, but only for this revision of the file and this raster
+    /// box — a rebuilt PDF must not show one page from each build.
+    fn take_cached(
+        &mut self,
+        page: usize,
+        raster: RasterBox,
+        stamp: FileStamp,
+    ) -> Option<image::RgbaImage> {
+        self.page_cache
+            .retain(|cached| cached.stamp == stamp && cached.raster == raster);
+        let index = self
+            .page_cache
+            .iter()
+            .position(|cached| cached.page == page)?;
+        Some(self.page_cache.remove(index).pixels)
+    }
+
+    fn context(&self, target: &Path) -> String {
+        let (width, height) = (self.source_width, self.source_height);
+        match &self.kind {
+            MediaKind::Image => format!("{} — {width}×{height} image", target.display()),
+            MediaKind::VideoPoster => {
+                format!("{} — {width}×{height} video poster", target.display())
+            }
+            MediaKind::Svg => format!("{} — SVG", target.display()),
+            MediaKind::Pdf { page, pages } => {
+                format!("{} — {}", target.display(), page_label(*page, pages.len()))
+            }
+        }
+    }
+
+    fn hint(&self) -> String {
+        match &self.kind {
+            MediaKind::Image => " image preview  o open  q close".into(),
+            MediaKind::VideoPoster => " video poster frame  o open  q close".into(),
+            MediaKind::Svg => " SVG preview  o open  q close".into(),
+            MediaKind::Pdf { page, pages } => format!(
+                " {}  n/p page  o open  q close",
+                page_label(*page, pages.len())
+            ),
+        }
+    }
+}
+
+fn page_label(page: usize, count: usize) -> String {
+    if count > 0 {
+        format!("page {page}/{count}")
+    } else {
+        format!("page {page}")
+    }
+}
+
+/// What a paging key does to a PDF preview.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageMove {
+    /// Render that page (or serve it from the cache).
+    Show(usize),
+    /// The key lands back on the page already on screen: the render in
+    /// flight is no longer wanted.
+    Cancel,
+}
+
+/// Where a paging key goes. `requested` is the page a render is already
+/// working towards, so holding `n` counts up from there instead of asking for
+/// the same page again — one rasterizer runs at a time. `None` for other keys
+/// or a move past either end; an unknown page count (no pdfinfo) blocks only
+/// the jump to the last page.
+fn page_move(
+    shown: usize,
+    requested: Option<usize>,
+    count: Option<usize>,
+    key: KeyCode,
+) -> Option<PageMove> {
+    let from = requested.unwrap_or(shown);
+    let target = match key {
+        KeyCode::Char('n') | KeyCode::PageDown => from + 1,
+        KeyCode::Char('p') | KeyCode::PageUp => from.saturating_sub(1),
+        KeyCode::Home | KeyCode::Char('g') => 1,
+        KeyCode::End | KeyCode::Char('G') => count?,
+        _ => return None,
+    };
+    if target < 1 || count.is_some_and(|count| target > count) || target == from {
+        return None;
+    }
+    Some(if target == shown {
+        PageMove::Cancel
+    } else {
+        PageMove::Show(target)
+    })
+}
+
+/// The page a PDF media kind shows, and how many pages it has (when pdfinfo
+/// could count them).
+fn pdf_position(kind: &MediaKind) -> Option<(usize, Option<usize>)> {
+    match kind {
+        MediaKind::Pdf { page, pages } => Some((*page, (!pages.is_empty()).then_some(pages.len()))),
+        _ => None,
+    }
+}
+
+/// Paging keys, unmodified (Shift only for `G`): Ctrl+N must not turn a page.
+fn is_page_key(key: KeyCode, modifiers: KeyModifiers) -> bool {
+    if !modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+        return false;
+    }
+    matches!(
+        key,
+        KeyCode::Char('n' | 'p' | 'g' | 'G')
+            | KeyCode::PageDown
+            | KeyCode::PageUp
+            | KeyCode::Home
+            | KeyCode::End
+    )
 }
 
 /// One rendered row of the body: the source line it came from (so scroll
@@ -334,7 +594,11 @@ impl Doc {
     fn relayout(&mut self, width: u16, height: u16) {
         if self.rows_key != Some((width, height, self.wrap)) {
             self.rows = if let Some(media) = &self.media {
-                render_media_rows(media, width, height)
+                if media.overlay {
+                    Vec::new()
+                } else {
+                    render_media_rows(media, width, height)
+                }
             } else {
                 build_rows(&self.lines, self.numbered, self.wrap, width)
             };
@@ -655,7 +919,15 @@ fn build_rows(lines: &[Line<'static>], numbered: bool, wrap: bool, width: u16) -
     rows
 }
 
-fn load(request: &Request) -> Doc {
+/// What a preview worker needs from the pane: the pixel box to rasterize
+/// for, and the token that stops its helpers once the user moves on.
+#[derive(Clone, Default)]
+struct LoadContext {
+    raster: RasterBox,
+    cancel: Cancel,
+}
+
+fn load(request: &Request, ctx: &LoadContext) -> Doc {
     match request {
         Request::Close => Doc {
             name: "Preview".into(),
@@ -670,7 +942,7 @@ fn load(request: &Request) -> Doc {
             pending_src: None,
             selection: PreviewSelection::default(),
         },
-        Request::File { path, line } => load_file(path, *line),
+        Request::File { path, line } => load_file(path, *line, ctx),
         Request::Diff { root, rel, kind } => load_diff(root, rel, kind),
         Request::Show { root, spec, path } => load_show(root, spec, path.as_deref()),
     }
@@ -709,13 +981,37 @@ fn loading_doc(request: &Request) -> Doc {
     }
 }
 
-fn start_preview_load(request: Request) -> (Request, std::sync::mpsc::Receiver<Doc>) {
+/// A preview being loaded off the event loop. Dropping it tells its helpers
+/// to stop: clicking through a folder of PDFs must not leave a pdfinfo and a
+/// pdftoppm running per discarded click.
+struct PreviewLoad {
+    request: Request,
+    cancel: Cancel,
+    receiver: std::sync::mpsc::Receiver<Doc>,
+}
+
+impl Drop for PreviewLoad {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+fn start_preview_load(request: Request, raster: RasterBox) -> PreviewLoad {
     let worker_request = request.clone();
     let (sender, receiver) = std::sync::mpsc::channel();
+    let cancel = Cancel::default();
+    let ctx = LoadContext {
+        raster,
+        cancel: cancel.clone(),
+    };
     std::thread::spawn(move || {
-        let _ = sender.send(load(&worker_request));
+        let _ = sender.send(load(&worker_request, &ctx));
     });
-    (request, receiver)
+    PreviewLoad {
+        request,
+        cancel,
+        receiver,
+    }
 }
 
 fn apply_diff_refresh(doc: &mut Doc, mut refreshed: Doc) {
@@ -770,16 +1066,17 @@ fn apply_pending(
     pending: Pending,
     mode: &mut ViewMode,
     current: &mut Option<Request>,
-    preview_load: &mut Option<(Request, std::sync::mpsc::Receiver<Doc>)>,
+    preview_load: &mut Option<PreviewLoad>,
     identity_pending: &mut bool,
     control: &Path,
+    raster: RasterBox,
 ) -> bool {
     match pending {
         Pending::Close => close_own_pane(control),
         Pending::LeaveEdit => {
             if let Some(request) = current.clone() {
                 *mode = ViewMode::Preview(loading_doc(&request));
-                *preview_load = Some(start_preview_load(request));
+                *preview_load = Some(start_preview_load(request, raster));
                 *identity_pending = true;
             }
             false
@@ -790,7 +1087,7 @@ fn apply_pending(
             } else {
                 *mode = ViewMode::Preview(loading_doc(&request));
                 *current = Some(request.clone());
-                *preview_load = Some(start_preview_load(request));
+                *preview_load = Some(start_preview_load(request, raster));
                 *identity_pending = true;
                 false
             }
@@ -900,6 +1197,11 @@ const MAX_MEDIA_DIMENSION: u32 = 8192;
 const MAX_MEDIA_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_VIDEO_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 const VIDEO_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
+/// Longest side a PDF page or SVG is rasterized to.
+const MAX_RASTER_SIDE: u32 = 4096;
+const RASTER_TIMEOUT: Duration = Duration::from_secs(10);
+const PDFINFO_TIMEOUT: Duration = Duration::from_secs(4);
+const MAX_PDFINFO_BYTES: u64 = 1024 * 1024;
 
 fn has_extension(target: &Path, extensions: &[&str]) -> bool {
     target
@@ -930,6 +1232,22 @@ fn is_video_file(target: &Path) -> bool {
     )
 }
 
+fn is_pdf_file(target: &Path) -> bool {
+    has_extension(target, &["pdf"])
+}
+
+fn is_svg_file(target: &Path) -> bool {
+    has_extension(target, &["svg"])
+}
+
+fn media_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_MEDIA_DIMENSION);
+    limits.max_image_height = Some(MAX_MEDIA_DIMENSION);
+    limits.max_alloc = Some(MAX_MEDIA_ALLOC_BYTES);
+    limits
+}
+
 fn decode_image_file(target: &Path) -> Result<image::RgbaImage, String> {
     let file_bytes = std::fs::metadata(target)
         .map_err(|error| error.to_string())?
@@ -951,28 +1269,38 @@ fn decode_image_file(target: &Path) -> Result<image::RgbaImage, String> {
         .map_err(|error| error.to_string())?
         .with_guessed_format()
         .map_err(|error| error.to_string())?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_MEDIA_DIMENSION);
-    limits.max_image_height = Some(MAX_MEDIA_DIMENSION);
-    limits.max_alloc = Some(MAX_MEDIA_ALLOC_BYTES);
-    reader.limits(limits);
+    reader.limits(media_limits());
     reader
         .decode()
         .map(|image| image.to_rgba8())
         .map_err(|error| error.to_string())
 }
 
-fn ffmpeg_in_path(path: &std::ffi::OsStr, cwd: Option<&Path>) -> Option<PathBuf> {
+/// Decode a helper's PNG output under the same limits as image files.
+fn decode_png(bytes: &[u8]) -> Result<image::RgbaImage, String> {
+    let mut reader =
+        image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png);
+    reader.limits(media_limits());
+    reader
+        .decode()
+        .map(|image| image.to_rgba8())
+        .map_err(|error| error.to_string())
+}
+
+/// Resolve a helper executable (ffmpeg, pdftoppm, …) from `path`, skipping
+/// relative and project-local entries: Windows process lookup would otherwise
+/// search the previewed project's directory first.
+fn executable_in_path(name: &str, path: &std::ffi::OsStr, cwd: Option<&Path>) -> Option<PathBuf> {
     let executable = if cfg!(windows) {
-        "ffmpeg.exe"
+        format!("{name}.exe")
     } else {
-        "ffmpeg"
+        name.to_string()
     };
     std::env::split_paths(path)
         .filter(|directory| directory.is_absolute())
         .filter_map(|directory| directory.canonicalize().ok())
         .filter(|directory| !cwd.is_some_and(|cwd| directory.starts_with(cwd)))
-        .map(|directory| directory.join(executable))
+        .map(|directory| directory.join(&executable))
         .find(|candidate| {
             if !candidate.is_file() {
                 return false;
@@ -989,39 +1317,58 @@ fn ffmpeg_in_path(path: &std::ffi::OsStr, cwd: Option<&Path>) -> Option<PathBuf>
         })
 }
 
-fn ffmpeg_on_path() -> Option<PathBuf> {
+fn executable_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|path| path.canonicalize().ok());
-    ffmpeg_in_path(&path, cwd.as_deref())
+    executable_in_path(name, &path, cwd.as_deref())
 }
 
-fn decode_video_poster(target: &Path) -> Result<image::RgbaImage, String> {
-    let ffmpeg =
-        ffmpeg_on_path().ok_or_else(|| "video preview needs ffmpeg on PATH".to_string())?;
-    let mut command = std::process::Command::new(ffmpeg);
-    command.args([
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostdin",
-        "-ss",
-        "0",
-        "-i",
-    ]);
-    command.arg(target);
-    command.args([
-        "-frames:v",
-        "1",
-        "-vf",
-        "scale=1280:720:force_original_aspect_ratio=decrease",
-        "-f",
-        "image2pipe",
-        "-vcodec",
-        "png",
-        "pipe:1",
-    ]);
+/// A file argument for a helper: a relative name starting with `-` would be
+/// parsed as an option.
+fn file_arg(target: &Path) -> PathBuf {
+    if target.is_relative() && target.as_os_str().to_string_lossy().starts_with('-') {
+        Path::new(".").join(target)
+    } else {
+        target.to_path_buf()
+    }
+}
+
+/// Cancellation for helper subprocesses: a preview the user already moved
+/// away from must not keep a `pdfinfo` and a `pdftoppm` running (nor start
+/// the next one), and a superseded page turn is killed rather than raced.
+#[derive(Clone, Default)]
+struct Cancel(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Cancel {
+    fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+struct Captured {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Run a helper with a wall-clock limit, keeping at most `max_stdout + 1`
+/// bytes of its output so callers can reject oversized results.
+fn run_bounded(
+    mut command: std::process::Command,
+    tool: &str,
+    max_stdout: u64,
+    timeout: Duration,
+    cancel: &Cancel,
+) -> Result<Captured, String> {
+    if cancel.is_cancelled() {
+        return Err(format!("{tool} was not needed anymore"));
+    }
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1033,20 +1380,18 @@ fn decode_video_poster(target: &Path) -> Result<image::RgbaImage, String> {
     }
     let mut child = command
         .spawn()
-        .map_err(|error| format!("ffmpeg failed: {error}"))?;
+        .map_err(|error| format!("{tool} failed: {error}"))?;
     let mut stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "ffmpeg stdout unavailable".to_string())?;
+        .ok_or_else(|| format!("{tool} stdout unavailable"))?;
     let mut stderr = child
         .stderr
         .take()
-        .ok_or_else(|| "ffmpeg stderr unavailable".to_string())?;
+        .ok_or_else(|| format!("{tool} stderr unavailable"))?;
     let stdout_reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = (&mut stdout)
-            .take(MAX_VIDEO_FRAME_BYTES + 1)
-            .read_to_end(&mut bytes);
+        let _ = (&mut stdout).take(max_stdout + 1).read_to_end(&mut bytes);
         bytes
     });
     let stderr_reader = std::thread::spawn(move || {
@@ -1054,10 +1399,17 @@ fn decode_video_poster(target: &Path) -> Result<image::RgbaImage, String> {
         let _ = (&mut stderr).take(16 * 1024).read_to_end(&mut bytes);
         bytes
     });
-    let deadline = Instant::now() + VIDEO_FRAME_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
+            Ok(None) if cancel.is_cancelled() => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("{tool} was not needed anymore"));
+            }
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(25));
             }
@@ -1066,70 +1418,311 @@ fn decode_video_poster(target: &Path) -> Result<image::RgbaImage, String> {
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                return Err("video poster timed out after 4 seconds".into());
+                return Err(format!(
+                    "{tool} timed out after {} seconds",
+                    timeout.as_secs()
+                ));
             }
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                return Err(format!("ffmpeg status failed: {error}"));
+                return Err(format!("{tool} status failed: {error}"));
             }
         }
     };
     let stdout = stdout_reader
         .join()
-        .map_err(|_| "ffmpeg output reader failed".to_string())?;
+        .map_err(|_| format!("{tool} output reader failed"))?;
     let stderr = stderr_reader
         .join()
-        .map_err(|_| "ffmpeg error reader failed".to_string())?;
-    if !status.success() {
-        let stderr = String::from_utf8_lossy(&stderr);
-        return Err(format!(
-            "ffmpeg could not read video: {}",
-            stderr.lines().next().unwrap_or("unknown error")
-        ));
-    }
-    if stdout.len() as u64 > MAX_VIDEO_FRAME_BYTES {
-        return Err("video poster frame exceeded 16 MiB".into());
-    }
-    image::load_from_memory_with_format(&stdout, image::ImageFormat::Png)
-        .map(|image| image.to_rgba8())
-        .map_err(|error| format!("could not decode video frame: {error}"))
+        .map_err(|_| format!("{tool} error reader failed"))?;
+    Ok(Captured {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
-fn load_media_file(target: &Path, name: String, video_poster: bool) -> Doc {
-    let result = if video_poster {
-        decode_video_poster(target)
-    } else {
-        decode_image_file(target)
+fn first_stderr_line(captured: &Captured) -> String {
+    String::from_utf8_lossy(&captured.stderr)
+        .lines()
+        .next()
+        .unwrap_or("unknown error")
+        .to_string()
+}
+
+fn decode_video_poster(target: &Path, cancel: &Cancel) -> Result<image::RgbaImage, String> {
+    let ffmpeg = executable_on_path("ffmpeg")
+        .ok_or_else(|| "video preview needs ffmpeg on PATH".to_string())?;
+    let mut command = std::process::Command::new(ffmpeg);
+    command.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-ss",
+        "0",
+        "-i",
+    ]);
+    command.arg(file_arg(target));
+    command.args([
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=1280:720:force_original_aspect_ratio=decrease",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "png",
+        "pipe:1",
+    ]);
+    let captured = run_bounded(
+        command,
+        "ffmpeg",
+        MAX_VIDEO_FRAME_BYTES,
+        VIDEO_FRAME_TIMEOUT,
+        cancel,
+    )?;
+    if !captured.status.success() {
+        return Err(format!(
+            "ffmpeg could not read video: {}",
+            first_stderr_line(&captured)
+        ));
+    }
+    if captured.stdout.len() as u64 > MAX_VIDEO_FRAME_BYTES {
+        return Err("video poster frame exceeded 16 MiB".into());
+    }
+    decode_png(&captured.stdout).map_err(|error| format!("could not decode video frame: {error}"))
+}
+
+/// The pane's size in cells, as the viewer's own terminal reports it.
+fn terminal_cells() -> (u16, u16) {
+    crossterm::terminal::size().unwrap_or((80, 24))
+}
+
+/// Pixel box of the preview body (the pane minus header and footer rows):
+/// real pixels when herdr reports the cell size, else the half-block grid of
+/// two pixels per cell. Bounded so a rasterized page stays decodable.
+fn raster_box(terminal: (u16, u16), cell: Option<crate::pane_graphics::CellSize>) -> RasterBox {
+    let cols = u32::from(terminal.0).max(1);
+    let rows = u32::from(terminal.1.saturating_sub(2)).max(1);
+    let (width, height) = match cell {
+        Some(cell) => (cols * cell.width_px, rows * cell.height_px),
+        None => (cols, rows * 2),
     };
-    let (lines, media, context) = match result {
-        Ok(pixels) => {
-            let (source_width, source_height) = pixels.dimensions();
-            let kind = if video_poster {
-                "video poster"
-            } else {
-                "image"
-            };
-            (
-                Vec::new(),
-                Some(MediaPreview {
-                    pixels,
-                    source_width,
-                    source_height,
-                    video_poster,
-                }),
-                format!(
-                    "{} — {source_width}×{source_height} {kind}",
-                    target.display()
-                ),
-            )
+    let mut width = f64::from(width.clamp(1, MAX_RASTER_SIDE));
+    let mut height = f64::from(height.clamp(1, MAX_RASTER_SIDE));
+    let pixels = width * height;
+    if pixels > MAX_MEDIA_PIXELS as f64 {
+        let shrink = (MAX_MEDIA_PIXELS as f64 / pixels).sqrt();
+        width *= shrink;
+        height *= shrink;
+    }
+    ((width as u32).max(1), (height as u32).max(1))
+}
+
+/// A vector source rasterized for `have` looks soft once the pane outgrows it.
+fn needs_rerender(have: RasterBox, want: RasterBox) -> bool {
+    u64::from(want.0) * 10 > u64::from(have.0) * 11
+        || u64::from(want.1) * 10 > u64::from(have.1) * 11
+}
+
+/// Page sizes out of `pdfinfo -f 1 -l <n>`; empty when the count is missing.
+fn parse_pdfinfo(text: &str) -> Vec<PageSize> {
+    let count = text.lines().find_map(|line| {
+        line.strip_prefix("Pages:")
+            .and_then(|count| count.trim().parse::<usize>().ok())
+    });
+    let count = count.unwrap_or(0).min(100_000);
+    let mut sizes = vec![(0.0, 0.0); count];
+    let mut quarter_turns = vec![false; count];
+    for line in text.lines() {
+        let mut words = line.split_whitespace();
+        if words.next() != Some("Page") {
+            continue;
         }
+        let Some(index) = words
+            .next()
+            .and_then(|page| page.parse::<usize>().ok())
+            .and_then(|page| page.checked_sub(1))
+            .filter(|index| *index < count)
+        else {
+            continue;
+        };
+        match (words.next(), words.next(), words.next(), words.next()) {
+            (Some("size:"), Some(width), Some("x"), Some(height)) => {
+                if let (Ok(width), Ok(height)) = (width.parse(), height.parse()) {
+                    sizes[index] = (width, height);
+                }
+            }
+            (Some("rot:"), Some(rotation), _, _) => {
+                quarter_turns[index] = rotation
+                    .parse::<i64>()
+                    .is_ok_and(|rotation| rotation.rem_euclid(180) == 90);
+            }
+            _ => {}
+        }
+    }
+    sizes
+        .into_iter()
+        .zip(quarter_turns)
+        .map(|((width, height), quarter_turn)| {
+            if quarter_turn {
+                PageSize {
+                    width: height,
+                    height: width,
+                }
+            } else {
+                PageSize { width, height }
+            }
+        })
+        .collect()
+}
+
+fn pdf_pages(target: &Path, cancel: &Cancel) -> std::sync::Arc<[PageSize]> {
+    let Some(pdfinfo) = executable_on_path("pdfinfo") else {
+        return std::sync::Arc::from(Vec::new());
+    };
+    let mut command = std::process::Command::new(pdfinfo);
+    command
+        .args(["-f", "1", "-l", "100000"])
+        .arg(file_arg(target));
+    let pages = match run_bounded(
+        command,
+        "pdfinfo",
+        MAX_PDFINFO_BYTES,
+        PDFINFO_TIMEOUT,
+        cancel,
+    ) {
+        Ok(captured) if captured.status.success() => {
+            parse_pdfinfo(&String::from_utf8_lossy(&captured.stdout))
+        }
+        _ => Vec::new(),
+    };
+    std::sync::Arc::from(pages)
+}
+
+/// pdftoppm `-scale-to` (long side, px) that fits `page` inside `raster`.
+fn pdf_scale_to(page: Option<PageSize>, raster: RasterBox) -> u32 {
+    let (box_w, box_h) = (f64::from(raster.0), f64::from(raster.1));
+    let long_side = match page {
+        Some(page) if page.width > 0.0 && page.height > 0.0 => {
+            let scale = (box_w / page.width).min(box_h / page.height);
+            page.width.max(page.height) * scale
+        }
+        _ => box_w.min(box_h),
+    };
+    (long_side.round() as u32).clamp(16, MAX_RASTER_SIDE)
+}
+
+/// Rasterize a vector document (one PDF page, or an SVG) to fit `raster`,
+/// with the stamp of the file it was read from.
+fn rasterize(
+    tool_path: &Path,
+    target: &Path,
+    kind: &MediaKind,
+    raster: RasterBox,
+    cancel: &Cancel,
+) -> Result<(image::RgbaImage, FileStamp), String> {
+    let stamp = file_stamp(target);
+    let (tool, command) = match kind {
+        MediaKind::Pdf { page, pages } => {
+            let page_size = pages.get(page.saturating_sub(1)).copied();
+            let mut command = std::process::Command::new(tool_path);
+            command
+                .args(["-png", "-singlefile", "-f"])
+                .arg(page.to_string())
+                .arg("-l")
+                .arg(page.to_string())
+                .arg("-scale-to")
+                .arg(pdf_scale_to(page_size, raster).to_string())
+                .arg(file_arg(target));
+            ("pdftoppm", command)
+        }
+        MediaKind::Svg => {
+            let mut command = std::process::Command::new(tool_path);
+            command
+                .args(["--keep-aspect-ratio", "--format", "png", "--width"])
+                .arg(raster.0.to_string())
+                .arg("--height")
+                .arg(raster.1.to_string())
+                .arg(file_arg(target));
+            ("rsvg-convert", command)
+        }
+        MediaKind::Image | MediaKind::VideoPoster => {
+            return Err("not a vector document".into());
+        }
+    };
+    let captured = run_bounded(command, tool, MAX_MEDIA_FILE_BYTES, RASTER_TIMEOUT, cancel)?;
+    if !captured.status.success() {
+        return Err(format!("{tool}: {}", first_stderr_line(&captured)));
+    }
+    if captured.stdout.len() as u64 > MAX_MEDIA_FILE_BYTES {
+        return Err(format!("{tool} output exceeded 32 MiB"));
+    }
+    let pixels = decode_png(&captured.stdout)
+        .map_err(|error| format!("could not decode {tool} output: {error}"))?;
+    Ok((pixels, stamp))
+}
+
+/// Rasterize off the event loop (page turns and pane growth). One job runs
+/// at a time; a newer goal waits for it (see `RasterGoal`) instead of piling
+/// up subprocesses, and dropping the job kills the one in flight.
+struct RasterLoad {
+    request: Request,
+    kind: MediaKind,
+    raster: RasterBox,
+    cancel: Cancel,
+    receiver: std::sync::mpsc::Receiver<Result<(image::RgbaImage, FileStamp), String>>,
+}
+
+impl Drop for RasterLoad {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+/// The page (or re-rasterization) the user is asking for, which may arrive
+/// while an earlier one is still rendering.
+#[derive(Clone)]
+struct RasterGoal {
+    kind: MediaKind,
+    raster: RasterBox,
+}
+
+fn start_raster(request: Request, target: PathBuf, tool: PathBuf, goal: RasterGoal) -> RasterLoad {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let cancel = Cancel::default();
+    let worker_kind = goal.kind.clone();
+    let worker_cancel = cancel.clone();
+    let raster = goal.raster;
+    std::thread::spawn(move || {
+        let _ = sender.send(rasterize(
+            &tool,
+            &target,
+            &worker_kind,
+            raster,
+            &worker_cancel,
+        ));
+    });
+    RasterLoad {
+        request,
+        kind: goal.kind,
+        raster,
+        cancel,
+        receiver,
+    }
+}
+
+fn media_doc(target: &Path, name: String, result: Result<MediaPreview, String>) -> Doc {
+    let (lines, context, media) = match result {
+        Ok(media) => (Vec::new(), media.context(target), Some(media)),
         Err(error) => (
             vec![Line::raw(format!("({error})"))],
-            None,
             target.display().to_string(),
+            None,
         ),
     };
     Doc {
@@ -1147,17 +1740,88 @@ fn load_media_file(target: &Path, name: String, video_poster: bool) -> Doc {
     }
 }
 
-fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
+fn load_media_file(target: &Path, name: String, video_poster: bool, cancel: &Cancel) -> Doc {
+    let stamp = file_stamp(target);
+    let result = if video_poster {
+        decode_video_poster(target, cancel)
+            .map(|pixels| MediaPreview::new(pixels, MediaKind::VideoPoster, None, None, stamp))
+    } else {
+        decode_image_file(target)
+            .map(|pixels| MediaPreview::new(pixels, MediaKind::Image, None, None, stamp))
+    };
+    media_doc(target, name, result)
+}
+
+/// A PDF's first page, or an SVG, rasterized by an already-resolved `tool`.
+/// `None` when the SVG cannot be rendered, so its source still previews as
+/// text.
+fn load_vector_file(
+    target: &Path,
+    name: String,
+    kind: MediaKind,
+    tool: &Path,
+    ctx: &LoadContext,
+) -> Option<Doc> {
+    let kind = match kind {
+        MediaKind::Pdf { .. } => MediaKind::Pdf {
+            page: 1,
+            pages: pdf_pages(target, &ctx.cancel),
+        },
+        kind => kind,
+    };
+    let result = rasterize(tool, target, &kind, ctx.raster, &ctx.cancel).map(|(pixels, stamp)| {
+        MediaPreview::new(
+            pixels,
+            kind.clone(),
+            Some(ctx.raster),
+            Some(tool.to_path_buf()),
+            stamp,
+        )
+    });
+    if result.is_err() && kind == MediaKind::Svg {
+        return None;
+    }
+    Some(media_doc(
+        target,
+        name,
+        result.map_err(|error| format!("could not render PDF: {error}")),
+    ))
+}
+
+fn load_file(target: &Path, target_line: Option<usize>, ctx: &LoadContext) -> Doc {
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| target.display().to_string());
     let lower = name.to_lowercase();
     if is_image_file(target) {
-        return load_media_file(target, name, false);
+        return load_media_file(target, name, false, &ctx.cancel);
     }
     if is_video_file(target) {
-        return load_media_file(target, name, true);
+        return load_media_file(target, name, true, &ctx.cancel);
+    }
+    // Vector documents need their rasterizer; without it they keep the plain
+    // preview (binary notice for PDF, source text for SVG).
+    if is_pdf_file(target)
+        && let Some(pdftoppm) = executable_on_path("pdftoppm")
+        && let Some(doc) = load_vector_file(
+            target,
+            name.clone(),
+            MediaKind::Pdf {
+                page: 1,
+                pages: std::sync::Arc::from(Vec::new()),
+            },
+            &pdftoppm,
+            ctx,
+        )
+    {
+        return doc;
+    }
+    if is_svg_file(target)
+        && let Some(rsvg) = executable_on_path("rsvg-convert")
+        && let Some(doc) = load_vector_file(target, name.clone(), MediaKind::Svg, &rsvg, ctx)
+    {
+        return doc;
     }
     let is_markdown = lower.ends_with(".md") || lower.ends_with(".markdown");
     let (lines, numbered) = match std::fs::read(target) {
@@ -1520,6 +2184,231 @@ fn sweep_orphan_controls(pane_list_json: &str) {
 }
 
 /// The viewer's event loop; returns when the user closes it.
+/// Full-resolution media through herdr's pane graphics layer (see
+/// `pane_graphics`). Without it — kitty graphics disabled, Windows, or a
+/// rejected frame — `cell` is `None` and media renders as half blocks.
+/// Full-resolution media through herdr's pane graphics layer (see
+/// `pane_graphics`). Without it — kitty graphics disabled, Windows, or a
+/// rejected frame — media renders as half blocks.
+///
+/// Every herdr roundtrip here happens on a worker: the API call has a five
+/// second timeout, and the draw loop must never wait that long. The cell size
+/// and the stream therefore arrive asynchronously, and the frame goes out on
+/// the first draw after they do.
+struct Graphics {
+    pane_id: String,
+    cell: Option<crate::pane_graphics::CellSize>,
+    probe: Option<std::sync::mpsc::Receiver<Option<crate::pane_graphics::CellSize>>>,
+    /// Debounces the re-probe: a resize drag emits a burst of events.
+    probed: Option<Instant>,
+    /// What the cell size was last probed for, so a new document re-probes
+    /// (the font or the display may have changed without a resize).
+    probed_media: Option<u64>,
+    opening: Option<std::sync::mpsc::Receiver<Option<crate::pane_graphics::Stream>>>,
+    stream: Option<crate::pane_graphics::Stream>,
+    /// The media id and body rect currently on screen: a frame is sent only
+    /// when one of them changes, never per tick.
+    shown: Option<(u64, Rect)>,
+    /// The media whose frame herdr refused. Only that one falls back; the
+    /// next document tries again, so one transient failure (a stream still
+    /// owned by a closing predecessor) does not mosaic the whole session.
+    refused: Option<u64>,
+}
+
+/// What `sync` changed, so the caller can repaint immediately instead of
+/// leaving a blank body (or a mosaic) on screen for a poll interval.
+#[derive(PartialEq, Eq)]
+enum Painted {
+    Unchanged,
+    Repaint,
+}
+
+/// How long a burst of resize events is coalesced before re-probing.
+const PROBE_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// How many immediate redraws a layer change may chain before the loop goes
+/// back to waiting for input.
+const MAX_CHAINED_REPAINTS: u8 = 3;
+
+impl Graphics {
+    fn new() -> Self {
+        let mut graphics = Self {
+            pane_id: std::env::var("HERDR_PANE_ID").unwrap_or_default(),
+            cell: None,
+            probe: None,
+            probed: None,
+            probed_media: None,
+            opening: None,
+            stream: None,
+            shown: None,
+            refused: None,
+        };
+        graphics.start_probe();
+        graphics
+    }
+
+    fn start_probe(&mut self) {
+        if self.pane_id.is_empty() || self.probe.is_some() {
+            return;
+        }
+        self.probed = Some(Instant::now());
+        let pane_id = self.pane_id.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(crate::pane_graphics::probe(&pane_id));
+        });
+        self.probe = Some(receiver);
+    }
+
+    /// A resize can follow a font or display change: re-probe, debounced.
+    fn resized(&mut self) {
+        self.shown = None;
+        if self
+            .probed
+            .is_none_or(|probed| probed.elapsed() >= PROBE_DEBOUNCE)
+        {
+            self.start_probe();
+        }
+    }
+
+    fn start_open(&mut self) {
+        if self.pane_id.is_empty() || self.opening.is_some() || self.stream.is_some() {
+            return;
+        }
+        let pane_id = self.pane_id.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(crate::pane_graphics::Stream::open(&pane_id));
+        });
+        self.opening = Some(receiver);
+    }
+
+    /// Collect whatever the workers finished, without blocking.
+    fn collect(&mut self) {
+        if let Some(probe) = &self.probe
+            && let Ok(cell) = probe.try_recv()
+        {
+            self.probe = None;
+            self.cell = cell;
+        }
+        if let Some(opening) = &self.opening
+            && let Ok(stream) = opening.try_recv()
+        {
+            self.opening = None;
+            self.stream = stream;
+        }
+    }
+
+    /// Whether `media` will be painted by the layer rather than half blocks.
+    /// A stream that is still being opened counts: this pane has already said
+    /// it does pane graphics, so the body stays blank for the frame or two
+    /// that takes instead of flashing a mosaic that is about to be replaced.
+    fn paints(&self, media: &MediaPreview) -> bool {
+        self.cell.is_some()
+            && (self.stream.is_some() || self.opening.is_some())
+            && self.refused != Some(media.id)
+    }
+
+    /// Before drawing: collect finished workers, start the stream the media
+    /// on screen is about to need, and leave the body blank where the layer
+    /// will paint.
+    fn prepare(&mut self, doc: &mut Doc) {
+        self.collect();
+        if doc.media.is_some() && self.cell.is_some() {
+            self.start_open();
+        }
+        if let Some(media) = &mut doc.media {
+            let overlay = self.paints(media);
+            if media.overlay != overlay {
+                media.overlay = overlay;
+                doc.rows_key = None;
+            }
+        }
+    }
+
+    /// After drawing: put `media` on the layer, or take the layer down.
+    fn sync(&mut self, media: Option<&MediaPreview>, body: Rect) -> Painted {
+        self.collect();
+        let Some(media) = media else {
+            self.clear();
+            return Painted::Unchanged;
+        };
+        if media.id != self.probed_media.unwrap_or(0) {
+            self.probed_media = Some(media.id);
+            self.start_probe();
+        }
+        if self
+            .stream
+            .as_ref()
+            .is_some_and(crate::pane_graphics::Stream::failed)
+        {
+            // herdr closed the stream: drop it (which releases the layer) and
+            // open a fresh one for the next frame.
+            self.stream = None;
+            self.shown = None;
+        }
+        let Some(cell) = self.cell else {
+            return Painted::Unchanged;
+        };
+        if self.refused == Some(media.id) {
+            return Painted::Unchanged;
+        }
+        if self.stream.is_none() {
+            self.start_open();
+            // Still opening: the body is already blank for it (see `paints`).
+            return Painted::Unchanged;
+        }
+        let repaint = if media.overlay {
+            Painted::Unchanged
+        } else {
+            // The body was drawn as half blocks before the layer was ready.
+            Painted::Repaint
+        };
+        if self.shown == Some((media.id, body)) {
+            return repaint;
+        }
+        let area = crate::pane_graphics::CellRect {
+            col: body.x,
+            row: body.y,
+            cols: body.width,
+            rows: body.height,
+        };
+        let Some(plan) = crate::pane_graphics::plan(
+            area,
+            cell,
+            media.pixels.dimensions(),
+            crate::pane_graphics::FRAME_MAX_BYTES,
+        ) else {
+            self.clear();
+            return Painted::Unchanged;
+        };
+        let frame = crate::pane_graphics::compose(&plan, &media.pixels);
+        if self
+            .stream
+            .as_mut()
+            .is_some_and(|stream| stream.send(&plan, &frame))
+        {
+            self.shown = Some((media.id, body));
+            repaint
+        } else {
+            self.stream = None;
+            self.shown = None;
+            self.refused = Some(media.id);
+            // Fall back for this document only, and repaint it as half
+            // blocks right away instead of leaving a blank body.
+            Painted::Repaint
+        }
+    }
+
+    /// Close the stream: herdr removes the layer with it.
+    fn clear(&mut self) {
+        self.stream = None;
+        self.shown = None;
+        self.refused = None;
+        self.probed_media = None;
+    }
+}
+
 pub fn run(control: &Path) -> std::io::Result<()> {
     let theme = IconTheme::resolve(
         std::env::var("HERDR_SIDEBAR_ICONS")
@@ -1529,7 +2418,12 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         crate::state::load_state().icons,
     );
     let mut current = read_control(control);
-    let mut preview_load = current.clone().map(start_preview_load);
+    // The cell size is not known yet (it is probed on a worker), so the first
+    // rasterization uses the half-block grid and is refreshed by the "pane
+    // outgrew its raster" check as soon as the probe lands.
+    let mut preview_load = current
+        .clone()
+        .map(|request| start_preview_load(request, raster_box(terminal_cells(), None)));
     let doc = current.as_ref().map(loading_doc).unwrap_or_else(|| Doc {
         name: "(nothing to show)".into(),
         context: String::new(),
@@ -1571,17 +2465,21 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     let mut last_diff_refresh = Instant::now();
     let mut diff_refresh: Option<(Request, std::sync::mpsc::Receiver<Doc>)> = None;
     let mut identity_pending = false;
+    let mut graphics = Graphics::new();
+    let mut raster_load: Option<RasterLoad> = None;
+    let mut raster_goal: Option<RasterGoal> = None;
+    let mut resized = false;
+    let mut repaints = 0_u8;
     let result = loop {
-        let loaded =
-            preview_load
-                .as_ref()
-                .and_then(|(request, receiver)| match receiver.try_recv() {
-                    Ok(doc) => Some((request.clone(), Some(doc))),
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        Some((request.clone(), None))
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                });
+        let loaded = preview_load
+            .as_ref()
+            .and_then(|load| match load.receiver.try_recv() {
+                Ok(doc) => Some((load.request.clone(), Some(doc))),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some((load.request.clone(), None))
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            });
         if let Some((request, loaded)) = loaded {
             preview_load = None;
             if current.as_ref() == Some(&request)
@@ -1590,7 +2488,55 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 *doc = loaded;
             }
         }
+        let rastered = raster_load
+            .as_ref()
+            .and_then(|load| match load.receiver.try_recv() {
+                Ok(result) => Some(Some(result)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(None),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            });
+        if let Some(result) = rastered
+            && let Some(load) = raster_load.take()
+            && current.as_ref() == Some(&load.request)
+            && let (ViewMode::Preview(doc), Some(Request::File { path, .. })) =
+                (&mut mode, current.as_ref())
+            && let Some(media) = &mut doc.media
+        {
+            match result {
+                Some(Ok((pixels, stamp))) => {
+                    media.replace(pixels, load.kind.clone(), load.raster, stamp);
+                    doc.context = media.context(path);
+                    doc.rows_key = None;
+                }
+                Some(Err(error)) => notice = Some(error),
+                None => {}
+            }
+        }
+        // One rasterizer at a time: a held-down `n` sets the goal repeatedly
+        // and only the page the user landed on is rendered.
+        if raster_load.is_none()
+            && let Some(goal) = raster_goal.clone()
+            && let (ViewMode::Preview(doc), Some(request @ Request::File { path, .. })) =
+                (&mode, current.as_ref())
+            && let Some(media) = &doc.media
+        {
+            raster_goal = None;
+            let shown = media.kind == goal.kind && media.raster == Some(goal.raster);
+            if !shown && let Some(tool) = media.tool.clone() {
+                raster_load = Some(start_raster(request.clone(), path.clone(), tool, goal));
+            }
+        }
+        if let ViewMode::Preview(doc) = &mut mode {
+            graphics.prepare(doc);
+        }
         let prompt_text = prompt.as_ref().map(Prompt::text);
+        // Progress belongs to the in-flight job, not to `notice`: a render
+        // finishing must not swallow the message from an `o` press.
+        let rendering = raster_load.as_ref().and_then(|load| match load.kind {
+            MediaKind::Pdf { page, .. } => Some(format!("rendering page {page}…")),
+            _ => None,
+        });
+        let status = notice.as_deref().or(rendering.as_deref());
         let draw = terminal.draw(|frame| match &mut mode {
             ViewMode::Preview(doc) => {
                 (page, preview_body) = draw_doc(
@@ -1598,7 +2544,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                     doc,
                     theme,
                     matches!(current, Some(Request::File { .. })),
-                    notice.as_deref(),
+                    status,
                 );
             }
             ViewMode::Edit(editor) => {
@@ -1608,6 +2554,36 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         if let Err(e) = draw {
             break Err(e);
         }
+        let media = match &mode {
+            ViewMode::Preview(doc) => doc.media.as_ref(),
+            ViewMode::Edit(_) => None,
+        };
+        let painted = graphics.sync(media, preview_body);
+        // A grown pane re-rasterizes vector media instead of upscaling it.
+        // The cell size arrives asynchronously, so this also picks up the
+        // first probe after startup.
+        let geometry_changed = std::mem::take(&mut resized) || painted == Painted::Repaint;
+        if geometry_changed
+            && let ViewMode::Preview(doc) = &mode
+            && let Some(media) = &doc.media
+            && let Some(have) = media.raster
+        {
+            let want = raster_box(terminal_cells(), graphics.cell);
+            if needs_rerender(have, want) {
+                raster_goal = Some(RasterGoal {
+                    kind: media.kind.clone(),
+                    raster: want,
+                });
+            }
+        }
+        if painted == Painted::Repaint && repaints < MAX_CHAINED_REPAINTS {
+            // The layer came up (or fell back): redraw before waiting for
+            // input, so the body never sits blank or mosaicked for a tick.
+            // Bounded, so no state can turn this into a spin.
+            repaints += 1;
+            continue;
+        }
+        repaints = 0;
         if identity_pending {
             report_identity(
                 &mode,
@@ -1617,7 +2593,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             identity_pending = false;
         }
         let mut should_close = false;
-        let poll = if preview_load.is_some() {
+        let poll = if preview_load.is_some() || raster_load.is_some() {
             LOAD_POLL
         } else {
             POLL
@@ -1638,6 +2614,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                                 &mut preview_load,
                                                 &mut identity_pending,
                                                 control,
+                                                raster_box(terminal_cells(), graphics.cell),
                                             );
                                         }
                                         Ok(SaveOutcome::Conflict) => {
@@ -1658,6 +2635,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     &mut preview_load,
                                     &mut identity_pending,
                                     control,
+                                    raster_box(terminal_cells(), graphics.cell),
                                 );
                             }
                             (Prompt::Unsaved(_), KeyCode::Esc | KeyCode::Char('c')) => {
@@ -1680,6 +2658,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                                     &mut preview_load,
                                                     &mut identity_pending,
                                                     control,
+                                                    raster_box(terminal_cells(), graphics.cell),
                                                 );
                                             }
                                         }
@@ -1703,6 +2682,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                                     &mut preview_load,
                                                     &mut identity_pending,
                                                     control,
+                                                    raster_box(terminal_cells(), graphics.cell),
                                                 );
                                             }
                                         }
@@ -1747,6 +2727,58 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     }
                                     KeyCode::Esc | KeyCode::Char('q') => {
                                         should_close = close_own_pane(control);
+                                    }
+                                    code if is_page_key(code, key.modifiers)
+                                        && doc.media.as_ref().is_some_and(|media| {
+                                            matches!(media.kind, MediaKind::Pdf { .. })
+                                        }) =>
+                                    {
+                                        // Count from the page already asked for, so repeated
+                                        // presses keep advancing while one render is in flight.
+                                        let requested = raster_goal
+                                            .as_ref()
+                                            .map(|goal| &goal.kind)
+                                            .or(raster_load.as_ref().map(|load| &load.kind))
+                                            .and_then(pdf_position)
+                                            .map(|(page, _)| page);
+                                        if let (Some(media), Some(Request::File { path, .. })) =
+                                            (&mut doc.media, current.as_ref())
+                                            && let Some((shown, count)) = pdf_position(&media.kind)
+                                            && let Some(moved) =
+                                                page_move(shown, requested, count, code)
+                                            && let MediaKind::Pdf { pages, .. } = &media.kind
+                                        {
+                                            let pages = pages.clone();
+                                            let raster = media.raster.unwrap_or_else(|| {
+                                                raster_box(terminal_cells(), graphics.cell)
+                                            });
+                                            let stamp = file_stamp(path);
+                                            raster_goal = None;
+                                            raster_load = None;
+                                            if let PageMove::Show(page) = moved {
+                                                let kind = MediaKind::Pdf { page, pages };
+                                                if let Some(pixels) =
+                                                    media.take_cached(page, raster, stamp)
+                                                {
+                                                    media.replace(pixels, kind, raster, stamp);
+                                                    doc.context = media.context(path);
+                                                    doc.rows_key = None;
+                                                } else {
+                                                    raster_goal = Some(RasterGoal { kind, raster });
+                                                }
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char('o') if doc.media.is_some() => {
+                                        if let Some(Request::File { path, .. }) = current.as_ref() {
+                                            notice =
+                                                Some(match crate::actions::open_external(path) {
+                                                    Ok(()) => "opened with the default app".into(),
+                                                    Err(error) => {
+                                                        format!("could not open: {error}")
+                                                    }
+                                                });
+                                        }
                                     }
                                     KeyCode::Char('e') => {
                                         if doc.media.is_some() {
@@ -1815,6 +2847,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                                 &mut preview_load,
                                                 &mut identity_pending,
                                                 control,
+                                                raster_box(terminal_cells(), graphics.cell),
                                             );
                                         }
                                     }
@@ -1871,7 +2904,11 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                         _ => {}
                     },
                 },
-                _ => {} // resize etc: redraw
+                Event::Resize(..) => {
+                    graphics.resized();
+                    resized = true;
+                }
+                _ => {} // focus etc: redraw
             }
         }
         if should_close {
@@ -1909,7 +2946,10 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 } else {
                     mode = ViewMode::Preview(loading_doc(&request));
                     current = Some(request.clone());
-                    preview_load = Some(start_preview_load(request));
+                    preview_load = Some(start_preview_load(
+                        request,
+                        raster_box(terminal_cells(), graphics.cell),
+                    ));
                     identity_pending = true;
                     notice = None;
                 }
@@ -1948,13 +2988,15 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 let worker_request = request.clone();
                 let (sender, receiver) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
-                    let _ = sender.send(load(&worker_request));
+                    // Diffs never rasterize, so the context is irrelevant here.
+                    let _ = sender.send(load(&worker_request, &LoadContext::default()));
                 });
                 diff_refresh = Some((request, receiver));
             }
             last_diff_refresh = Instant::now();
         }
     };
+    graphics.clear();
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -2037,11 +3079,7 @@ fn draw_doc(
     let hint = if let Some(notice) = notice {
         format!(" {notice}")
     } else if let Some(media) = &doc.media {
-        if media.video_poster {
-            " video poster frame  q close".into()
-        } else {
-            " image preview  q close".into()
-        }
+        media.hint()
     } else if editable {
         format!(" drag select  Ctrl/Cmd+C copy  e edit  {wrap_hint}  q close")
     } else {
@@ -3024,12 +4062,7 @@ mod tests {
             pixels.put_pixel(x, 1, image::Rgba([0, 0, 255, 255]));
         }
         let rows = render_media_rows(
-            &MediaPreview {
-                pixels,
-                source_width: 2,
-                source_height: 2,
-                video_poster: false,
-            },
+            &MediaPreview::new(pixels, MediaKind::Image, None, None, FileStamp::default()),
             2,
             1,
         );
@@ -3047,6 +4080,354 @@ mod tests {
         assert!(is_video_file(Path::new("clip.MP4")));
         assert!(!is_video_file(Path::new("photo.png")));
         assert!(!is_image_file(Path::new("notes.txt")));
+        assert!(is_pdf_file(Path::new("paper.PDF")));
+        assert!(is_svg_file(Path::new("logo.svg")));
+        assert!(!is_image_file(Path::new("logo.svg")));
+    }
+
+    fn pdf(page: usize, count: usize) -> MediaKind {
+        MediaKind::Pdf {
+            page,
+            pages: std::sync::Arc::from(vec![
+                PageSize {
+                    width: 595.0,
+                    height: 842.0,
+                };
+                count
+            ]),
+        }
+    }
+
+    fn stamp(len: u64) -> FileStamp {
+        FileStamp {
+            len,
+            modified: None,
+        }
+    }
+
+    fn media(kind: MediaKind, raster: Option<RasterBox>, len: u64) -> MediaPreview {
+        MediaPreview::new(image::RgbaImage::new(1, 1), kind, raster, None, stamp(len))
+    }
+
+    #[test]
+    fn pdf_paging_keys_stay_within_the_document() {
+        use PageMove::Show;
+        assert_eq!(
+            page_move(1, None, Some(3), KeyCode::Char('n')),
+            Some(Show(2))
+        );
+        assert_eq!(page_move(2, None, Some(3), KeyCode::PageUp), Some(Show(1)));
+        assert_eq!(
+            page_move(1, None, Some(3), KeyCode::Char('G')),
+            Some(Show(3))
+        );
+        assert_eq!(page_move(3, None, Some(3), KeyCode::Home), Some(Show(1)));
+        assert_eq!(page_move(3, None, Some(3), KeyCode::Char('n')), None);
+        assert_eq!(page_move(1, None, Some(3), KeyCode::Char('p')), None);
+        assert_eq!(page_move(1, None, Some(3), KeyCode::Char('x')), None);
+        // Without pdfinfo the count is unknown: forward paging is still
+        // allowed (pdftoppm reports the end), jumping to the end is not.
+        assert_eq!(page_move(4, None, None, KeyCode::Char('n')), Some(Show(5)));
+        assert_eq!(page_move(4, None, None, KeyCode::End), None);
+        assert_eq!(pdf_position(&MediaKind::Image), None);
+        assert_eq!(pdf_position(&pdf(2, 3)), Some((2, Some(3))));
+        assert_eq!(pdf_position(&pdf(2, 0)), Some((2, None)));
+    }
+
+    #[test]
+    fn held_paging_counts_from_the_page_already_requested() {
+        use PageMove::Show;
+        // Page 1 on screen, page 2 rendering: the next press asks for 3, so
+        // a held key advances instead of re-requesting the same render.
+        assert_eq!(
+            page_move(1, Some(2), Some(9), KeyCode::Char('n')),
+            Some(Show(3))
+        );
+        assert_eq!(
+            page_move(1, Some(8), Some(9), KeyCode::Char('n')),
+            Some(Show(9))
+        );
+        assert_eq!(page_move(1, Some(9), Some(9), KeyCode::Char('n')), None);
+        // Paging back onto the page already displayed cancels that render
+        // rather than queueing a second one.
+        assert_eq!(
+            page_move(1, Some(2), Some(9), KeyCode::Char('p')),
+            Some(PageMove::Cancel)
+        );
+        assert_eq!(
+            page_move(1, Some(4), Some(9), KeyCode::Home),
+            Some(PageMove::Cancel)
+        );
+    }
+
+    #[test]
+    fn pdfinfo_page_sizes_honour_rotation() {
+        let info = "Title:           Report\nPages:           2\n\
+                    Page    1 size:  595.28 x 841.89 pts (A4)\nPage    1 rot:   0\n\
+                    Page    2 size:  595.28 x 841.89 pts (A4)\nPage    2 rot:   270\n";
+        let pages = parse_pdfinfo(info);
+        assert_eq!(pages.len(), 2);
+        assert_eq!((pages[0].width, pages[0].height), (595.28, 841.89));
+        assert_eq!((pages[1].width, pages[1].height), (841.89, 595.28));
+        assert!(parse_pdfinfo("Syntax Error: not a PDF").is_empty());
+    }
+
+    #[test]
+    fn raster_box_uses_reported_cell_pixels_or_the_half_block_grid() {
+        let retina = crate::pane_graphics::CellSize {
+            width_px: 17,
+            height_px: 35,
+        };
+        // Header and footer rows are not part of the body.
+        assert_eq!(raster_box((119, 53), Some(retina)), (119 * 17, 51 * 35));
+        assert_eq!(raster_box((119, 53), None), (119, 102));
+        let (width, height) = raster_box((400, 200), Some(retina));
+        assert!(u64::from(width) * u64::from(height) <= MAX_MEDIA_PIXELS);
+        assert!(width <= MAX_RASTER_SIDE && height <= MAX_RASTER_SIDE);
+    }
+
+    #[test]
+    fn pdf_pages_rasterize_to_fit_the_body_box() {
+        let a4 = PageSize {
+            width: 595.0,
+            height: 842.0,
+        };
+        // Height-bound in a wide pane: the long side is the box height.
+        assert_eq!(pdf_scale_to(Some(a4), (2023, 1785)), 1785);
+        // Width-bound in a tall pane: the long side follows the aspect.
+        assert_eq!(pdf_scale_to(Some(a4), (595, 2000)), 842);
+        // Unknown page size: never overflow either side.
+        assert_eq!(pdf_scale_to(None, (2023, 1785)), 1785);
+        assert_eq!(pdf_scale_to(Some(a4), (100_000, 100_000)), MAX_RASTER_SIDE);
+    }
+
+    #[test]
+    fn vector_media_rerenders_only_when_the_pane_outgrows_it() {
+        assert!(!needs_rerender((2000, 1800), (2000, 1800)));
+        assert!(!needs_rerender((2000, 1800), (1000, 900)));
+        assert!(!needs_rerender((2000, 1800), (2150, 1800)));
+        assert!(needs_rerender((2000, 1800), (3000, 1800)));
+        assert!(needs_rerender((2000, 1800), (2000, 2600)));
+    }
+
+    #[test]
+    fn media_footers_offer_open_and_pdf_paging_but_not_editing() {
+        let image = media(MediaKind::Image, None, 1);
+        assert!(image.hint().contains("o open"));
+        assert!(!image.hint().contains("e edit"));
+        assert!(!image.hint().contains("wrap"));
+        let page = media(pdf(2, 3), Some((10, 10)), 1);
+        assert!(page.hint().contains("page 2/3"));
+        assert!(page.hint().contains("n/p page"));
+        assert!(page.context(Path::new("/tmp/a.pdf")).ends_with("page 2/3"));
+    }
+
+    #[test]
+    fn media_painted_by_the_graphics_layer_leaves_the_body_blank() {
+        let mut doc = media_doc(
+            Path::new("/tmp/red.png"),
+            "red.png".into(),
+            Ok(MediaPreview::new(
+                image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255])),
+                MediaKind::Image,
+                None,
+                None,
+                FileStamp::default(),
+            )),
+        );
+        doc.relayout(8, 4);
+        assert!(!doc.rows.is_empty(), "half blocks without the layer");
+        doc.media.as_mut().unwrap().overlay = true;
+        doc.rows_key = None;
+        doc.relayout(8, 4);
+        assert!(doc.rows.is_empty(), "no half blocks under the layer");
+    }
+
+    #[test]
+    fn turning_pages_keeps_recent_ones_cached() {
+        let mut media = MediaPreview::new(
+            image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 0, 0, 255])),
+            pdf(1, 3),
+            Some((10, 10)),
+            None,
+            stamp(7),
+        );
+        let first_id = media.id;
+        media.replace(image::RgbaImage::new(2, 2), pdf(2, 3), (10, 10), stamp(7));
+        assert_ne!(media.id, first_id);
+        assert_eq!(media.source_width, 2);
+        let cached = media
+            .take_cached(1, (10, 10), stamp(7))
+            .expect("page 1 cached");
+        assert_eq!(*cached.get_pixel(0, 0), image::Rgba([1, 0, 0, 255]));
+        assert!(media.take_cached(1, (20, 20), stamp(7)).is_none());
+    }
+
+    #[test]
+    fn a_rebuilt_file_drops_every_page_of_the_old_revision() {
+        let mut media = MediaPreview::new(
+            image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 0, 0, 255])),
+            pdf(1, 3),
+            Some((10, 10)),
+            None,
+            stamp(7),
+        );
+        media.replace(image::RgbaImage::new(2, 2), pdf(2, 3), (10, 10), stamp(7));
+        // The file was rebuilt while page 3 rendered: the cached page 2 and
+        // the cached page 1 belong to the previous revision.
+        media.replace(image::RgbaImage::new(3, 3), pdf(3, 3), (10, 10), stamp(9));
+        assert!(media.page_cache.is_empty(), "old revision kept");
+        assert!(media.take_cached(1, (10, 10), stamp(9)).is_none());
+        // A page cached under the new revision is served again.
+        media.replace(image::RgbaImage::new(4, 4), pdf(1, 3), (10, 10), stamp(9));
+        assert!(media.take_cached(3, (10, 10), stamp(9)).is_some());
+        assert!(media.take_cached(3, (10, 10), stamp(11)).is_none());
+    }
+
+    #[test]
+    fn the_page_cache_is_bounded_by_bytes() {
+        let big = || {
+            // 2 MP: four of these blow well past the cache budget.
+            image::RgbaImage::new(2000, 1000)
+        };
+        let mut media = MediaPreview::new(big(), pdf(1, 20), Some((10, 10)), None, stamp(7));
+        for page in 2..=12 {
+            media.replace(big(), pdf(page, 20), (10, 10), stamp(7));
+        }
+        let cached: u64 = media
+            .page_cache
+            .iter()
+            .map(|page| u64::from(page.pixels.width()) * u64::from(page.pixels.height()) * 4)
+            .sum();
+        assert!(cached <= PAGE_CACHE_MAX_BYTES, "cached {cached} bytes");
+        assert!(!media.page_cache.is_empty(), "nothing cached at all");
+        // A raster box the pane outgrew can never be shown again.
+        media.replace(big(), pdf(13, 20), (40, 40), stamp(7));
+        assert!(
+            media.page_cache.iter().all(|page| page.raster == (40, 40)),
+            "stale raster boxes kept"
+        );
+    }
+
+    #[test]
+    fn page_keys_ignore_control_and_alt() {
+        assert!(is_page_key(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(is_page_key(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert!(!is_page_key(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert!(!is_page_key(KeyCode::PageDown, KeyModifiers::ALT));
+        assert!(!is_page_key(KeyCode::Char('x'), KeyModifiers::NONE));
+    }
+
+    /// The shared bounded runner still drives ffmpeg (skipped without it).
+    #[test]
+    fn installed_ffmpeg_extracts_a_poster_frame() {
+        let Some(ffmpeg) = executable_on_path("ffmpeg") else {
+            eprintln!("skipped: ffmpeg not on PATH");
+            return;
+        };
+        let root = std::env::temp_dir().join(format!("viewer-video-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let clip = root.join("clip.mp4");
+        let status = std::process::Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=1",
+                "-frames:v",
+                "1",
+            ])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let doc = load_file(&clip, None, &test_context());
+        let media = doc.media.as_ref().expect("poster frame");
+        assert_eq!(media.kind, MediaKind::VideoPoster);
+        // The poster is fitted into 1280×720, keeping the 4:3 aspect.
+        assert_eq!((media.source_width, media.source_height), (960, 720));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn test_context() -> LoadContext {
+        LoadContext {
+            raster: (600, 400),
+            cancel: Cancel::default(),
+        }
+    }
+
+    /// An SVG the renderer rejects always falls back to its source text —
+    /// with rsvg-convert installed it fails at render time, without it the
+    /// extension never reaches the renderer.
+    #[test]
+    fn an_unrenderable_svg_previews_as_its_source_text() {
+        let root = std::env::temp_dir().join(format!("viewer-broken-svg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let broken = root.join("broken.svg");
+        std::fs::write(&broken, "<svg this is not xml").unwrap();
+        let doc = load_file(&broken, None, &test_context());
+        assert!(doc.media.is_none());
+        assert!(row_texts(&build_rows(&doc.lines, false, false, 80))[0].contains("<svg"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Exercises the real rasterizers where they are installed (skipped
+    /// otherwise): an SVG, and a PDF made from it, render as media.
+    #[test]
+    fn installed_rasterizers_render_svg_and_pdf() {
+        let Some(rsvg) = executable_on_path("rsvg-convert") else {
+            eprintln!("skipped: rsvg-convert not on PATH");
+            return;
+        };
+        let root = std::env::temp_dir().join(format!("viewer-vector-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let svg = root.join("shape.svg");
+        std::fs::write(
+            &svg,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20" fill="#f00"/></svg>"##,
+        )
+        .unwrap();
+        let doc = load_file(&svg, None, &test_context());
+        let media = doc.media.as_ref().expect("svg renders as media");
+        assert_eq!(media.kind, MediaKind::Svg);
+        assert!(media.source_width > media.source_height);
+        assert_eq!(media.stamp, file_stamp(&svg));
+
+        if executable_on_path("pdftoppm").is_some() {
+            let pdf_path = root.join("shape.pdf");
+            let status = std::process::Command::new(rsvg)
+                .args(["--format", "pdf", "--output"])
+                .arg(&pdf_path)
+                .arg(&svg)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let doc = load_file(&pdf_path, None, &test_context());
+            let media = doc.media.as_ref().expect("pdf renders as media");
+            assert!(matches!(media.kind, MediaKind::Pdf { page: 1, .. }));
+            assert_eq!(
+                media.tool.as_deref(),
+                executable_on_path("pdftoppm").as_deref()
+            );
+
+            // A cancelled load stops before it spawns anything.
+            let cancelled = LoadContext {
+                raster: (600, 400),
+                cancel: Cancel::default(),
+            };
+            cancelled.cancel.cancel();
+            let doc = load_file(&pdf_path, None, &cancelled);
+            assert!(doc.media.is_none(), "cancelled load still rasterized");
+        } else {
+            eprintln!("skipped PDF: pdftoppm not on PATH");
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3059,7 +4440,7 @@ mod tests {
         image::RgbaImage::from_pixel(3, 2, image::Rgba([12, 34, 56, 255]))
             .save_with_format(&image_path, image::ImageFormat::Png)
             .unwrap();
-        let doc = load_file(&image_path, None);
+        let doc = load_file(&image_path, None, &test_context());
         assert!(doc.media.is_some());
         assert!(doc.lines.is_empty());
 
@@ -3077,7 +4458,7 @@ mod tests {
     }
 
     #[test]
-    fn ffmpeg_lookup_skips_project_local_path_entries() {
+    fn helper_lookup_skips_project_local_path_entries() {
         let root = std::env::temp_dir().join(format!("viewer-ffmpeg-{}", std::process::id()));
         let project = root.join("project");
         let local_bin = project.join("tools");
@@ -3102,7 +4483,7 @@ mod tests {
         let search_path = std::env::join_paths([&local_bin, &external_bin]).unwrap();
         let project = project.canonicalize().unwrap();
         assert_eq!(
-            ffmpeg_in_path(&search_path, Some(&project)),
+            executable_in_path("ffmpeg", &search_path, Some(&project)),
             Some(external_bin.canonicalize().unwrap().join(executable))
         );
         std::fs::remove_dir_all(root).unwrap();
@@ -3782,7 +5163,7 @@ mod tests {
         let mut bytes = vec![b'a'; 9000];
         bytes.push(0);
         std::fs::write(&path, bytes).unwrap();
-        let doc = load_file(&path, None);
+        let doc = load_file(&path, None, &test_context());
         let rendered: String = doc.lines[0]
             .spans
             .iter()
@@ -4006,7 +5387,7 @@ mod tests {
         for name in ["sample.txt", "sample.md"] {
             let path = root.join(name);
             std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
-            let doc = load_file(&path, Some(2));
+            let doc = load_file(&path, Some(2), &test_context());
             assert_eq!(doc.pending_src, Some(1));
             assert!(
                 doc.numbered,
