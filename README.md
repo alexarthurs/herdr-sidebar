@@ -105,8 +105,8 @@ folder stays put until that pane changes directory again.
 | `b` | hide | `b` | hide |
 | `1` / `2` / `3` | change view | `1` / `2` / `3` | change view |
 
-Preview: drag to select, `Ctrl/Cmd+C` to copy, arrows/PageUp/PageDown to scroll,
-`w` to toggle wrapping, and `q` or Esc to close.
+Preview: drag to select, `Ctrl/Cmd+C` to copy, arrows/PageUp/PageDown or
+Space/`b` to scroll, `w` to toggle wrapping, and `q` or Esc to close.
 
 Host keybindings can invoke the direct `show-explorer`, `show-search`, `show-git`, and
 `quick-open` actions. For example, bind `cmd+p` to:

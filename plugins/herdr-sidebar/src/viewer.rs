@@ -1782,8 +1782,14 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     KeyCode::Down | KeyCode::Char('j') => {
                                         doc.scroll = (doc.scroll + 1).min(max)
                                     }
-                                    KeyCode::PageUp => doc.scroll = doc.scroll.saturating_sub(page),
-                                    KeyCode::PageDown => doc.scroll = (doc.scroll + page).min(max),
+                                    // Shift+Space is byte-identical to Space without the
+                                    // kitty keyboard protocol, so page-back takes `b`.
+                                    KeyCode::PageUp | KeyCode::Char('b') => {
+                                        doc.scroll = doc.scroll.saturating_sub(page)
+                                    }
+                                    KeyCode::PageDown | KeyCode::Char(' ') => {
+                                        doc.scroll = (doc.scroll + page).min(max)
+                                    }
                                     KeyCode::Home | KeyCode::Char('g') => doc.scroll = 0,
                                     KeyCode::End | KeyCode::Char('G') => doc.scroll = max,
                                     KeyCode::Char('w') if doc.media.is_none() => {
@@ -2043,9 +2049,9 @@ fn draw_doc(
             " image preview  q close".into()
         }
     } else if editable {
-        format!(" drag select  Ctrl/Cmd+C copy  e edit  {wrap_hint}  q close")
+        format!(" drag select  Ctrl/Cmd+C copy  space/b page  e edit  {wrap_hint}  q close")
     } else {
-        format!(" drag select  Ctrl/Cmd+C copy  ↑↓ scroll  {wrap_hint}  q close")
+        format!(" drag select  Ctrl/Cmd+C copy  space/b page  ↑↓ scroll  {wrap_hint}  q close")
     };
     frame.render_widget(Paragraph::new(Line::from(hint).dim()), footer);
     (usize::from(body.height).saturating_sub(1).max(1), body)
