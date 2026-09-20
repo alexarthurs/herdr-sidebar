@@ -46,8 +46,12 @@ Use the mouse or press `1`, `2`, and `3`.
   `m` / Ctrl+right-click context menus.
 - Click a file to reuse an ephemeral preview tab; double-click to pin it. Preview in the
   same tab instead by setting **Preview opens in** to `pane`.
-- Preview text, Markdown, images, and—when `ffmpeg` is available—video poster frames.
-  Read-only previews support mouse selection and clipboard copy.
+- Preview text, Markdown, images, and—when their optional renderers are on `PATH`—video
+  poster frames (`ffmpeg`), PDFs page by page (`pdftoppm`, page count from `pdfinfo`),
+  and SVGs (`rsvg-convert`). On Linux and macOS, with herdr's `[experimental]
+  kitty_graphics = true`, media is painted at the pane's full pixel resolution; Windows and
+  every other setup render true-color half blocks. Read-only previews support mouse
+  selection and clipboard copy.
 - Find files with `Ctrl+P`; search project contents with `Ctrl+F` or `Ctrl+Shift+F`.
   Search supports case, whole-word, regex, and include/exclude filters.
 - Stage files or folders from the tree without crossing nested-repository boundaries.
@@ -106,7 +110,9 @@ folder stays put until that pane changes directory again.
 | `1` / `2` / `3` | change view | `1` / `2` / `3` | change view |
 
 Preview: drag to select, `Ctrl/Cmd+C` to copy, arrows/PageUp/PageDown to scroll,
-`w` to toggle wrapping, and `q` or Esc to close.
+`w` to toggle wrapping, and `q` or Esc to close. Media previews: `o` opens the file with
+the default app; in a PDF, `n`/`p` (or PageDown/PageUp) turn pages and `g`/`G` jump to
+the first/last page.
 
 Host keybindings can invoke the direct `show-explorer`, `show-search`, `show-git`, and
 `quick-open` actions. For example, bind `cmd+p` to:
@@ -156,7 +162,8 @@ Use the `-windows` suffix for each direct action on Windows.
 
 All docking, metadata, pane creation, and preview control use herdr's socket API directly.
 The plugin is one Rust crate; optional external tools only enhance Markdown (`glow`), video
-posters (`ffmpeg`), and AI commit drafts (`claude`).
+posters (`ffmpeg`), PDFs (`pdftoppm`/`pdfinfo` from poppler), SVGs (`rsvg-convert`), and AI
+commit drafts (`claude`). Without them those files keep the plain preview.
 
 <div align="center">
 <sub>Screenshots: herdr on Windows Terminal with a Nerd Font.</sub>

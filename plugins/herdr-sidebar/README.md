@@ -15,7 +15,10 @@ directly (`-windows` suffix on Windows), so chords such as `Cmd+P` are remappabl
 The Git footer keeps branch switching and sync one click away in every view and can be hidden
 from Settings.
 Common image formats render directly in the preview pane; videos show a poster frame when
-`ffmpeg` is available on `PATH`.
+`ffmpeg` is available on `PATH`, PDFs render page by page (`n`/`p`) with `pdftoppm`, and SVGs
+with `rsvg-convert`. On Linux and macOS, with herdr's `[experimental] kitty_graphics = true`,
+they are painted at full pixel resolution through herdr's pane graphics API; Windows keeps the
+half-block rendering. `o` opens the file in its default app.
 To open clicked files in a terminal editor, configure "Custom editor…" in sidebar Settings, then
 enable "Use editor on click". Clicking an already-open file focuses its existing editor tab;
 keyboard Enter continues to use the built-in preview.
