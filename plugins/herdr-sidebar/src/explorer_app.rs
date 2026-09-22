@@ -1877,6 +1877,19 @@ impl App {
                 }
                 self.overlay = self.suspended_search.take();
             }
+            PickerAction::Create(name) => {
+                let Some(Overlay::BranchPicker(picker)) = self.overlay.take() else {
+                    return;
+                };
+                match picker.git.create_branch(&name) {
+                    Ok(()) => {
+                        self.notice = Some(format!("created {name}"));
+                        self.refresh_tree();
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+                self.overlay = self.suspended_search.take();
+            }
         }
     }
 

@@ -404,6 +404,22 @@ impl Git {
         Ok(parse_branch_choices(&out))
     }
 
+    /// Create a branch at HEAD and switch to it. `switch -c` refuses to
+    /// clobber an existing branch, so an in-use name is reported rather than
+    /// silently reset, and a dirty worktree carries over exactly as it does
+    /// for [`Self::checkout_branch`].
+    pub fn create_branch(&self, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("branch name is empty".to_string());
+        }
+        // Let git judge the name: its rules cover far more than a hand-rolled
+        // check (trailing `.lock`, `@{`, control characters, leading dashes).
+        run_in(&self.root, &["check-ref-format", "--branch", name])
+            .map_err(|_| format!("`{name}` is not a valid branch name"))?;
+        run_in(&self.root, &["switch", "-c", name]).map(drop)
+    }
+
     /// Checkout one picker entry. Remote refs become ordinary local tracking
     /// branches, matching editor branch pickers rather than leaving a detached
     /// HEAD. Dirty-worktree failures are returned unchanged; nothing is forced.
@@ -1093,6 +1109,54 @@ mod tests {
             remote: false,
         })
         .unwrap();
+        assert_eq!(git.status().unwrap().branch, original);
+        let _ = std::fs::remove_dir_all(&git.root);
+    }
+
+    #[test]
+    fn create_branch_makes_and_switches_to_the_new_branch() {
+        let git = repo_with_head("create-branch");
+        git.create_branch("feature/login").unwrap();
+        assert_eq!(git.status().unwrap().branch, "feature/login");
+        assert!(
+            git.branch_choices()
+                .unwrap()
+                .iter()
+                .any(|branch| branch.name == "feature/login" && branch.current)
+        );
+        let _ = std::fs::remove_dir_all(&git.root);
+    }
+
+    #[test]
+    fn create_branch_refuses_a_name_already_in_use() {
+        let git = repo_with_head("create-branch-existing");
+        let original = git.status().unwrap().branch;
+        git.create_branch("topic").unwrap();
+        git.checkout_branch(&Branch {
+            name: original.clone(),
+            current: false,
+            remote: false,
+        })
+        .unwrap();
+        assert!(git.create_branch("topic").is_err());
+        assert_eq!(git.status().unwrap().branch, original);
+        let _ = std::fs::remove_dir_all(&git.root);
+    }
+
+    #[test]
+    fn create_branch_rejects_a_malformed_name_before_running_switch() {
+        let git = repo_with_head("create-branch-invalid");
+        let original = git.status().unwrap().branch;
+        for bad in [
+            "",
+            "   ",
+            "has space",
+            "bad..name",
+            "-leading-dash",
+            "ends/",
+        ] {
+            assert!(git.create_branch(bad).is_err(), "accepted {bad:?}");
+        }
         assert_eq!(git.status().unwrap().branch, original);
         let _ = std::fs::remove_dir_all(&git.root);
     }

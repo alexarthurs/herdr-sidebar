@@ -2012,6 +2012,18 @@ impl App {
                     Err(error) => self.flash = Some((error, true)),
                 }
             }
+            PickerAction::Create(name) => {
+                let Some(Overlay::BranchPicker(picker)) = self.overlay.take() else {
+                    return;
+                };
+                match picker.git.create_branch(&name) {
+                    Ok(()) => {
+                        self.flash = Some((format!("created {name}"), false));
+                        self.refresh();
+                    }
+                    Err(error) => self.flash = Some((error, true)),
+                }
+            }
         }
     }
 
