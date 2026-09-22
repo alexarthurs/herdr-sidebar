@@ -48,6 +48,17 @@ pub struct Branch {
     pub remote: bool,
 }
 
+/// Why a non-forcing branch delete did not happen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeleteRefused {
+    /// The branch holds commits reachable from nowhere else; deleting it loses
+    /// them. The only case worth re-asking about.
+    NotMerged,
+    /// Anything else — checked out in another worktree, no such branch, git
+    /// missing. Carries git's own message.
+    Failed(String),
+}
+
 /// What one [`Git::stage_under`] call did: how many paths it staged, and how
 /// many it deliberately left alone because they live at or inside a NESTED
 /// repository. The second number is what lets the UI explain a stage that
@@ -402,6 +413,40 @@ impl Git {
             ],
         )?;
         Ok(parse_branch_choices(&out))
+    }
+
+    /// Delete a branch without forcing. `NotMerged` is reported separately so
+    /// the caller can ask a second, informed question instead of destroying
+    /// commits behind a prompt that could not know they existed.
+    pub fn delete_branch(&self, name: &str) -> Result<(), DeleteRefused> {
+        match run_in(&self.root, &["branch", "-d", name]) {
+            Ok(_) => Ok(()),
+            // git's refusal text is translated under a non-English locale, and
+            // nothing here pins one, so classify the failure structurally
+            // rather than by matching the message.
+            Err(message) => match self.branch_is_merged(name) {
+                Some(false) => Err(DeleteRefused::NotMerged),
+                _ => Err(DeleteRefused::Failed(message)),
+            },
+        }
+    }
+
+    /// `branch -D`: only for a caller that has confirmed the loss explicitly.
+    pub fn force_delete_branch(&self, name: &str) -> Result<(), String> {
+        run_in(&self.root, &["branch", "-D", name]).map(drop)
+    }
+
+    /// Whether `name`'s tip is already contained in HEAD. `None` when the ref
+    /// does not resolve, which keeps a missing branch — or any other failure —
+    /// from being mistaken for unmerged work.
+    fn branch_is_merged(&self, name: &str) -> Option<bool> {
+        let branch_ref = format!("refs/heads/{name}");
+        run_in(
+            &self.root,
+            &["rev-parse", "--verify", "--quiet", &branch_ref],
+        )
+        .ok()?;
+        Some(run_in(&self.root, &["merge-base", "--is-ancestor", name, "HEAD"]).is_ok())
     }
 
     /// Checkout one picker entry. Remote refs become ordinary local tracking
@@ -1094,6 +1139,73 @@ mod tests {
         })
         .unwrap();
         assert_eq!(git.status().unwrap().branch, original);
+        let _ = std::fs::remove_dir_all(&git.root);
+    }
+
+    #[test]
+    fn delete_branch_removes_a_merged_branch_without_forcing() {
+        let git = repo_with_head("delete-merged");
+        run_in(&git.root, &["branch", "merged"]).unwrap();
+        assert_eq!(git.delete_branch("merged"), Ok(()));
+        assert!(
+            !git.branch_choices()
+                .unwrap()
+                .iter()
+                .any(|b| b.name == "merged")
+        );
+        let _ = std::fs::remove_dir_all(&git.root);
+    }
+
+    #[test]
+    fn delete_branch_reports_unmerged_work_instead_of_destroying_it() {
+        let git = repo_with_head("delete-unmerged");
+        let original = git.status().unwrap().branch;
+        run_in(&git.root, &["checkout", "-q", "-b", "wip"]).unwrap();
+        std::fs::write(git.root.join("w.txt"), "work").unwrap();
+        run_in(&git.root, &["add", "-A"]).unwrap();
+        run_in(
+            &git.root,
+            &[
+                "-c",
+                "user.email=t@t.dev",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "wip",
+            ],
+        )
+        .unwrap();
+        run_in(&git.root, &["checkout", "-q", &original]).unwrap();
+
+        assert_eq!(git.delete_branch("wip"), Err(DeleteRefused::NotMerged));
+        assert!(
+            git.branch_choices()
+                .unwrap()
+                .iter()
+                .any(|b| b.name == "wip"),
+            "a refused delete must leave the branch alone"
+        );
+        git.force_delete_branch("wip").unwrap();
+        assert!(
+            !git.branch_choices()
+                .unwrap()
+                .iter()
+                .any(|b| b.name == "wip")
+        );
+        let _ = std::fs::remove_dir_all(&git.root);
+    }
+
+    /// A branch that does not exist must not be reported as unmerged work —
+    /// that would offer to force-delete nothing and hide git's real message.
+    #[test]
+    fn delete_branch_separates_other_failures_from_unmerged() {
+        let git = repo_with_head("delete-missing");
+        match git.delete_branch("no-such-branch") {
+            Err(DeleteRefused::Failed(message)) => assert!(!message.is_empty()),
+            other => panic!("expected Failed, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&git.root);
     }
 

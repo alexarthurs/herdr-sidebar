@@ -25,7 +25,7 @@ use herdr_sidebar::actions::{copy_to_clipboard, open_external, reveal};
 use herdr_sidebar::branch_ui::{
     BranchPicker, FooterZones, PickerAction, draw_git_footer, sync_glyph,
 };
-use herdr_sidebar::git::{FileEntry, Git, Status};
+use herdr_sidebar::git::{DeleteRefused, FileEntry, Git, Status};
 use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::state::Exit;
 use herdr_sidebar::state::{self as sidebar, View};
@@ -1856,8 +1856,13 @@ impl App {
             Cmd::AdjustWidth(wider) => self.adjust_sidebar_width(wider),
             Cmd::GitConfirmed(repo, args) => {
                 self.overlay = None;
-                let strs: Vec<&str> = args.iter().map(String::as_str).collect();
-                self.run_git(repo, &strs);
+                match safe_branch_delete(&args) {
+                    Some(branch) => self.delete_branch(repo, branch.to_string()),
+                    None => {
+                        let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+                        self.run_git(repo, &strs);
+                    }
+                }
             }
             Cmd::DiscardConfirmed(repo, entry) => {
                 self.overlay = None;
@@ -2482,7 +2487,7 @@ impl App {
             MenuAction::DeleteBranch => self.confirm_git(
                 repo,
                 format!("Delete branch '{spec}'? (y/N)"),
-                vec!["branch".into(), "-D".into(), spec],
+                vec!["branch".into(), "-d".into(), spec],
             ),
             MenuAction::StashDrop => self.confirm_git(
                 repo,
@@ -2514,6 +2519,36 @@ impl App {
 
     fn confirm_git(&mut self, repo: usize, prompt: String, args: Vec<String>) {
         self.overlay = Some(Overlay::ConfirmGit { repo, prompt, args });
+    }
+
+    /// The confirmed non-forcing delete. Unmerged commits are the one refusal
+    /// worth re-asking about, and only here can the question name what would
+    /// be lost; the forced retry is an ordinary confirmed `branch -D`.
+    fn delete_branch(&mut self, repo: usize, branch: String) {
+        let git = match self.repos.get(repo) {
+            Some(r) => r.git.clone(),
+            None => {
+                self.flash = Some(("repository is gone".to_string(), true));
+                return;
+            }
+        };
+        match git.delete_branch(&branch) {
+            Ok(()) => {
+                self.flash = Some((format!("deleted {branch}"), false));
+                self.refresh();
+            }
+            Err(DeleteRefused::Failed(error)) => {
+                self.flash = Some((error, true));
+                self.refresh();
+            }
+            Err(DeleteRefused::NotMerged) => self.confirm_git(
+                repo,
+                format!(
+                    "'{branch}' is not fully merged — delete anyway and lose its commits? (y/N)"
+                ),
+                vec!["branch".into(), "-D".into(), branch],
+            ),
+        }
     }
 
     fn run_changes_header_action(&mut self, repo: usize, action: ChangesHeaderAction) {
@@ -4038,6 +4073,12 @@ impl App {
             popup,
         );
     }
+}
+
+/// The menu's first, non-forcing `git branch -d <name>`. Matched structurally
+/// so a forced retry — or any other confirmed command — runs unchanged.
+fn safe_branch_delete(args: &[String]) -> Option<&str> {
+    (args.len() == 3 && args[0] == "branch" && args[1] == "-d").then(|| args[2].as_str())
 }
 
 /// Next selectable (non-separator) menu index in `direction`, staying put at
