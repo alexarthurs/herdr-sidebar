@@ -45,8 +45,11 @@ Use the mouse or press `1`, `2`, and `3`.
 - Navigate a real expandable tree with file icons, hover actions, Git decorations, and
   `m` / Ctrl+right-click context menus.
 - Click a file to reuse an ephemeral preview tab; double-click to pin it. Preview in the
-  same tab with **Preview opens in: pane**, or opt into experimental `replace` mode:
-  working panes move to a temporary tab while you preview; Esc / `q` brings them back.
+  same tab with **Preview opens in: pane** (beside the sidebar) or **above** (stacked
+  over the tab's largest non-sidebar pane, usually your agent, which keeps its full
+  width; **Above preview height** sets the share, 60% by default, with ←/→), or opt
+  into experimental `replace` mode: working panes move to a temporary tab while you
+  preview; Esc / `q` brings them back.
 - Preview text, Markdown, images, and—when `ffmpeg` is available—video poster frames.
   Read-only previews support mouse selection and clipboard copy, including OSC 52 over SSH,
   and reload on their own when the file changes on disk.
@@ -97,7 +100,8 @@ Settings persist across tabs and restarts. Configure:
 - Unified or separate Explorer and Source Control panes
 - Left/right docking and preferred width
 - Material/emoji icons and VS Code/light/terminal colors
-- Tab (default), split-pane, or temporary takeover previews and optional custom editor
+- Tab (default), split-pane, stacked-above, or temporary takeover previews, the
+  stacked viewer's height, and optional custom editor
 - Source Control list/tree view (shared across sidebars)
 - Hidden files, Git decorations, Git footer, and footer hotkeys
 - Auto-open, strict open/close toggle, focus-on-open, and live folder following
