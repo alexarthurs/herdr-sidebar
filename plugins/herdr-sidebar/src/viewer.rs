@@ -1736,7 +1736,13 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         notice = Some(match doc.selected_text() {
                                             Some(text) => {
                                                 match crate::actions::copy_to_clipboard(&text) {
-                                                    Ok(()) => "copied selection".into(),
+                                                    Ok(crate::actions::ClipboardWrite::Native) => {
+                                                        "copied selection".into()
+                                                    }
+                                                    Ok(
+                                                        crate::actions::ClipboardWrite::Osc52Unacknowledged,
+                                                    ) => "sent selection to terminal clipboard"
+                                                        .into(),
                                                     Err(error) => {
                                                         format!("clipboard unavailable: {error}")
                                                     }

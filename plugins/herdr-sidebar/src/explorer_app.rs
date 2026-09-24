@@ -2748,7 +2748,10 @@ impl App {
                         .to_string()
                 };
                 self.notice = Some(match actions::copy_to_clipboard(&text) {
-                    Ok(()) => format!("copied: {text}"),
+                    Ok(actions::ClipboardWrite::Native) => format!("copied: {text}"),
+                    Ok(actions::ClipboardWrite::Osc52Unacknowledged) => {
+                        format!("sent to terminal clipboard: {text}")
+                    }
                     Err(err) => format!("copy failed: {err}"),
                 });
             }

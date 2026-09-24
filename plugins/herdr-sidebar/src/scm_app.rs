@@ -21,7 +21,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
 
-use herdr_sidebar::actions::{copy_to_clipboard, open_external, reveal};
+use herdr_sidebar::actions::{ClipboardWrite, copy_to_clipboard, open_external, reveal};
 use herdr_sidebar::branch_ui::{
     BranchPicker, FooterZones, PickerAction, draw_git_footer, sync_glyph,
 };
@@ -2414,7 +2414,10 @@ impl App {
                     rel
                 };
                 self.flash = Some(match copy_to_clipboard(&text) {
-                    Ok(()) => (format!("copied: {text}"), false),
+                    Ok(ClipboardWrite::Native) => (format!("copied: {text}"), false),
+                    Ok(ClipboardWrite::Osc52Unacknowledged) => {
+                        (format!("sent to terminal clipboard: {text}"), false)
+                    }
                     Err(err) => (format!("copy failed: {err}"), true),
                 });
             }
@@ -2463,7 +2466,10 @@ impl App {
                     _ => spec,
                 };
                 self.flash = Some(match copy_to_clipboard(&text) {
-                    Ok(()) => (format!("copied: {text}"), false),
+                    Ok(ClipboardWrite::Native) => (format!("copied: {text}"), false),
+                    Ok(ClipboardWrite::Osc52Unacknowledged) => {
+                        (format!("sent to terminal clipboard: {text}"), false)
+                    }
                     Err(err) => (format!("copy failed: {err}"), true),
                 });
             }
