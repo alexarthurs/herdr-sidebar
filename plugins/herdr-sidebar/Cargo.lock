@@ -658,6 +658,7 @@ dependencies = [
  "globset",
  "ignore",
  "image",
+ "libc",
  "ratatui",
  "regex",
  "rfd",

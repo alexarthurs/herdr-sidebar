@@ -171,9 +171,21 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
         }
         Some(("CLOSE", id)) => {
             if toggle {
-                request_close(&panes, id)?;
+                // Set the marker BEFORE closing: if the quiet ensure hook's
+                // very next focus event lands between the close and the
+                // marker write, it re-docks a sidebar the user just asked
+                // to close. An explicit toggle surfaces a marker failure
+                // rather than closing into a state the hook won't respect.
                 if tracks_snooze {
-                    snooze::set(&snooze_dir, &tab);
+                    snooze::set(&snooze_dir, &tab)?;
+                }
+                if let Err(e) = request_close(&panes, id) {
+                    // The close never happened; don't leave a stale marker
+                    // snoozing a tab that still has its sidebar open.
+                    if tracks_snooze {
+                        let _ = snooze::clear(&snooze_dir, &tab);
+                    }
+                    return Err(e);
                 }
             } else if let Some(target) = activation {
                 activate_existing(id, target)?;
@@ -197,14 +209,19 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
         _ => {
             if toggle {
                 if tracks_snooze {
-                    snooze::clear(&snooze_dir, &tab);
+                    // Opening is about to happen regardless of whether the
+                    // marker clears; a stale marker here just means the next
+                    // quiet hook wrongly leaves it closed, not a resource we
+                    // need to fail loudly over.
+                    let _ = snooze::clear(&snooze_dir, &tab);
                 }
                 // "Focus on open: off" (⚙ Settings) docks in the background:
                 // open()'s quiet path already hands focus back after the swap.
                 open(&panes, state.focus_on_open, &scope, view, None)?;
             } else if let Some(target) = activation {
                 if tracks_snooze {
-                    snooze::clear(&snooze_dir, &tab);
+                    // Same best-effort reasoning as the toggle-open branch above.
+                    let _ = snooze::clear(&snooze_dir, &tab);
                 }
                 prepare_activation(target);
                 open(&panes, true, &scope, view, Some(target))?;
@@ -467,13 +484,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aa-ft-snooze-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        snooze::set(&dir, "w1:t1");
-        snooze::set(&dir, "w1:t2");
+        snooze::set(&dir, "w1:t1").unwrap();
+        snooze::set(&dir, "w1:t2").unwrap();
         assert!(snooze::is_set(&dir, "w1:t1"));
         assert!(!snooze::is_set(&dir, "w1:t9"));
         assert!(!snooze::is_set(&dir, ""), "empty tab id never snoozes");
 
-        snooze::clear(&dir, "w1:t1");
+        snooze::clear(&dir, "w1:t1").unwrap();
         assert!(!snooze::is_set(&dir, "w1:t1"));
 
         // Sweep drops markers for tabs that no longer exist.

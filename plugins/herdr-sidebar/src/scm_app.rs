@@ -877,11 +877,17 @@ impl App {
             return;
         }
         let Some(ctl) = &self.pane_ctl else { return };
-        if snooze
-            && let Ok(json) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({}))
-        {
-            let tab = herdr_sidebar::launch::tab_of(&json, &ctl.pane_id);
-            herdr_sidebar::snooze::set(&herdr_sidebar::snooze::dir(), &tab);
+        if snooze {
+            let tab = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({}))
+                .map(|json| herdr_sidebar::launch::tab_of(&json, &ctl.pane_id))
+                .unwrap_or_default();
+            // Set the marker BEFORE closing: if it fails, closing anyway
+            // would let the very next focus event re-dock a sidebar the
+            // user just asked to hide.
+            if let Err(e) = herdr_sidebar::snooze::set(&herdr_sidebar::snooze::dir(), &tab) {
+                self.flash = Some((format!("hide failed: {e}"), true));
+                return;
+            }
         }
         let _ = herdr_sidebar::ipc::call_text(
             "pane.close",

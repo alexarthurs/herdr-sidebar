@@ -55,6 +55,11 @@ image = { version = "0.25", default-features = false, features = [
     "webp",
 ] }
 
+# Raw euid() for scoping private runtime directories (rundir.rs) to the
+# owning user; already present transitively, so this adds no new download.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Native folder picker for "Change Folder" on Windows. macOS uses osascript:
 # rfd's Cocoa backend aborts when called from the background thread required
 # to keep the TUI heartbeat alive. Linux keeps the typed-path fallback.

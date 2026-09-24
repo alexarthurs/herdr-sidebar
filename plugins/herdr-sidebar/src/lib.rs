@@ -15,6 +15,7 @@ pub mod gitdeco;
 pub mod icons;
 pub mod ipc;
 pub mod launch;
+pub mod rundir;
 pub mod snooze;
 pub mod state;
 pub mod suggest;

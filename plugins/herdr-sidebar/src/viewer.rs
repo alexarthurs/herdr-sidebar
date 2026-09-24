@@ -44,25 +44,71 @@ const MAX_BYTES: usize = 1024 * 1024;
 const MAX_LINES: usize = 5000;
 
 /// Directory for the sidebar's private scratch files (viewer control files).
-/// `std::env::temp_dir()` can be a shared, world-writable directory (unix
-/// `/tmp`) where our filenames are predictable from the pane id; scope our
-/// files into a private, mode-0700 subdirectory so another local user can't
-/// plant a symlink at a path we're about to `fs::write` through. Windows'
-/// per-user `%TEMP%` needs no extra scoping.
+/// Lives in the plugin's per-user state dir (see `rundir`) rather than the
+/// shared OS temp dir, so another local user can never share it with us.
+/// Pure: does not create or chmod anything. Callers that are about to WRITE
+/// through a path under it must call `rundir::ensure_private` first.
 fn scratch_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join("herdr-sidebar-scratch");
-    let _ = std::fs::create_dir_all(&dir);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    crate::rundir::dir("scratch")
+}
+
+/// Is `path` a control file CONFINED to our private scratch directory? Every
+/// control-file operation gates on this rather than trusting a path just
+/// because its immediate parent happens to be private — a metadata token can
+/// name any path, including one outside `scratch_dir()` that we also happen
+/// to own privately (an attacker's own `~/.ssh`, say, if it is 0700). Three
+/// checks, all re-verified fresh on every call:
+/// - `path`'s parent is LEXICALLY `scratch_dir()` — a plain path comparison,
+///   never `canonicalize`, which would follow a symlink and could make a
+///   symlinked scratch dir compare equal to somewhere it shouldn't.
+/// - that parent still verifies as `rundir::is_private` (ownership/mode can
+///   change between calls, not just at creation).
+/// - `path`'s final component is a plain filename (`Component::Normal`), not
+///   `.`/`..`/a root/a prefix: `scratch_dir().join("..")` has a parent EQUAL
+///   to `scratch_dir()` (`Path::parent` only strips the last component, it
+///   does not resolve `..`), so without this check that "file" would
+///   resolve outside `scratch_dir()` entirely.
+fn control_path_ok(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    parent == scratch_dir()
+        && crate::rundir::is_private(parent)
+        && matches!(
+            path.components().next_back(),
+            Some(std::path::Component::Normal(_))
+        )
+}
+
+/// Delete a control file, but only when it passes [`control_path_ok`] —
+/// never remove_file a path outside the confined scratch directory.
+fn remove_control_file(path: &Path) {
+    if control_path_ok(path) {
+        let _ = std::fs::remove_file(path);
     }
-    dir
+}
+
+/// The error a control-file operation reports when [`control_path_ok`]
+/// refuses `path`.
+fn control_path_err(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "control path {} is not confined to the private scratch directory {}",
+            path.display(),
+            scratch_dir().display()
+        ),
+    )
 }
 
 /// Write `contents` to `path`, refusing to follow a pre-existing symlink at
-/// that location (defense in depth alongside `scratch_dir`'s 0700 perms).
+/// that location (defense in depth alongside the scratch dir's 0700 perms),
+/// and refusing to write at all unless `path` is confined to the private
+/// scratch directory.
 fn write_scratch_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    if !control_path_ok(path) {
+        return Err(control_path_err(path));
+    }
     if std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
@@ -1281,6 +1327,9 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
 }
 
 fn read_control(control: &Path) -> Option<Request> {
+    if !control_path_ok(control) {
+        return None;
+    }
     let mut buf = String::new();
     std::fs::File::open(control)
         .ok()?
@@ -1378,8 +1427,8 @@ fn close_own_pane(control: &Path) -> bool {
             serde_json::json!({ "pane_id": pane_id }),
         ));
         if closed {
-            let _ = std::fs::remove_file(control);
-            let _ = std::fs::remove_file(control_path_for_pane(&pane_id));
+            remove_control_file(control);
+            remove_control_file(&control_path_for_pane(&pane_id));
         }
         return closed;
     }
@@ -1389,8 +1438,8 @@ fn close_own_pane(control: &Path) -> bool {
             .into_iter()
             .find(|preview| preview.pane_id == pane_id)
     });
-    let _ = std::fs::remove_file(control);
-    let _ = std::fs::remove_file(control_path_for_pane(&pane_id));
+    remove_control_file(control);
+    remove_control_file(&control_path_for_pane(&pane_id));
     if let Some(preview) = preview.filter(|preview| {
         preview.dedicated
             && list
@@ -1481,6 +1530,13 @@ fn pin_own_tab(doc_key: &str) {
 /// herdr, redeploy, server restart), which never get to run their own
 /// cleanup. Cheap: one readdir against a `pane.list` we already have.
 fn sweep_orphan_controls(pane_list_json: &str) {
+    let dir = scratch_dir();
+    // Skip entirely rather than reading through a directory we have not
+    // verified as private — an unswept orphan is harmless; touching files in
+    // a directory another local user could have planted is not.
+    if !crate::rundir::is_private(&dir) {
+        return;
+    }
     let previews = previews_in(pane_list_json);
     let live: std::collections::BTreeSet<String> = previews
         .iter()
@@ -1492,7 +1548,7 @@ fn sweep_orphan_controls(pane_list_json: &str) {
         .filter(|preview| !preview.stale)
         .map(|preview| preview.control)
         .collect();
-    let Ok(entries) = std::fs::read_dir(scratch_dir()) else {
+    let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
     for entry in entries.flatten() {
@@ -1521,6 +1577,22 @@ fn sweep_orphan_controls(pane_list_json: &str) {
 
 /// The viewer's event loop; returns when the user closes it.
 pub fn run(control: &Path) -> std::io::Result<()> {
+    // A control path outside our confined scratch directory would otherwise
+    // leave this process idling forever, silently never seeing a request —
+    // fail fast instead. This can legitimately happen if the launcher and
+    // this process disagree on `rundir::dir`'s no-`HOME` fallback (`TMPDIR`
+    // can vary by process), so say that rather than just "denied".
+    if !control_path_ok(control) {
+        let mut err = control_path_err(control).to_string();
+        err.push_str(
+            " (the launcher and this process may have resolved a different \
+             runtime directory — see rundir::dir's fallback)",
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            err,
+        ));
+    }
     let theme = IconTheme::resolve(
         std::env::var("HERDR_SIDEBAR_ICONS")
             .or_else(|_| std::env::var("HERDR_AA_FILETREE_ICONS"))
@@ -2149,7 +2221,7 @@ pub fn open_in_pane(
         .filter(|p| p.workspace_id == my_workspace)
         .collect();
     for stale in previews.iter().filter(|preview| preview.stale) {
-        let _ = std::fs::remove_file(&stale.control);
+        remove_control_file(&stale.control);
         if (stale.dedicated || stale.resumed) && tab_is_plugin_only(&list, &stale.tab_id) {
             let _ = ipc::call_text("tab.close", serde_json::json!({ "tab_id": stale.tab_id }));
         } else {
@@ -2684,6 +2756,7 @@ fn spawn_viewer_pane(
     payload: &str,
     inline: Option<InlineSpawn>,
 ) -> Result<(String, PathBuf), String> {
+    crate::rundir::ensure_private(&scratch_dir()).map_err(|e| format!("preview failed: {e}"))?;
     let control = fresh_control_path();
     write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
     let layout = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": my_pane_id })).ok();
@@ -2727,7 +2800,7 @@ fn spawn_viewer_pane(
         .ok()
         .and_then(|r| crate::launch::split_pane_id(&r))
         .ok_or_else(|| {
-            let _ = std::fs::remove_file(&control);
+            remove_control_file(&control);
             "preview pane failed to open".to_string()
         })?;
     if plan.swap
@@ -2758,6 +2831,7 @@ fn create_viewer_tab(
     doc_key: &str,
     payload: &str,
 ) -> Result<(String, String, PathBuf), String> {
+    crate::rundir::ensure_private(&scratch_dir()).map_err(|e| format!("preview failed: {e}"))?;
     let control = fresh_control_path();
     write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
     let workspace_id = ipc::call_text("pane.list", serde_json::json!({}))
@@ -2777,7 +2851,7 @@ fn create_viewer_tab(
         .as_deref()
         .and_then(crate::launch::created_tab_root_pane)
     else {
-        let _ = std::fs::remove_file(&control);
+        remove_control_file(&control);
         return Err("preview tab failed to open".into());
     };
     if let Err(error) = register_viewer_pane(&new_pane, &control, doc_key, false) {
@@ -2847,12 +2921,12 @@ fn mark_dedicated_preview(pane_id: &str) -> bool {
 }
 
 fn cleanup_spawn(pane_id: &str, control: &Path) {
-    let _ = std::fs::remove_file(control);
+    remove_control_file(control);
     let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
 }
 
 fn cleanup_moved_spawn(pane_id: &str, tab_id: &str, control: &Path) {
-    let _ = std::fs::remove_file(control);
+    remove_control_file(control);
     let plugin_only = ipc::call_text("pane.list", serde_json::json!({}))
         .ok()
         .is_some_and(|list| tab_is_plugin_only(&list, tab_id));
@@ -3899,14 +3973,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn scratch_dir_is_private_to_the_owning_user() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let dir = scratch_dir();
-        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        crate::rundir::ensure_private(&dir).unwrap();
+        let meta = std::fs::metadata(&dir).unwrap();
         assert_eq!(
-            mode & 0o777,
+            meta.permissions().mode() & 0o777,
             0o700,
             "scratch dir must not be group/world readable or writable"
         );
+        assert_eq!(meta.uid(), unsafe { libc::geteuid() });
     }
 
     #[cfg(unix)]
@@ -3914,6 +3990,7 @@ mod tests {
     fn write_scratch_file_refuses_to_follow_a_preexisting_symlink() {
         use std::os::unix::fs::symlink;
         let dir = scratch_dir();
+        crate::rundir::ensure_private(&dir).unwrap();
         let victim = dir.join(format!("aa-victim-{}.txt", std::process::id()));
         let link = dir.join(format!("aa-link-{}.ctl", std::process::id()));
         std::fs::write(&victim, "original victim contents").unwrap();
@@ -3938,6 +4015,92 @@ mod tests {
 
         let _ = std::fs::remove_file(&victim);
         let _ = std::fs::remove_file(&link);
+    }
+
+    /// Every control-file operation gates on the parent being a verified
+    /// private directory, not just a path that looks like ours — a stale or
+    /// hijacked parent must not be trusted just because it used to be ours.
+    #[cfg(unix)]
+    #[test]
+    fn control_operations_refuse_a_path_whose_parent_is_not_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-viewer-untrusted-parent-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Group/world readable: not private by rundir's definition.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let control = dir.join("untrusted.ctl");
+
+        assert!(write_scratch_file(&control, "payload").is_err());
+        assert!(!control.exists(), "write must not have happened");
+
+        std::fs::write(&control, "planted").unwrap();
+        assert_eq!(read_control(&control), None);
+
+        remove_control_file(&control);
+        assert!(
+            control.exists(),
+            "delete must refuse to touch a file under an unverified parent"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A metadata-derived control path naming some OTHER directory we own
+    /// privately (an attacker's own `~/.ssh`, say, if it happens to be 0700)
+    /// must be refused just as firmly as a non-private one — `control_path_ok`
+    /// requires confinement to `scratch_dir()` itself, not merely that
+    /// *some* private directory is involved.
+    #[cfg(unix)]
+    #[test]
+    fn control_operations_refuse_a_path_confined_to_a_different_private_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-viewer-other-private-dir-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::rundir::ensure_private(&dir).unwrap();
+        assert!(crate::rundir::is_private(&dir), "test setup sanity check");
+        let control = dir.join("not-ours.ctl");
+
+        assert!(write_scratch_file(&control, "payload").is_err());
+        assert!(!control.exists(), "write must not have happened");
+
+        std::fs::write(&control, "planted").unwrap();
+        assert_eq!(read_control(&control), None);
+
+        remove_control_file(&control);
+        assert!(
+            control.exists(),
+            "delete must refuse to touch a file outside scratch_dir(), \
+             even in a directory we privately own"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The confinement checks in `control_path_ok` must not reject a
+    /// legitimate path directly under `scratch_dir()` itself.
+    #[cfg(unix)]
+    #[test]
+    fn control_operations_accept_a_path_directly_under_scratch_dir() {
+        let dir = scratch_dir();
+        crate::rundir::ensure_private(&dir).unwrap();
+        let control = dir.join(format!("accepted-{}.ctl", std::process::id()));
+        let _ = std::fs::remove_file(&control);
+
+        write_scratch_file(&control, "close").unwrap();
+        assert!(control.exists());
+        assert_eq!(read_control(&control), Some(Request::Close));
+
+        remove_control_file(&control);
+        assert!(
+            !control.exists(),
+            "delete must succeed inside scratch_dir()"
+        );
     }
 
     #[test]
