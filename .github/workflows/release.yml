@@ -18,6 +18,8 @@ jobs:
             triple: x86_64-pc-windows-msvc
           - os: ubuntu-latest
             triple: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-musl
           - os: macos-latest
             triple: x86_64-apple-darwin
           - os: macos-latest
@@ -42,7 +44,7 @@ jobs:
         with:
           targets: ${{ matrix.triple }}
       - name: Install musl linker
-        if: matrix.triple == 'x86_64-unknown-linux-musl'
+        if: endsWith(matrix.triple, '-unknown-linux-musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build release binaries
         run: cargo build --release --target ${{ matrix.triple }} --bins

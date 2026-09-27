@@ -244,9 +244,42 @@ mod tests {
 
     #[test]
     fn picker_starts_on_current_branch() {
-        let git = Git::discover(std::path::Path::new(".")).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-sidebar-branch-picker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "initial",
+            ][..],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let git = Git::discover(&root).unwrap();
         let picker = BranchPicker::open(git).unwrap();
         assert!(picker.branches[picker.selected].current);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 pub struct Entry {
     pub name: String,
     pub is_dir: bool,
+    pub is_symlink: bool,
 }
 
 /// One visible line of the tree, in render order.
@@ -18,6 +19,7 @@ pub struct Row {
     pub path: PathBuf,
     pub name: String,
     pub is_dir: bool,
+    pub is_symlink: bool,
     pub depth: usize,
     pub expanded: bool,
 }
@@ -104,9 +106,19 @@ impl Tree {
         let mut entries: Vec<Entry> = fs::read_dir(dir)
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
-                    .map(|e| Entry {
-                        is_dir: e.file_type().map(|t| t.is_dir()).unwrap_or(false),
-                        name: e.file_name().to_string_lossy().into_owned(),
+                    .map(|e| {
+                        let kind = e.file_type().ok();
+                        let is_symlink = kind.as_ref().is_some_and(|kind| kind.is_symlink());
+                        let is_dir = if is_symlink {
+                            e.path().is_dir()
+                        } else {
+                            kind.is_some_and(|kind| kind.is_dir())
+                        };
+                        Entry {
+                            is_dir,
+                            is_symlink,
+                            name: e.file_name().to_string_lossy().into_owned(),
+                        }
                     })
                     .collect()
             })
@@ -135,6 +147,7 @@ impl Tree {
             out.push(Row {
                 name: entry.name,
                 is_dir: entry.is_dir,
+                is_symlink: entry.is_symlink,
                 depth,
                 expanded,
                 path: path.clone(),
@@ -290,6 +303,34 @@ mod tests {
         assert_eq!(tree.rows().len(), 1, "cached listing must not re-read disk");
         tree.refresh();
         assert_eq!(tree.rows().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_symlinks_are_sorted_and_expand_like_directories() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new("dir-symlink");
+        tmp.mkdir("real");
+        fs::write(tmp.0.join("real/child.txt"), "child").unwrap();
+        fs::write(tmp.0.join("plain.txt"), "file").unwrap();
+        symlink(tmp.0.join("real"), tmp.0.join("linked")).unwrap();
+
+        let mut tree = Tree::new(tmp.0.clone());
+        let rows = tree.rows();
+        let linked = rows.iter().find(|row| row.name == "linked").unwrap();
+        assert!(linked.is_dir);
+        assert!(linked.is_symlink);
+        let plain = rows.iter().position(|row| row.name == "plain.txt").unwrap();
+        let linked_index = rows.iter().position(|row| row.name == "linked").unwrap();
+        assert!(linked_index < plain, "directory links sort with folders");
+
+        tree.expand(&tmp.0.join("linked"));
+        assert!(
+            tree.rows()
+                .iter()
+                .any(|row| row.path == tmp.0.join("linked/child.txt") && row.depth == 1)
+        );
     }
 
     #[test]

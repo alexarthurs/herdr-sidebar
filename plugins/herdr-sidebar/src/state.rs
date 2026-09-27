@@ -382,7 +382,7 @@ pub fn save_editor_command(command: &str) -> bool {
     std::fs::write(path, command).is_ok()
 }
 
-fn state_dir() -> Option<PathBuf> {
+pub(crate) fn state_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("HERDR_PLUGIN_STATE_DIR")
         && !dir.is_empty()
     {

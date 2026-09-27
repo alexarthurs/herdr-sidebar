@@ -46,3 +46,25 @@ jobs:
       - run: cargo build --release
       - run: cargo test
       - run: cargo clippy --release -- -D warnings
+
+  arm64-linux:
+    name: build + test + clippy (ubuntu-24.04-arm)
+    runs-on: ubuntu-24.04-arm
+    defaults:
+      run:
+        working-directory: plugins/herdr-sidebar
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: plugins/herdr-sidebar
+      - name: Install musl linker
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: sh scripts/test-fetch-or-build.sh
+      - run: cargo test
+      - run: cargo clippy --release -- -D warnings
+      - run: cargo build --release --target aarch64-unknown-linux-musl --bins

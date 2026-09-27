@@ -1,6 +1,6 @@
 [package]
 name = "herdr-sidebar"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 rust-version = "1.89"
 description = "VS Code-style sidebar for herdr: file explorer + source control in one pane"
@@ -54,6 +54,11 @@ image = { version = "0.25", default-features = false, features = [
     "tiff",
     "webp",
 ] }
+
+# Raw euid() for scoping private runtime directories (rundir.rs) to the
+# owning user; already present transitively, so this adds no new download.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Native folder picker for "Change Folder" on Windows. macOS uses osascript:
 # rfd's Cocoa backend aborts when called from the background thread required

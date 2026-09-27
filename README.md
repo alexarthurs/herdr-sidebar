@@ -47,7 +47,7 @@ Use the mouse or press `1`, `2`, and `3`.
 - Click a file to reuse an ephemeral preview tab; double-click to pin it. Preview in the
   same tab instead by setting **Preview opens in** to `pane`.
 - Preview text, Markdown, images, and—when `ffmpeg` is available—video poster frames.
-  Read-only previews support mouse selection and clipboard copy.
+  Read-only previews support mouse selection and clipboard copy, including OSC 52 over SSH.
 - Find files with `Ctrl+P`; search project contents with `Ctrl+F` or `Ctrl+Shift+F`.
   Search supports case, whole-word, regex, and include/exclude filters.
 - Stage files or folders from the tree without crossing nested-repository boundaries.

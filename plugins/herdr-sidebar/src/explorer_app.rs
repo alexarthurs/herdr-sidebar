@@ -735,7 +735,7 @@ impl App {
 
     /// The decoration letter for a row, if any (see [`Decorations::letter`]).
     fn row_deco(&self, row: &Row) -> Option<char> {
-        self.deco.letter(&row.path, row.is_dir)
+        self.deco.letter(&row.path, row.is_dir && !row.is_symlink)
     }
 
     /// Re-stamp the identity tokens so launchers know this pane is alive.
@@ -867,11 +867,25 @@ impl App {
 
     fn close(&mut self, snooze: bool) {
         let Some(ctl) = &self.pane_ctl else { return };
-        if snooze
-            && let Ok(json) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({}))
-        {
-            let tab = herdr_sidebar::launch::tab_of(&json, &ctl.pane_id);
-            herdr_sidebar::snooze::set(&herdr_sidebar::snooze::dir(), &tab);
+        if snooze {
+            let tab = match herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) {
+                Ok(json) => herdr_sidebar::launch::tab_of(&json, &ctl.pane_id),
+                Err(e) => {
+                    self.notice = Some(format!("hide failed: {e}"));
+                    return;
+                }
+            };
+            if tab.is_empty() {
+                self.notice = Some("hide failed: could not resolve this tab".into());
+                return;
+            }
+            // Set the marker BEFORE closing: if it fails, closing anyway
+            // would let the very next focus event re-dock a sidebar the
+            // user just asked to hide.
+            if let Err(e) = herdr_sidebar::snooze::set(&herdr_sidebar::snooze::dir(), &tab) {
+                self.notice = Some(format!("hide failed: {e}"));
+                return;
+            }
         }
         let _ = herdr_sidebar::ipc::call_text(
             "pane.close",
@@ -2748,7 +2762,10 @@ impl App {
                         .to_string()
                 };
                 self.notice = Some(match actions::copy_to_clipboard(&text) {
-                    Ok(()) => format!("copied: {text}"),
+                    Ok(actions::ClipboardWrite::Native) => format!("copied: {text}"),
+                    Ok(actions::ClipboardWrite::Osc52Unacknowledged) => {
+                        format!("sent to terminal clipboard: {text}")
+                    }
                     Err(err) => format!("copy failed: {err}"),
                 });
             }
@@ -4590,7 +4607,7 @@ fn row_line(row: &Row, theme: IconTheme, deco: Option<char>, width: u16) -> Line
         Span::styled(format!("{indent}{arrow}"), Style::default().dim()),
         Span::styled(format!("{} ", icon.glyph), icon_style),
     ];
-    let marker = deco.and_then(|letter| deco_marker(letter, row.is_dir));
+    let marker = deco.and_then(|letter| deco_marker(letter, row.is_dir && !row.is_symlink));
     // Row anatomy with a marker: [prefix][name][pad][marker][2 trailing]. The
     // two trailing cells keep the marker clear of the overflow scrollbar,
     // which overdraws the very last column; the name yields the 4 cells that
@@ -4867,6 +4884,7 @@ mod tests {
             path: root.join("src"),
             name: "src".into(),
             is_dir: true,
+            is_symlink: false,
             depth: 0,
             expanded: false,
         };
@@ -4874,6 +4892,7 @@ mod tests {
             path: root.join("src").join("main.rs"),
             name: "main.rs".into(),
             is_dir: false,
+            is_symlink: false,
             depth: 1,
             expanded: false,
         };
@@ -4913,6 +4932,7 @@ mod tests {
             path: PathBuf::from("C:\\ws").join(name),
             name: name.into(),
             is_dir: false,
+            is_symlink: false,
             depth: 0,
             expanded: false,
         }
@@ -4923,6 +4943,18 @@ mod tests {
             path: PathBuf::from("C:\\ws").join(name),
             name: name.into(),
             is_dir: true,
+            is_symlink: false,
+            depth: 0,
+            expanded: false,
+        }
+    }
+
+    fn symlink_dir_row(name: &str) -> Row {
+        Row {
+            path: PathBuf::from("C:\\ws").join(name),
+            name: name.into(),
+            is_dir: true,
+            is_symlink: true,
             depth: 0,
             expanded: false,
         }
@@ -4932,6 +4964,10 @@ mod tests {
     fn files_render_their_status_letter_and_dirs_a_dirty_dot() {
         assert!(rendered(&file_row("app.rs"), Some('M'), 30).ends_with("M  "));
         assert!(rendered(&file_row("new.rs"), Some('A'), 30).ends_with("A  "));
+        assert!(
+            rendered(&symlink_dir_row("linked"), Some('U'), 30).ends_with("U  "),
+            "a directory symlink is a Git file even though it expands like a folder"
+        );
         assert!(rendered(&file_row("gone.rs"), Some('D'), 30).ends_with("D  "));
         assert!(rendered(&file_row("notes.md"), Some('U'), 30).ends_with("U  "));
         assert!(rendered(&file_row("merge.rs"), Some('!'), 30).ends_with("!  "));

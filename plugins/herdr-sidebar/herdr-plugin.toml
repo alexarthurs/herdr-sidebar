@@ -2,7 +2,7 @@
 # and source control in one plugin (one pane by default, separated panes on
 # request via the ⚙ settings).
 #
-# Cross-platform notes (verified against herdr 0.8; see CLAUDE.md for the
+# Cross-platform notes (verified against herdr 0.8; see AGENTS.md for the
 # full findings list):
 #  - Action ids must be GLOBALLY unique across platforms, so Windows launchers
 #    use `-windows`-suffixed ids; both variants gate with the item-level
@@ -18,7 +18,7 @@
 
 id = "herdr-sidebar"
 name = "herdr-sidebar"
-version = "0.13.0"
+version = "0.14.0"
 description = "VS Code-style sidebar: file explorer + source control (with ✧ AI commit messages) in one herdr pane."
 min_herdr_version = "0.8.0"
 platforms = ["linux", "macos", "windows"]
