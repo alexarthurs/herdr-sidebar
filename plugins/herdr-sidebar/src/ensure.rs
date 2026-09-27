@@ -5,8 +5,12 @@
 //! responses (same JSON the CLI prints).
 
 use std::fs::File;
+use std::path::{Path, PathBuf};
 
 use crate::{ipc, launch, state::View};
+
+const REPLACE_ATTEMPTS_PER_WINDOW: u32 = 3;
+const REPLACE_WINDOW_SECS: u64 = 60;
 
 /// Why the native launcher was invoked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,31 +80,66 @@ impl Target {
 /// crashes, so no retry timer or stale-lock cleanup is needed.
 pub struct LaunchLock {
     _file: File,
+    _legacy: Option<File>,
 }
 
 impl LaunchLock {
     /// Acquire the shared launcher lock. Discrete user actions should wait;
     /// redundant focus hooks should use a non-blocking attempt and yield.
     pub fn acquire(wait: bool) -> Option<Self> {
-        let path = crate::state::state_path()
-            .map(|path| path.with_file_name("launcher.lock"))
-            .unwrap_or_else(|| std::env::temp_dir().join("herdr-sidebar-launcher.lock"));
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok()?;
-        }
+        let dir = crate::rundir::dir("launch");
+        crate::rundir::ensure_private(&dir).ok()?;
+        let path = dir.join("launcher.lock");
         let file = File::options()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(path)
+            .open(&path)
             .ok()?;
         let acquired = if wait {
             file.lock().is_ok()
         } else {
             file.try_lock().is_ok()
         };
-        acquired.then_some(Self { _file: file })
+        if !acquired {
+            return None;
+        }
+        // During one upgrade window, also take the pre-runtime-dir lock so
+        // already-running old hooks and new hooks cannot launch concurrently.
+        let legacy = if let Some(legacy_path) = crate::state::state_path()
+            .map(|path| path.with_file_name("launcher.lock"))
+            .filter(|legacy| *legacy != path)
+        {
+            match File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(legacy_path)
+            {
+                Ok(file) => {
+                    let acquired = if wait {
+                        file.lock().is_ok()
+                    } else {
+                        file.try_lock().is_ok()
+                    };
+                    if !acquired {
+                        return None;
+                    }
+                    Some(file)
+                }
+                // Compatibility must not make the new private lock unusable
+                // forever because a stale old path cannot be opened.
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        Some(Self {
+            _file: file,
+            _legacy: legacy,
+        })
     }
 }
 
@@ -128,6 +167,11 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
         return Ok(());
     }
     let event_json = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
+    let creation_event = !explicit
+        && matches!(
+            launch::event_kind(&event_json).as_str(),
+            "tab_created" | "workspace_created"
+        );
     let wait_for_lock = must_wait_for_lock(explicit, &event_json);
     let Some(_lock) = LaunchLock::acquire(wait_for_lock) else {
         return Ok(());
@@ -145,7 +189,9 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
     };
     let tab = snooze_tab_for_scope(&panes, &scope);
     let snooze_dir = snooze::dir();
-    snooze::sweep(&snooze_dir, &launch::live_tabs(&panes));
+    let live_tabs = launch::live_tabs(&panes);
+    snooze::migrate_legacy(&snooze_dir, &live_tabs);
+    snooze::sweep(&snooze_dir, &live_tabs);
     let now = crate::state::unix_now();
     let decision_view = activation.map_or(view, |target| match target {
         Target::SourceControl => View::SourceControl,
@@ -160,6 +206,8 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
     } else {
         decision
     };
+    let replace_dir = crate::rundir::dir("launch");
+    sweep_replace_backoff(&replace_dir, now);
     let tracks_snooze = view == View::Explorer;
     match decision.split_once(' ') {
         Some(("FOCUS", id)) => {
@@ -171,15 +219,61 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
         }
         Some(("CLOSE", id)) => {
             if toggle {
-                request_close(&panes, id)?;
+                // Set the marker BEFORE closing: if the quiet ensure hook's
+                // very next focus event lands between the close and the
+                // marker write, it re-docks a sidebar the user just asked
+                // to close. An explicit toggle surfaces a marker failure
+                // rather than closing into a state the hook won't respect.
                 if tracks_snooze {
-                    snooze::set(&snooze_dir, &tab);
+                    if tab.is_empty() {
+                        return Err(std::io::Error::other(
+                            "hide failed: could not resolve the sidebar tab",
+                        ));
+                    }
+                    snooze::set(&snooze_dir, &tab)?;
+                }
+                if let Err(e) = request_close(&panes, id) {
+                    // The close never happened; don't leave a stale marker
+                    // snoozing a tab that still has its sidebar open.
+                    if tracks_snooze {
+                        let _ = snooze::clear(&snooze_dir, &tab);
+                    }
+                    return Err(e);
                 }
             } else if let Some(target) = activation {
                 activate_existing(id, target)?;
             }
         }
         Some(("REPLACE", id)) => {
+            let replace_scope = {
+                let tab = launch::tab_of(&panes, id);
+                if tab.is_empty() { scope.clone() } else { tab }
+            };
+            if explicit {
+                clear_replace_backoff(&replace_dir, &scope, decision_view);
+                let tab = launch::tab_of(&panes, id);
+                let workspace = launch::workspace_of(&panes, id);
+                clear_replace_backoff(&replace_dir, &tab, decision_view);
+                clear_replace_backoff(&replace_dir, &workspace, decision_view);
+            } else {
+                match replacement_allowed(&replace_dir, &replace_scope, decision_view, now) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        eprintln!(
+                            "herdr-sidebar: suppressed repeated replacement in scope {scope:?}; \
+                             use the sidebar action to retry"
+                        );
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "herdr-sidebar: replacement suppressed because retry state failed: \
+                             {error}"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
             // A dead pane (stale heartbeat): close it and dock a fresh one,
             // quiet or toggle alike — a corpse should never block the dock.
             ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }))?;
@@ -189,27 +283,46 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
             panes = ipc::call_text("pane.list", serde_json::json!({}))?;
             if let Some(target) = activation {
                 prepare_activation(target);
-                open(&panes, true, &scope, view, Some(target))?;
+                open(&panes, true, &scope, view, Some(target), creation_event)?;
             } else {
-                open(&panes, toggle && state.focus_on_open, &scope, view, None)?;
+                open(
+                    &panes,
+                    toggle && state.focus_on_open,
+                    &scope,
+                    view,
+                    None,
+                    creation_event,
+                )?;
             }
         }
         _ => {
             if toggle {
                 if tracks_snooze {
-                    snooze::clear(&snooze_dir, &tab);
+                    // Opening is about to happen regardless of whether the
+                    // marker clears; a stale marker here just means the next
+                    // quiet hook wrongly leaves it closed, not a resource we
+                    // need to fail loudly over.
+                    let _ = snooze::clear(&snooze_dir, &tab);
                 }
                 // "Focus on open: off" (⚙ Settings) docks in the background:
                 // open()'s quiet path already hands focus back after the swap.
-                open(&panes, state.focus_on_open, &scope, view, None)?;
+                open(
+                    &panes,
+                    state.focus_on_open,
+                    &scope,
+                    view,
+                    None,
+                    creation_event,
+                )?;
             } else if let Some(target) = activation {
                 if tracks_snooze {
-                    snooze::clear(&snooze_dir, &tab);
+                    // Same best-effort reasoning as the toggle-open branch above.
+                    let _ = snooze::clear(&snooze_dir, &tab);
                 }
                 prepare_activation(target);
-                open(&panes, true, &scope, view, Some(target))?;
+                open(&panes, true, &scope, view, Some(target), creation_event)?;
             } else if !snooze::is_set(&snooze_dir, &tab) {
-                open(&panes, false, &scope, view, None)?;
+                open(&panes, false, &scope, view, None, creation_event)?;
             }
         }
     }
@@ -232,6 +345,72 @@ pub fn request_close(panes_json: &str, pane_id: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn replace_backoff_path(dir: &Path, scope: &str, view: View) -> PathBuf {
+    let hash = view
+        .token()
+        .bytes()
+        .chain(std::iter::once(0))
+        .chain(scope.bytes())
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
+    dir.join(format!("replace-{hash:016x}.txt"))
+}
+
+fn replacement_allowed(dir: &Path, scope: &str, view: View, now: u64) -> std::io::Result<bool> {
+    crate::rundir::ensure_private(dir)?;
+    let path = replace_backoff_path(dir, scope, view);
+    let (mut attempts, last) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| {
+            let mut fields = text.split_whitespace();
+            Some((
+                fields.next()?.parse::<u32>().ok()?,
+                fields.next()?.parse::<u64>().ok()?,
+            ))
+        })
+        .unwrap_or((0, 0));
+    if now.saturating_sub(last) >= REPLACE_WINDOW_SECS {
+        attempts = 0;
+    }
+    if attempts >= REPLACE_ATTEMPTS_PER_WINDOW {
+        return Ok(false);
+    }
+    std::fs::write(path, format!("{} {now}\n", attempts + 1))?;
+    Ok(true)
+}
+
+fn clear_replace_backoff(dir: &Path, scope: &str, view: View) {
+    if crate::rundir::is_private(dir) {
+        let _ = std::fs::remove_file(replace_backoff_path(dir, scope, view));
+    }
+}
+
+fn sweep_replace_backoff(dir: &Path, now: u64) {
+    if !crate::rundir::is_private(dir) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_marker = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("replace-") && name.ends_with(".txt"));
+        if !is_marker {
+            continue;
+        }
+        let last = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.split_whitespace().nth(1)?.parse::<u64>().ok());
+        if last.is_none_or(|last| now.saturating_sub(last) >= REPLACE_WINDOW_SECS * 2) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 fn snooze_tab_for_scope(panes_json: &str, scope: &str) -> String {
     if scope.contains(':') {
         scope.to_string()
@@ -240,6 +419,30 @@ fn snooze_tab_for_scope(panes_json: &str, scope: &str) -> String {
     } else {
         String::new()
     }
+}
+
+fn focused_pane_id(panes_json: &str) -> String {
+    launch::focused_pane_in(panes_json, "")
+        .split_once('\t')
+        .map(|(pane_id, _)| pane_id.to_string())
+        .unwrap_or_default()
+}
+
+fn creation_focus_repair(
+    panes_before: &str,
+    panes_after: &str,
+    new_sidebar: &str,
+    displaced_by_swap: Option<&str>,
+) -> Option<String> {
+    let after = focused_pane_id(panes_after);
+    if after != new_sidebar {
+        return None;
+    }
+    if let Some(displaced) = displaced_by_swap.filter(|pane| !pane.is_empty()) {
+        return Some(displaced.to_string());
+    }
+    let before = focused_pane_id(panes_before);
+    (!before.is_empty() && before != new_sidebar).then_some(before)
 }
 
 fn focus(pane_id: &str) -> std::io::Result<()> {
@@ -281,6 +484,7 @@ fn open(
     scope: &str,
     view: View,
     initial: Option<Target>,
+    creation_event: bool,
 ) -> std::io::Result<()> {
     // Root the new sidebar from a pane in the scope we are docking into —
     // the decision above answered for that scope, and the two must agree or
@@ -289,7 +493,6 @@ fn open(
     let Some((fid, fcwd)) = fp.split_once('\t') else {
         return Ok(());
     };
-
     let state = crate::state::load_state();
     let dock_right = state.dock_right;
     let layout = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": fid }))?;
@@ -387,10 +590,25 @@ fn open(
 
     if focus_new {
         focus(&new_pane)?;
+    } else if creation_event {
+        // Background creation must not steal focus, but an intended focus may
+        // land while this hook is docking (notably a preview tab's explicit
+        // focus transition). Re-read and repair only when the layout operation
+        // itself left focus on the new sidebar pane; otherwise do nothing.
+        if let Ok(after) = ipc::call_text("pane.list", serde_json::json!({}))
+            && let Some(previous) = creation_focus_repair(
+                panes_json,
+                &after,
+                &new_pane,
+                needs_swap.then_some(target.as_str()),
+            )
+        {
+            focus(&previous)?;
+        }
     } else {
-        // Quiet mode must never move focus, but the split/swap can (focus
-        // follows the SLOT, not the pane) — unconditionally restore the pane
-        // that was focused when we started.
+        // Focus events are scoped to the tab/workspace the client is moving
+        // into, even while the global pane snapshot still points at the one it
+        // left. Restore that scoped pane, not the stale global one.
         focus(fid)?;
     }
     Ok(())
@@ -467,13 +685,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aa-ft-snooze-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        snooze::set(&dir, "w1:t1");
-        snooze::set(&dir, "w1:t2");
+        snooze::set(&dir, "w1:t1").unwrap();
+        snooze::set(&dir, "w1:t2").unwrap();
         assert!(snooze::is_set(&dir, "w1:t1"));
         assert!(!snooze::is_set(&dir, "w1:t9"));
         assert!(!snooze::is_set(&dir, ""), "empty tab id never snoozes");
 
-        snooze::clear(&dir, "w1:t1");
+        snooze::clear(&dir, "w1:t1").unwrap();
         assert!(!snooze::is_set(&dir, "w1:t1"));
 
         // Sweep drops markers for tabs that no longer exist.
@@ -493,6 +711,69 @@ mod tests {
         assert_eq!(snooze_tab_for_scope(panes, ""), "w1:t1");
         assert_eq!(snooze_tab_for_scope(panes, "w2:t1"), "w2:t1");
         assert_eq!(snooze_tab_for_scope(panes, "w2"), "");
+    }
+
+    #[test]
+    fn creation_focus_repair_only_undoes_focus_stolen_by_the_new_sidebar() {
+        let before = r#"{"result":{"panes":[
+            {"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","focused":true,"cwd":"/one"},
+            {"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","focused":false,"cwd":"/two"}
+        ]}}"#;
+        let scoped = launch::focused_pane_in(before, "w2:t1");
+        let (scoped_pane, _) = scoped.split_once('\t').unwrap();
+        assert_eq!(scoped_pane, "w2:p1", "the dock still roots in the new tab");
+
+        let sidebar_stole_focus = r#"{"result":{"panes":[
+            {"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","focused":false},
+            {"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","focused":false},
+            {"pane_id":"w2:p2","tab_id":"w2:t1","workspace_id":"w2","focused":true}
+        ]}}"#;
+        assert_eq!(
+            creation_focus_repair(before, sidebar_stole_focus, "w2:p2", None).as_deref(),
+            Some("w1:p1")
+        );
+
+        let intended_preview_focus = r#"{"result":{"panes":[
+            {"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","focused":false},
+            {"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","focused":true},
+            {"pane_id":"w2:p2","tab_id":"w2:t1","workspace_id":"w2","focused":false}
+        ]}}"#;
+        assert_eq!(
+            creation_focus_repair(before, intended_preview_focus, "w2:p2", Some("w2:p1")),
+            None,
+            "a concurrent intended focus must never be snapped back"
+        );
+
+        assert_eq!(
+            creation_focus_repair(before, sidebar_stole_focus, "w2:p2", Some("w2:p1")).as_deref(),
+            Some("w2:p1"),
+            "after a swap, restore the displaced pane rather than stale global focus"
+        );
+    }
+
+    #[test]
+    fn repeated_replacements_stop_until_the_retry_window_expires() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-replace-backoff-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let now = 10_000;
+        for _ in 0..REPLACE_ATTEMPTS_PER_WINDOW {
+            assert!(replacement_allowed(&dir, "w2:t1", View::Explorer, now).unwrap());
+        }
+        assert!(!replacement_allowed(&dir, "w2:t1", View::Explorer, now).unwrap());
+        assert!(
+            replacement_allowed(&dir, "w2:t1", View::Explorer, now + REPLACE_WINDOW_SECS).unwrap()
+        );
+        clear_replace_backoff(&dir, "w2:t1", View::Explorer);
+        assert!(replacement_allowed(&dir, "w2:t1", View::Explorer, now).unwrap());
+        sweep_replace_backoff(&dir, now + REPLACE_WINDOW_SECS * 2);
+        assert!(!replace_backoff_path(&dir, "w2:t1", View::Explorer).exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -8,7 +8,7 @@ grabs the window with PrintWindow and crops the terminal content out.
 Why this exists: WT is one shared process, so hand-driving Win32 resizes and
 PrintWindow per shot freezes the operator's own terminal and the window
 churns; doing the whole grab in one deterministic pass keeps it to a single
-window op. See CLAUDE.md "README screenshots" for the full playbook.
+window op. See AGENTS.md "README screenshots" for the full playbook.
 
 Usage:
   python shoot_capture.py <tab_id> <crop_name> [--session shoot]

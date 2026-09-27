@@ -43,26 +43,105 @@ const LOAD_POLL: Duration = Duration::from_millis(16);
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_LINES: usize = 5000;
 
+/// Body width from the most recent `draw_doc` call. Markdown loads happen on
+/// a worker before layout is available, so glow uses this snapshot and the
+/// event loop reloads a glow document if its actual body width differs.
+static LAST_BODY_WIDTH: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(80);
+
 /// Directory for the sidebar's private scratch files (viewer control files).
-/// `std::env::temp_dir()` can be a shared, world-writable directory (unix
-/// `/tmp`) where our filenames are predictable from the pane id; scope our
-/// files into a private, mode-0700 subdirectory so another local user can't
-/// plant a symlink at a path we're about to `fs::write` through. Windows'
-/// per-user `%TEMP%` needs no extra scoping.
+/// Lives in the plugin's per-user state dir (see `rundir`) rather than the
+/// shared OS temp dir, so another local user can never share it with us.
+/// Pure: does not create or chmod anything. Callers that are about to WRITE
+/// through a path under it must call `rundir::ensure_private` first.
 fn scratch_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join("herdr-sidebar-scratch");
-    let _ = std::fs::create_dir_all(&dir);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    crate::rundir::dir("scratch")
+}
+
+fn legacy_scratch_dir() -> PathBuf {
+    std::env::temp_dir().join("herdr-sidebar-scratch")
+}
+
+/// Is `path` a control file CONFINED to a recognized private scratch directory?
+/// The state-dir location is current; the old temp location remains accepted
+/// only when it still verifies as private, so already-running preview panes can
+/// survive one upgrade. Every
+/// control-file operation gates on this rather than trusting a path just
+/// because its immediate parent happens to be private — a metadata token can
+/// name any path, including one outside `scratch_dir()` that we also happen
+/// to own privately (an attacker's own `~/.ssh`, say, if it is 0700). Three
+/// checks, all re-verified fresh on every call:
+/// - `path`'s parent is LEXICALLY the expected directory — a plain path comparison,
+///   never `canonicalize`, which would follow a symlink and could make a
+///   symlinked scratch dir compare equal to somewhere it shouldn't.
+/// - that parent still verifies as `rundir::is_private` (ownership/mode can
+///   change between calls, not just at creation).
+/// - `path`'s final component is a plain filename (`Component::Normal`), not
+///   `.`/`..`/a root/a prefix: `scratch_dir().join("..")` has a parent EQUAL
+///   to `scratch_dir()` (`Path::parent` only strips the last component, it
+///   does not resolve `..`), so without this check that "file" would
+///   resolve outside `scratch_dir()` entirely.
+fn control_path_ok(path: &Path) -> bool {
+    control_path_ok_in(path, &scratch_dir()) || control_path_ok_in(path, &legacy_scratch_dir())
+}
+
+fn control_path_ok_in(path: &Path, expected_dir: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    parent == expected_dir
+        && crate::rundir::is_private(parent)
+        && matches!(
+            path.components().next_back(),
+            Some(std::path::Component::Normal(_))
+        )
+}
+
+/// Delete a control file, but only when it passes [`control_path_ok`] —
+/// never remove_file a path outside the confined scratch directory.
+fn remove_control_file(path: &Path) {
+    if control_path_ok(path) {
+        let _ = std::fs::remove_file(path);
     }
-    dir
+}
+
+#[cfg(all(test, unix))]
+fn remove_control_file_in(path: &Path, expected_dir: &Path) {
+    if control_path_ok_in(path, expected_dir) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// The error a control-file operation reports when [`control_path_ok`]
+/// refuses `path`.
+fn control_path_err(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "control path {} is not confined to a private sidebar scratch directory (current: {})",
+            path.display(),
+            scratch_dir().display()
+        ),
+    )
 }
 
 /// Write `contents` to `path`, refusing to follow a pre-existing symlink at
-/// that location (defense in depth alongside `scratch_dir`'s 0700 perms).
+/// that location (defense in depth alongside the scratch dir's 0700 perms),
+/// and refusing to write at all unless `path` is confined to the private
+/// scratch directory.
 fn write_scratch_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    if !control_path_ok(path) {
+        return Err(control_path_err(path));
+    }
+    let Some(parent) = path.parent() else {
+        return Err(control_path_err(path));
+    };
+    write_scratch_file_in(path, contents, parent)
+}
+
+fn write_scratch_file_in(path: &Path, contents: &str, expected_dir: &Path) -> std::io::Result<()> {
+    if !control_path_ok_in(path, expected_dir) {
+        return Err(control_path_err(path));
+    }
     if std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
@@ -102,9 +181,19 @@ fn control_token(control: &Path) -> String {
 }
 
 fn control_from_token(token: &str) -> PathBuf {
+    control_from_token_in(token, &scratch_dir(), &legacy_scratch_dir())
+}
+
+fn control_from_token_in(token: &str, current_dir: &Path, legacy_dir: &Path) -> PathBuf {
     let path = Path::new(token);
     if path.components().count() == 1 {
-        scratch_dir().join(path)
+        let current = current_dir.join(path);
+        let legacy = legacy_dir.join(path);
+        if !current.exists() && legacy.exists() && control_path_ok_in(&legacy, legacy_dir) {
+            legacy
+        } else {
+            current
+        }
     } else {
         path.to_path_buf()
     }
@@ -289,6 +378,9 @@ struct Doc {
     /// Long lines wrap unless the user toggles them off (`w`). Per document:
     /// a newly loaded one starts wrapped again.
     wrap: bool,
+    /// Width glow formatted this markdown document for. A mismatch with the
+    /// live body triggers one background reload instead of generic rewrap.
+    glow_width: Option<u16>,
     /// `lines` laid out for the pane, rebuilt only when the width or the
     /// wrap toggle changes (see [`Doc::relayout`]).
     rows: Vec<Row>,
@@ -665,6 +757,7 @@ fn load(request: &Request) -> Doc {
             media: None,
             scroll: 0,
             wrap: true,
+            glow_width: None,
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
@@ -702,6 +795,7 @@ fn loading_doc(request: &Request) -> Doc {
         media: None,
         scroll: 0,
         wrap: true,
+        glow_width: None,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
@@ -807,6 +901,7 @@ fn restore_current_control(control: &Path, current: &Option<Request>) {
 /// `git show` with stat + patch, colored — what a click on a commit, stash,
 /// tag, or branch line renders. Immutable content: no refresh loop needed.
 fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
+    let display_spec = spec.strip_prefix("refs/tags/").unwrap_or(spec);
     let mut args: Vec<String> = vec![
         "-c".into(),
         "color.ui=always".into(),
@@ -815,6 +910,7 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
         "--stat".into(),
         "--patch".into(),
         "--no-ext-diff".into(),
+        "--end-of-options".into(),
         spec.to_string(),
     ];
     if let Some(p) = path {
@@ -842,13 +938,14 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
         }
     };
     Doc {
-        name: spec.to_string(),
-        context: format!("git show {spec} — {}", root.display()),
+        name: display_spec.to_string(),
+        context: format!("git show {display_spec} — {}", root.display()),
         lines,
         numbered: false,
         media: None,
         scroll: 0,
         wrap: true,
+        glow_width: None,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
@@ -862,12 +959,13 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
 /// Receives the already-read `text` buffer so the MAX_BYTES guard in
 /// `load_file` is honoured — glow would otherwise re-read the full file.
 /// Pipes via stdin (`-`) to avoid treating filenames starting with `-` as
-/// flags. Width is a best-effort approximation; the ideal fix would pass
-/// `body.width` from `draw_doc` once that is available at load time.
+/// flags. The first render uses the most recently drawn body width; the event
+/// loop schedules one background reload if the actual body width differs.
 fn glow_markdown(text: &str, width: u16) -> Option<Vec<Line<'static>>> {
     use std::io::Write as _;
+    let args = glow_args(width, crate::ui::is_light());
     let mut child = std::process::Command::new("glow")
-        .args(["--style", "dark", "--width", &width.to_string(), "-"])
+        .args(args)
         .env("CLICOLOR_FORCE", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -892,6 +990,30 @@ fn glow_markdown(text: &str, width: u16) -> Option<Vec<Line<'static>>> {
         return None;
     }
     Some(lines)
+}
+
+fn glow_args(width: u16, light: bool) -> Vec<String> {
+    vec![
+        "--style".into(),
+        if light { "light" } else { "dark" }.into(),
+        "--width".into(),
+        width.to_string(),
+        "-".into(),
+    ]
+}
+
+fn choose_text_render<F>(
+    glow_rendered: Option<Vec<Line<'static>>>,
+    fallback: F,
+    glow_width: u16,
+) -> (Vec<Line<'static>>, bool, Option<u16>)
+where
+    F: FnOnce() -> Vec<Line<'static>>,
+{
+    match glow_rendered {
+        Some(rendered) => (rendered, false, Some(glow_width)),
+        None => (fallback(), true, None),
+    }
 }
 
 const MAX_MEDIA_FILE_BYTES: u64 = 32 * 1024 * 1024;
@@ -1140,6 +1262,7 @@ fn load_media_file(target: &Path, name: String, video_poster: bool) -> Doc {
         media,
         scroll: 0,
         wrap: false,
+        glow_width: None,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
@@ -1160,31 +1283,26 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
         return load_media_file(target, name, true);
     }
     let is_markdown = lower.ends_with(".md") || lower.ends_with(".markdown");
-    let (lines, numbered) = match std::fs::read(target) {
-        Err(e) => (vec![Line::raw(format!("(unreadable: {e})"))], true),
+    let (lines, numbered, glow_width) = match std::fs::read(target) {
+        Err(e) => (vec![Line::raw(format!("(unreadable: {e})"))], true, None),
         Ok(bytes) => {
             if bytes.contains(&0) {
                 (
                     vec![Line::raw(format!("(binary file — {} bytes)", bytes.len()))],
                     false,
+                    None,
                 )
             } else {
                 let truncated = bytes.len() > MAX_BYTES;
                 let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_BYTES)]);
                 // Markdown: render via glow; fall back to syntax highlight on failure.
-                // Width is approximated by subtracting 6 for the sidebar share and
-                // line-number gutter; ideal fix is to pass body.width from draw_doc.
-                let glow_width = crossterm::terminal::size()
-                    .map(|(w, _)| w.saturating_sub(6))
-                    .unwrap_or(74);
+                let requested_glow_width = LAST_BODY_WIDTH
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .max(20);
                 let glow_rendered = (is_markdown && target_line.is_none())
-                    .then(|| glow_markdown(&text, glow_width))
+                    .then(|| glow_markdown(&text, requested_glow_width))
                     .flatten();
-                // Glow-rendered markdown gets no line numbers (it formats its own layout).
-                let numbered = glow_rendered.is_none();
-                let mut lines: Vec<Line<'static>> = if let Some(rendered) = glow_rendered {
-                    rendered
-                } else {
+                let fallback = || {
                     crate::syntax::highlight(&name, &text, MAX_LINES).unwrap_or_else(|| {
                         text.lines()
                             .take(MAX_LINES)
@@ -1192,13 +1310,15 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
                             .collect()
                     })
                 };
+                let (mut lines, numbered, glow_width) =
+                    choose_text_render(glow_rendered, fallback, requested_glow_width);
                 if truncated || text.lines().count() > MAX_LINES {
                     lines.push(Line::raw("… (truncated)"));
                 }
                 if lines.is_empty() {
                     lines.push(Line::raw("(empty file)"));
                 }
-                (lines, numbered)
+                (lines, numbered, glow_width)
             }
         }
     };
@@ -1209,12 +1329,19 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
         numbered,
         media: None,
         scroll: 0,
-        wrap: true,
+        // Glow already laid out tables and paragraphs for `glow_width`.
+        wrap: glow_width.is_none(),
+        glow_width,
         rows: Vec::new(),
         rows_key: None,
         pending_src: target_line.map(|line| line.saturating_sub(1)),
         selection: PreviewSelection::default(),
     }
+}
+
+fn glow_needs_reload(doc: &Doc, body_width: u16) -> bool {
+    let body_width = body_width.max(20);
+    doc.glow_width.is_some_and(|width| width != body_width)
 }
 
 fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
@@ -1273,6 +1400,7 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         media: None,
         scroll: 0,
         wrap: true,
+        glow_width: None,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
@@ -1281,6 +1409,21 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
 }
 
 fn read_control(control: &Path) -> Option<Request> {
+    if !control_path_ok(control) {
+        return None;
+    }
+    read_control_file(control)
+}
+
+#[cfg(all(test, unix))]
+fn read_control_in(control: &Path, expected_dir: &Path) -> Option<Request> {
+    if !control_path_ok_in(control, expected_dir) {
+        return None;
+    }
+    read_control_file(control)
+}
+
+fn read_control_file(control: &Path) -> Option<Request> {
     let mut buf = String::new();
     std::fs::File::open(control)
         .ok()?
@@ -1378,8 +1521,8 @@ fn close_own_pane(control: &Path) -> bool {
             serde_json::json!({ "pane_id": pane_id }),
         ));
         if closed {
-            let _ = std::fs::remove_file(control);
-            let _ = std::fs::remove_file(control_path_for_pane(&pane_id));
+            remove_control_file(control);
+            remove_control_file(&control_path_for_pane(&pane_id));
         }
         return closed;
     }
@@ -1389,8 +1532,8 @@ fn close_own_pane(control: &Path) -> bool {
             .into_iter()
             .find(|preview| preview.pane_id == pane_id)
     });
-    let _ = std::fs::remove_file(control);
-    let _ = std::fs::remove_file(control_path_for_pane(&pane_id));
+    remove_control_file(control);
+    remove_control_file(&control_path_for_pane(&pane_id));
     if let Some(preview) = preview.filter(|preview| {
         preview.dedicated
             && list
@@ -1482,17 +1625,28 @@ fn pin_own_tab(doc_key: &str) {
 /// cleanup. Cheap: one readdir against a `pane.list` we already have.
 fn sweep_orphan_controls(pane_list_json: &str) {
     let previews = previews_in(pane_list_json);
+    sweep_orphan_controls_in(&scratch_dir(), &previews);
+    sweep_orphan_controls_in(&legacy_scratch_dir(), &previews);
+}
+
+fn sweep_orphan_controls_in(dir: &Path, previews: &[PreviewPane]) {
+    // Skip entirely rather than reading through a directory we have not
+    // verified as private — an unswept orphan is harmless; touching files in
+    // a directory another local user could have planted is not.
+    if !crate::rundir::is_private(dir) {
+        return;
+    }
     let live: std::collections::BTreeSet<String> = previews
         .iter()
         .filter(|preview| !preview.stale)
         .map(|preview| preview.pane_id.replace(':', "_"))
         .collect();
     let live_controls: std::collections::BTreeSet<PathBuf> = previews
-        .into_iter()
+        .iter()
         .filter(|preview| !preview.stale)
-        .map(|preview| preview.control)
+        .map(|preview| preview.control.clone())
         .collect();
-    let Ok(entries) = std::fs::read_dir(scratch_dir()) else {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
@@ -1521,6 +1675,22 @@ fn sweep_orphan_controls(pane_list_json: &str) {
 
 /// The viewer's event loop; returns when the user closes it.
 pub fn run(control: &Path) -> std::io::Result<()> {
+    // A control path outside our confined scratch directory would otherwise
+    // leave this process idling forever, silently never seeing a request —
+    // fail fast instead. This can legitimately happen if the launcher and
+    // this process disagree on `rundir::dir`'s no-`HOME` fallback (`TMPDIR`
+    // can vary by process), so say that rather than just "denied".
+    if !control_path_ok(control) {
+        let mut err = control_path_err(control).to_string();
+        err.push_str(
+            " (the launcher and this process may have resolved a different \
+             runtime directory — see rundir::dir's fallback)",
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            err,
+        ));
+    }
     let theme = IconTheme::resolve(
         std::env::var("HERDR_SIDEBAR_ICONS")
             .or_else(|_| std::env::var("HERDR_AA_FILETREE_ICONS"))
@@ -1538,6 +1708,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         media: None,
         scroll: 0,
         wrap: true,
+        glow_width: None,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
@@ -1585,8 +1756,11 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         if let Some((request, loaded)) = loaded {
             preview_load = None;
             if current.as_ref() == Some(&request)
-                && let (ViewMode::Preview(doc), Some(loaded)) = (&mut mode, loaded)
+                && let (ViewMode::Preview(doc), Some(mut loaded)) = (&mut mode, loaded)
             {
+                if doc.glow_width.is_some() && loaded.glow_width.is_some() {
+                    loaded.scroll = doc.scroll;
+                }
                 *doc = loaded;
             }
         }
@@ -1615,6 +1789,15 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 control,
             );
             identity_pending = false;
+        }
+        let body_width = preview_body.width.max(20);
+        if preview_load.is_none()
+            && let (ViewMode::Preview(doc), Some(request @ Request::File { line: None, .. })) =
+                (&mode, current.as_ref())
+            && glow_needs_reload(doc, body_width)
+        {
+            LAST_BODY_WIDTH.store(body_width, std::sync::atomic::Ordering::Relaxed);
+            preview_load = Some(start_preview_load(request.clone()));
         }
         let mut should_close = false;
         let poll = if preview_load.is_some() {
@@ -1736,7 +1919,13 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         notice = Some(match doc.selected_text() {
                                             Some(text) => {
                                                 match crate::actions::copy_to_clipboard(&text) {
-                                                    Ok(()) => "copied selection".into(),
+                                                    Ok(crate::actions::ClipboardWrite::Native) => {
+                                                        "copied selection".into()
+                                                    }
+                                                    Ok(
+                                                        crate::actions::ClipboardWrite::Osc52Unacknowledged,
+                                                    ) => "sent selection to terminal clipboard"
+                                                        .into(),
                                                     Err(error) => {
                                                         format!("clipboard unavailable: {error}")
                                                     }
@@ -1979,6 +2168,7 @@ fn draw_doc(
 
     // Lay the body out for THIS width first: everything below (the clamp,
     // the slice, the page stride) counts rendered rows.
+    LAST_BODY_WIDTH.store(body.width, std::sync::atomic::Ordering::Relaxed);
     doc.relayout(body.width, body.height);
     doc.scroll = doc.scroll.min(
         doc.rows
@@ -2149,7 +2339,7 @@ pub fn open_in_pane(
         .filter(|p| p.workspace_id == my_workspace)
         .collect();
     for stale in previews.iter().filter(|preview| preview.stale) {
-        let _ = std::fs::remove_file(&stale.control);
+        remove_control_file(&stale.control);
         if (stale.dedicated || stale.resumed) && tab_is_plugin_only(&list, &stale.tab_id) {
             let _ = ipc::call_text("tab.close", serde_json::json!({ "tab_id": stale.tab_id }));
         } else {
@@ -2684,6 +2874,7 @@ fn spawn_viewer_pane(
     payload: &str,
     inline: Option<InlineSpawn>,
 ) -> Result<(String, PathBuf), String> {
+    crate::rundir::ensure_private(&scratch_dir()).map_err(|e| format!("preview failed: {e}"))?;
     let control = fresh_control_path();
     write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
     let layout = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": my_pane_id })).ok();
@@ -2727,7 +2918,7 @@ fn spawn_viewer_pane(
         .ok()
         .and_then(|r| crate::launch::split_pane_id(&r))
         .ok_or_else(|| {
-            let _ = std::fs::remove_file(&control);
+            remove_control_file(&control);
             "preview pane failed to open".to_string()
         })?;
     if plan.swap
@@ -2758,6 +2949,7 @@ fn create_viewer_tab(
     doc_key: &str,
     payload: &str,
 ) -> Result<(String, String, PathBuf), String> {
+    crate::rundir::ensure_private(&scratch_dir()).map_err(|e| format!("preview failed: {e}"))?;
     let control = fresh_control_path();
     write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
     let workspace_id = ipc::call_text("pane.list", serde_json::json!({}))
@@ -2777,7 +2969,7 @@ fn create_viewer_tab(
         .as_deref()
         .and_then(crate::launch::created_tab_root_pane)
     else {
-        let _ = std::fs::remove_file(&control);
+        remove_control_file(&control);
         return Err("preview tab failed to open".into());
     };
     if let Err(error) = register_viewer_pane(&new_pane, &control, doc_key, false) {
@@ -2847,12 +3039,12 @@ fn mark_dedicated_preview(pane_id: &str) -> bool {
 }
 
 fn cleanup_spawn(pane_id: &str, control: &Path) {
-    let _ = std::fs::remove_file(control);
+    remove_control_file(control);
     let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
 }
 
 fn cleanup_moved_spawn(pane_id: &str, tab_id: &str, control: &Path) {
-    let _ = std::fs::remove_file(control);
+    remove_control_file(control);
     let plugin_only = ipc::call_text("pane.list", serde_json::json!({}))
         .ok()
         .is_some_and(|list| tab_is_plugin_only(&list, tab_id));
@@ -3003,6 +3195,7 @@ mod tests {
             media: None,
             scroll: 0,
             wrap: true,
+            glow_width: None,
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
@@ -3896,31 +4089,44 @@ mod tests {
         assert_eq!(created_tab_root_pane(flaggy), None);
     }
 
+    fn test_scratch(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "herdr-viewer-scratch-{label}-{}",
+            std::process::id()
+        ))
+    }
+
     #[cfg(unix)]
     #[test]
     fn scratch_dir_is_private_to_the_owning_user() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = scratch_dir();
-        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = test_scratch("private");
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::rundir::ensure_private(&dir).unwrap();
+        let meta = std::fs::metadata(&dir).unwrap();
         assert_eq!(
-            mode & 0o777,
+            meta.permissions().mode() & 0o777,
             0o700,
             "scratch dir must not be group/world readable or writable"
         );
+        assert_eq!(meta.uid(), unsafe { libc::geteuid() });
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(unix)]
     #[test]
     fn write_scratch_file_refuses_to_follow_a_preexisting_symlink() {
         use std::os::unix::fs::symlink;
-        let dir = scratch_dir();
+        let dir = test_scratch("symlink");
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::rundir::ensure_private(&dir).unwrap();
         let victim = dir.join(format!("aa-victim-{}.txt", std::process::id()));
         let link = dir.join(format!("aa-link-{}.ctl", std::process::id()));
         std::fs::write(&victim, "original victim contents").unwrap();
         let _ = std::fs::remove_file(&link);
         symlink(&victim, &link).unwrap();
 
-        write_scratch_file(&link, "payload").unwrap();
+        write_scratch_file_in(&link, "payload", &dir).unwrap();
 
         // The symlink must have been replaced by a real file, and the
         // victim it used to point at must be untouched.
@@ -3936,8 +4142,120 @@ mod tests {
             "original victim contents"
         );
 
-        let _ = std::fs::remove_file(&victim);
-        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Every control-file operation gates on the parent being a verified
+    /// private directory, not just a path that looks like ours — a stale or
+    /// hijacked parent must not be trusted just because it used to be ours.
+    #[cfg(unix)]
+    #[test]
+    fn control_operations_refuse_a_path_whose_parent_is_not_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-viewer-untrusted-parent-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Group/world readable: not private by rundir's definition.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let control = dir.join("untrusted.ctl");
+
+        assert!(write_scratch_file_in(&control, "payload", &dir).is_err());
+        assert!(!control.exists(), "write must not have happened");
+
+        std::fs::write(&control, "planted").unwrap();
+        assert_eq!(read_control_in(&control, &dir), None);
+
+        remove_control_file_in(&control, &dir);
+        assert!(
+            control.exists(),
+            "delete must refuse to touch a file under an unverified parent"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A metadata-derived control path naming some OTHER directory we own
+    /// privately (an attacker's own `~/.ssh`, say, if it happens to be 0700)
+    /// must be refused just as firmly as a non-private one — `control_path_ok`
+    /// requires confinement to `scratch_dir()` itself, not merely that
+    /// *some* private directory is involved.
+    #[cfg(unix)]
+    #[test]
+    fn control_operations_refuse_a_path_confined_to_a_different_private_directory() {
+        let expected = test_scratch("expected-private-dir");
+        let dir = test_scratch("other-private-dir");
+        let _ = std::fs::remove_dir_all(&expected);
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::rundir::ensure_private(&expected).unwrap();
+        crate::rundir::ensure_private(&dir).unwrap();
+        assert!(crate::rundir::is_private(&dir), "test setup sanity check");
+        let control = dir.join("not-ours.ctl");
+
+        assert!(write_scratch_file_in(&control, "payload", &expected).is_err());
+        assert!(!control.exists(), "write must not have happened");
+
+        std::fs::write(&control, "planted").unwrap();
+        assert_eq!(read_control_in(&control, &expected), None);
+
+        remove_control_file_in(&control, &expected);
+        assert!(
+            control.exists(),
+            "delete must refuse to touch a file outside scratch_dir(), \
+             even in a directory we privately own"
+        );
+
+        let _ = std::fs::remove_dir_all(expected);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The confinement checks in `control_path_ok` must not reject a
+    /// legitimate path directly under `scratch_dir()` itself.
+    #[cfg(unix)]
+    #[test]
+    fn control_operations_accept_a_path_directly_under_scratch_dir() {
+        let dir = test_scratch("accepted");
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::rundir::ensure_private(&dir).unwrap();
+        let control = dir.join(format!("accepted-{}.ctl", std::process::id()));
+        let _ = std::fs::remove_file(&control);
+
+        write_scratch_file_in(&control, "close", &dir).unwrap();
+        assert!(control.exists());
+        assert_eq!(read_control_in(&control, &dir), Some(Request::Close));
+
+        remove_control_file_in(&control, &dir);
+        assert!(
+            !control.exists(),
+            "delete must succeed inside scratch_dir()"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn control_token_falls_back_to_a_verified_legacy_file() {
+        let current = test_scratch("migration-current");
+        let legacy = test_scratch("migration-legacy");
+        let _ = std::fs::remove_dir_all(&current);
+        let _ = std::fs::remove_dir_all(&legacy);
+        crate::rundir::ensure_private(&current).unwrap();
+        crate::rundir::ensure_private(&legacy).unwrap();
+        std::fs::write(legacy.join("preview.ctl"), "close").unwrap();
+
+        assert_eq!(
+            control_from_token_in("preview.ctl", &current, &legacy),
+            legacy.join("preview.ctl")
+        );
+        std::fs::write(current.join("preview.ctl"), "new").unwrap();
+        assert_eq!(
+            control_from_token_in("preview.ctl", &current, &legacy),
+            current.join("preview.ctl")
+        );
+
+        let _ = std::fs::remove_dir_all(current);
+        let _ = std::fs::remove_dir_all(legacy);
     }
 
     #[test]
@@ -3998,6 +4316,64 @@ mod tests {
     }
 
     #[test]
+    fn git_show_treats_a_dash_prefixed_ref_as_data_not_an_option() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-sidebar-dash-ref-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "initial",
+            ][..],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let head = String::from_utf8(head.stdout).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["update-ref", "refs/tags/--output=pwned.txt", head.trim()])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let doc = load_show(&root, "--output=pwned.txt", None);
+        assert!(!doc.lines.is_empty());
+        assert!(
+            !root.join("pwned.txt").exists(),
+            "the ref name must never become a git-show option"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn line_target_anchors_plain_and_markdown_source_previews() {
         let root =
             std::env::temp_dir().join(format!("herdr-sidebar-line-target-{}", std::process::id()));
@@ -4017,15 +4393,8 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the optional glow executable"]
     fn glow_markdown_returns_styled_spans() {
-        // Skip if glow is not installed
-        if std::process::Command::new("glow")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return;
-        }
         let md = "# Heading\n\n**bold** and `code`\n";
         let lines = glow_markdown(md, 80);
         assert!(lines.is_some(), "glow_markdown returned None");
@@ -4040,6 +4409,44 @@ mod tests {
         assert!(
             has_styled,
             "glow_markdown returned no styled spans — ANSI not parsed"
+        );
+    }
+
+    #[test]
+    fn glow_rendered_markdown_uses_the_body_width_without_generic_rewrap() {
+        let rendered = vec![Line::raw("preformatted table")];
+        let fallback = vec![Line::raw("markdown source")];
+        let (lines, numbered, glow_width) = choose_text_render(Some(rendered), || fallback, 80);
+        let doc = Doc {
+            name: "table.md".into(),
+            context: String::new(),
+            lines,
+            numbered,
+            media: None,
+            scroll: 0,
+            wrap: glow_width.is_none(),
+            glow_width,
+            rows: Vec::new(),
+            rows_key: None,
+            pending_src: None,
+            selection: PreviewSelection::default(),
+        };
+        assert!(!doc.wrap, "glow output must not be generically re-wrapped");
+        assert!(!doc.numbered, "glow formats its own layout, no gutter");
+        assert_eq!(doc.glow_width, Some(80));
+        assert!(!glow_needs_reload(&doc, 80));
+        assert!(glow_needs_reload(&doc, 60));
+    }
+
+    #[test]
+    fn glow_arguments_always_carry_theme_width_and_stdin_sentinel() {
+        assert_eq!(
+            glow_args(39, true),
+            ["--style", "light", "--width", "39", "-"]
+        );
+        assert_eq!(
+            glow_args(120, false),
+            ["--style", "dark", "--width", "120", "-"]
         );
     }
 

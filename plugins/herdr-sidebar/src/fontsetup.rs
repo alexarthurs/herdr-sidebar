@@ -128,8 +128,8 @@ enum Screen {
         /// A FRESH (uncached) probe re-run after a successful install —
         /// `false` means the registration isn't visible yet.
         probe_ok: bool,
-        /// `c` copied [`MANUAL_CMD`] to the clipboard.
-        copied: bool,
+        /// `c` copied [`MANUAL_CMD`] to the clipboard, and how.
+        copied: Option<actions::ClipboardWrite>,
     },
 }
 
@@ -155,7 +155,7 @@ fn run(
                     screen = Screen::Done {
                         result,
                         probe_ok,
-                        copied: false,
+                        copied: None,
                     };
                 }
                 Err(_) => {}
@@ -203,8 +203,8 @@ fn run(
             }
             Screen::Done { result, copied, .. } => match key.code {
                 KeyCode::Char('c' | 'C') if result.is_err() => {
-                    if actions::copy_to_clipboard(MANUAL_CMD).is_ok() {
-                        *copied = true;
+                    if let Ok(how) = actions::copy_to_clipboard(MANUAL_CMD) {
+                        *copied = Some(how);
                     }
                 }
                 _ => {
@@ -472,13 +472,20 @@ fn done_ok_lines(probe_ok: bool, width: u16, height: usize) -> Vec<Line<'static>
     fit_blocks(blocks, height)
 }
 
-fn done_err_lines(err: &str, copied: bool, width: u16, height: usize) -> Vec<Line<'static>> {
+fn done_err_lines(
+    err: &str,
+    copied: Option<actions::ClipboardWrite>,
+    width: u16,
+    height: usize,
+) -> Vec<Line<'static>> {
     let mut options = option_lines(
         "C",
-        if copied {
-            "copy the command — copied ✓"
-        } else {
-            "copy the command"
+        match copied {
+            Some(actions::ClipboardWrite::Native) => "copy the command — copied ✓",
+            Some(actions::ClipboardWrite::Osc52Unacknowledged) => {
+                "copy the command — sent to terminal clipboard"
+            }
+            None => "copy the command",
         },
         width,
     );
@@ -780,7 +787,7 @@ mod tests {
 
     #[test]
     fn failure_screen_shows_error_and_manual_command() {
-        let lines = done_err_lines("winget failed: 0x8a150044", false, 38, 20);
+        let lines = done_err_lines("winget failed: 0x8a150044", None, 38, 20);
         let text = squashed(&lines);
         assert!(text.contains("Install failed"), "{text}");
         assert!(text.contains("winget failed: 0x8a150044"), "{text}");
@@ -792,15 +799,22 @@ mod tests {
         assert!(text.contains("copy the command"), "{text}");
         assert!(max_width(&lines) <= 38);
         // Copy feedback.
-        let copied = done_err_lines("boom", true, 38, 20);
+        let copied = done_err_lines("boom", Some(actions::ClipboardWrite::Native), 38, 20);
         assert!(squashed(&copied).contains("copied ✓"));
+        let sent = done_err_lines(
+            "boom",
+            Some(actions::ClipboardWrite::Osc52Unacknowledged),
+            38,
+            20,
+        );
+        assert!(squashed(&sent).contains("sent to terminal clipboard"));
     }
 
     #[test]
     fn failure_screen_keeps_actions_when_narrow() {
         let lines = done_err_lines(
             "some very long error message from the installer",
-            false,
+            None,
             26,
             8,
         );

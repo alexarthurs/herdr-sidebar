@@ -75,6 +75,7 @@ triple=""
 case "$os/$arch" in
   Darwin/arm64|Darwin/aarch64) triple="aarch64-apple-darwin" ;;
   Darwin/x86_64|Darwin/amd64) triple="x86_64-apple-darwin" ;;
+  Linux/aarch64|Linux/arm64) triple="aarch64-unknown-linux-musl" ;;
   Linux/x86_64|Linux/amd64) triple="x86_64-unknown-linux-musl" ;;
 esac
 [ -n "$triple" ] || fallback "no prebuilt binary for $os/$arch"

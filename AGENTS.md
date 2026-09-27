@@ -3,7 +3,7 @@
 **This file is a living doc — always capture findings.** Whenever you discover something
 non-obvious the hard way (a herdr behavior, a Windows quirk, a manifest gotcha, a build issue),
 record it here in the relevant section before finishing the task, the way the Windows caveats
-below were captured. If you're working in a feature worktree, commit the CLAUDE.md update on
+below were captured. If you're working in a feature worktree, commit the AGENTS.md update on
 your branch so it lands on main with the merge.
 
 One herdr plugin, a VS Code-style sidebar for the terminal, as a **self-contained Rust crate**:
@@ -118,7 +118,7 @@ executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launch
   reach them — the lock only clears when that other session restarts. Rename-aside (above)
   still unblocks the build.
 
-### Release flow (verified for v0.7.0)
+### Release flow
 
 - Bump the version in THREE files: `Cargo.toml`, `herdr-plugin.toml`, and `Cargo.lock`
   (any cargo command regenerates the lock entry). Commit as `vX.Y.Z`, `git tag vX.Y.Z`,
@@ -130,6 +130,8 @@ executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launch
 - Prebuilt selection is version-based and checksum-verified. Windows needs BOTH the main binary
   and the GUI-subsystem ensure sidecar; a partial download must fall back to the source build.
 - Release assets use `herdr-sidebar[-ensure]-<rust-target>[.exe]` plus `SHA256SUMS`.
+  Linux publishes both x86-64 and ARM64 musl binaries; the Unix installer maps
+  `aarch64`/`arm64` hosts to `aarch64-unknown-linux-musl` before falling back to source.
   Platform-gated `[[build]]` entries fetch only the crate's declared version, verify before
   moving either binary into `target/release`, and fall back to `cargo build --release` for
   unsupported targets, missing assets, or mismatches. The `HS_*` seams are enabled only by
@@ -140,21 +142,22 @@ executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launch
   a pull request") is bypassable as repo admin — the push prints a rule-violation warning
   but succeeds.
 - Before merging fetched contributor commits, inspect `gh pr diff N --name-only | rg -i
-  '^\.(claude|codex)/|^CLAUDE\.md$|^\.github/workflows/'` for agent instructions and
+  '^\.(claude|codex)/|^AGENTS\.md$|^CLAUDE\.md$|^\.github/workflows/'` for agent instructions and
   workflow changes. `.claude/commands/` and `.codex/prompts/` are
   maintainer-local, ignored, rejected by ordinary CI, and independently rejected by a
   `pull_request_target` workflow that never checks out contributor code. A PR can still alter
-  `CLAUDE.md`, tracked skills, or workflows, so review those paths as instructions, not data.
+  `AGENTS.md`, add another root instruction file, or alter tracked skills/workflows, so review
+  those paths as instructions, not data.
 
 ### Testing hooks headless (no TUI attached)
 
 - Bare `herdr server` STARTS a foreground server (it does not print help) and restores the
   persisted session — all workspaces and panes respawn. Handy for exercising plugin hooks
   from a script; test in throwaway workspaces and close them after.
-- The ensure hooks only dock into the FOCUSED tab: `workspace create --no-focus` fires
-  workspace.created but nothing docks until `herdr workspace focus <id>`. With no TUI
-  client attached, focus changes are invisible to the user — still restore the previous
-  focus when done.
+- Creation hooks dock into their event scope even when `workspace create --no-focus` or
+  `tab create --no-focus` targets the background. After docking they re-read `pane.list` and
+  restore the previously focused pane only if the split/swap itself focused the new sidebar;
+  a concurrent intended focus transition must win.
 - Drive the live TUI for verification with `pane send-keys <id> s` (⚙ Settings) etc., then
   `pane read <id> --source visible` to assert on the rendered modal.
 
@@ -441,7 +444,16 @@ HACKING.md — budget time for that before promising a patched build.
 - A focus event may yield when the launcher lock is held because another focus event follows, but
   `tab.created` is discrete and must block for the OS lock or a preview tab can permanently miss
   its sidebar (issue #32). Herdr's `EventEnvelope` serializes the JSON discriminator as
-  `tab_created`; manifest hook names remain dotted (`tab.created`).
+  `tab_created`; manifest hook names remain dotted (`tab.created`). Creation hooks still dock
+  their event scope when it is in the background, then conditionally repair focus only when the
+  new sidebar stole it, so `--no-focus` remains authoritative without reopening issue #32's
+  missed-preview-tab race. Ordinary focus hooks restore the scoped pane because their first
+  global snapshot can still point at the tab/workspace the client just left.
+- A crashing startup must never create an unbounded `REPLACE` loop. Quiet hooks persist a
+  per-tab replacement budget in the private runtime directory: three attempts per minute, then
+  leave the corpse in place until another event after the window or an explicit sidebar action.
+  Focus/swap events do not clear it; explicit actions bypass and clear it, and expired marker
+  files are swept after two windows.
 - **Stamp the heartbeat on EVERY event-loop iteration, not only in the poll-timeout
   branch**: sustained input with <500ms gaps (held-key auto-repeat, a long paste) keeps
   `event::poll` returning true, starving a timeout-branch heartbeat until the launcher
@@ -522,8 +534,8 @@ HACKING.md — budget time for that before promising a patched build.
 - "Reveal in File Explorer" opens a selected directory itself; only files are revealed by
   opening their parent with the file selected. Applying file-style reveal semantics to folders
   lands one level too high and looks like the clicked tree row was ignored. Pass the row/menu's
-  known directory bit into `actions::reveal`; restatting with `Path::is_dir()` follows symlinks
-  and can disagree with Explorer's `DirEntry::file_type()` row classification.
+  known directory bit into `actions::reveal`. Explorer deliberately restats symlinks once while
+  building rows so links to directories are expandable; downstream actions must trust that bit.
 - List UX invariants (both views): NOTHING is highlighted until the user selects
   (hover stays subtle); the wheel scrolls the VIEW only (`scroll_view`) and never
   moves the selection; keyboard nav snaps the view to the selection; overflow shows a
@@ -886,6 +898,9 @@ setting are all gone.
   request still matches the current document. Collect the receiver before drawing each frame and
   use the 16ms `LOAD_POLL` only while a worker is active: checking it after the normal 250ms idle
   event wait added a second polling interval, making otherwise-fast swaps take about half a second.
+- `glow` receives the actual preview-body width and the configured light/dark color mode. Its
+  terminal-formatted output bypasses the generic text wrapper; first-load and resize mismatches
+  schedule one background reload at the new width while preserving the reader's scroll offset.
 - Raster image previews are decoded in-process and rendered as true-color `▀` cells (foreground
   = upper pixel, background = lower pixel), so they work through herdr's terminal compositor
   without Kitty/Sixel passthrough. They preserve aspect ratio, center, and rebuild from the
@@ -924,11 +939,13 @@ setting are all gone.
   viewer confirms save/discard/cancel and then closes itself (stale viewers are still killed
   directly). The same prompt guards control-file switches to another preview.
 - Clipboard is best-effort and command-backed: `clip` / PowerShell `Get-Clipboard` on
-  Windows, `pbcopy`/`pbpaste` on macOS, and wl-clipboard or xclip on Linux. Ctrl and Cmd
-  shortcuts are both accepted; CONTROL+ALT chars remain text so Windows AltGr layouts work.
-  A copy command counts only when its exit status succeeds. Do not treat writing OSC 52 bytes
-  as confirmed clipboard success: terminals provide no acknowledgement here, and unconditional
-  escape output would add a behavior/security compatibility change with no opt-out.
+  Windows, `pbcopy`/`pbpaste` on macOS, and wl-clipboard or xclip on Linux. Over SSH, copy
+  emits bounded OSC 52 only when stdout is a terminal, following herdr's own clipboard path;
+  Unix also falls back to OSC 52 when every native clipboard command fails in a terminal.
+  Callers describe that as "sent" rather than confirmed because terminals do not acknowledge
+  it. Editor cut keeps the selected text on that unacknowledged path because there is no undo.
+  Ctrl and Cmd shortcuts are both accepted; CONTROL+ALT chars remain text so Windows AltGr
+  layouts work.
 - ANSI parsing consumes complete OSC payloads through BEL or ST. Glow 3 emits OSC 8 hyperlinks
   under forced color; dropping only ESC exposes the hyperlink metadata as visible preview text.
 - Edit mode accepts terminal mouse input: click moves the caret, drag selects across logical and
@@ -1056,7 +1073,7 @@ end-to-end twice:
 
 0. **Shared backdrop (shoot session)** — shots are taken in the isolated
    `herdr --session shoot` server so herdr's left chrome shows a DUMMY roster, kept
-   IDENTICAL to the herdr-aa-notes repo's shots (mirrored in that repo's CLAUDE.md):
+   identical across the sidebar's screenshot set:
    spaces `acme-app [main ↑1]` / `acme-api [main]` / `acme-web [dev]` /
    `billing-service [main]`; agents in acme-app's 2×2 grid: `auth-refactor` (claude),
    `checkout-tests` (codex), `api-docs` (codex, unsubmitted composer text),
@@ -1116,7 +1133,7 @@ Hard-won capture gotchas:
   Code's auto-set terminal title happened to contain "herdr-shoot". Use
   **capture_exact.ps1** (exact title + PrintWindow PW_RENDERFULLCONTENT): immune to
   occlusion, monitors, and title collisions. Still **view every capture** before shipping.
-- **NO_COLOR kills Claude Code's orange** (the CLAUDE.md crossterm gotcha, shoot-server
+- **NO_COLOR kills Claude Code's orange** (the `AGENTS.md` crossterm gotcha, shoot-server
   edition): agent tool shells carry NO_COLOR=1 (even when a nested probe shell says
   otherwise — check `$env:NO_COLOR` in the ACTUAL shell), every server started from one
   passes it to every pane, and claude renders monochrome. Start the shoot server with

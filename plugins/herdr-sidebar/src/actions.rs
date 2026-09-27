@@ -120,9 +120,53 @@ pub fn delete(path: &Path, is_dir: bool) -> io::Result<()> {
     }
 }
 
-/// Copy text to the system clipboard by piping to the platform's clipboard
-/// tool (a console child of the TUI's own pty — no window is created).
-pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
+/// Which path [`copy_to_clipboard`] took, so a caller can word its notice
+/// accordingly: a native tool's exit status is a real confirmation, while an
+/// OSC 52 write is not (the terminal never acknowledges it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClipboardWrite {
+    Native,
+    Osc52Unacknowledged,
+}
+
+/// herdr's libghostty-vt OSC parser caps a captured OSC 52 payload at 8 MiB
+/// (`Parser.MAX_ALLOCATING_BUF` in `terminal/osc.zig`). The captured span
+/// starts right after the "52;" prefix (which is consumed by the parser's
+/// state machine and never itself counted) and holds the kind + separator
+/// ("c;", 2 bytes), the base64 payload, and a trailing NUL byte the parser
+/// appends once the sequence ends (`terminal/osc/parsers/clipboard_operation.zig`,
+/// `cap.writeByte(0)`). A larger sequence never reaches the clipboard, so
+/// reject it up front rather than writing a truncated payload the client
+/// can't decode.
+const OSC52_MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Copy text to the system clipboard.
+///
+/// Over SSH there is often no local clipboard tool to shell out to, so this
+/// emits an OSC 52 sequence on stdout instead: herdr's own terminal emulator
+/// parses it out of the pane's PTY stream and forwards it to the attached
+/// client, which writes it to the real (possibly remote) clipboard — the
+/// same path core herdr's own selection-copy uses. Otherwise this first pipes
+/// to the platform's clipboard tool (a console child of the TUI's own pty —
+/// no window is created), then falls back to OSC 52 when stdout is a terminal.
+pub fn copy_to_clipboard(text: &str) -> io::Result<ClipboardWrite> {
+    // Mirrors core herdr's SSH presence check; deliberately narrower than its
+    // `should_prefer_osc52` (no WSL/VS Code detection — those aren't "we have
+    // no local clipboard tool" cases the way SSH is).
+    #[cfg(not(windows))]
+    let stdout_is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    #[cfg(not(windows))]
+    let prefer_osc52 = (std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_TTY").is_some())
+        && stdout_is_terminal;
+    #[cfg(windows)]
+    let prefer_osc52 = false;
+
+    if prefer_osc52 {
+        let stdout = io::stdout();
+        return write_osc52(stdout.lock(), text);
+    }
+
     #[cfg(windows)]
     let candidates: &[&[&str]] = &[&["clip"]];
     #[cfg(not(windows))]
@@ -135,11 +179,98 @@ pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
     let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no clipboard tool found");
     for argv in candidates {
         match copy_with(argv, text) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(ClipboardWrite::Native),
             Err(err) => last_err = err,
         }
     }
+    #[cfg(not(windows))]
+    if stdout_is_terminal {
+        let stdout = io::stdout();
+        return write_osc52(stdout.lock(), text);
+    }
     Err(last_err)
+}
+
+fn write_osc52(mut out: impl std::io::Write, text: &str) -> io::Result<ClipboardWrite> {
+    if text.is_empty() {
+        // An empty OSC 52 payload clears the terminal's clipboard instead of
+        // leaving it untouched.
+        return Err(io::Error::other("nothing to copy"));
+    }
+    if !osc52_sequence_fits(text.len()) {
+        return Err(io::Error::other(
+            "selection too large for terminal clipboard (OSC 52 limit)",
+        ));
+    }
+    let encoded = base64_encode(text.as_bytes());
+    write!(out, "\x1b]52;c;{encoded}\x07")?;
+    out.flush()?;
+    Ok(ClipboardWrite::Osc52Unacknowledged)
+}
+
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard (RFC 4648, padded) base64 encoder. Hand-rolled so the OSC 52
+/// path doesn't need a new dependency for something this small.
+fn base64_encode(bytes: &[u8]) -> String {
+    // A precise capacity is just a preallocation hint here (the caller has
+    // already validated the length via `osc52_sequence_fits`); 0 is always a
+    // safe fallback if it were ever to overflow, not a claim about the real
+    // encoded length.
+    let capacity = checked_base64_encoded_len(bytes.len()).unwrap_or(0);
+    let mut out = String::with_capacity(capacity);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied();
+        let b2 = chunk.get(2).copied();
+        out.push(BASE64_ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(BASE64_ALPHABET[(((b0 & 0x03) << 4) | (b1.unwrap_or(0) >> 4)) as usize] as char);
+        out.push(match b1 {
+            Some(b1) => {
+                BASE64_ALPHABET[(((b1 & 0x0f) << 2) | (b2.unwrap_or(0) >> 6)) as usize] as char
+            }
+            None => '=',
+        });
+        out.push(match b2 {
+            Some(b2) => BASE64_ALPHABET[(b2 & 0x3f) as usize] as char,
+            None => '=',
+        });
+    }
+    out
+}
+
+/// The base64-encoded length of `input_len` raw bytes (RFC 4648 padded:
+/// `ceil(input_len / 3) * 4`), or `None` if computing it would overflow
+/// `usize`.
+fn checked_base64_encoded_len(input_len: usize) -> Option<usize> {
+    input_len.checked_add(2)?.checked_div(3)?.checked_mul(4)
+}
+
+/// Whether `input_len` raw bytes, once base64-encoded, fit inside herdr's
+/// libghostty-vt OSC 52 capture limit (see [`OSC52_MAX_CAPTURE_BYTES`])
+/// alongside the "c;" kind prefix and the trailing NUL the parser appends.
+/// Factored out (and worked on the byte count, before encoding) so the
+/// boundary can be tested without allocating or emitting real escape
+/// sequences, and so a pathological length can't be encoded just to be
+/// rejected. Uses checked arithmetic throughout rather than a sentinel
+/// fallback, so an overflow is reported as "doesn't fit" instead of being
+/// silently misrepresented as a real length.
+fn osc52_sequence_fits(input_len: usize) -> bool {
+    // The capture holds "c;" (2 bytes) then the base64 payload, then the
+    // parser appends one trailing NUL once the OSC sequence ends.
+    const KIND_PREFIX_BYTES: usize = 2;
+    const TRAILING_NUL_BYTES: usize = 1;
+    let Some(encoded_len) = checked_base64_encoded_len(input_len) else {
+        return false;
+    };
+    let Some(total) = encoded_len
+        .checked_add(KIND_PREFIX_BYTES)
+        .and_then(|t| t.checked_add(TRAILING_NUL_BYTES))
+    else {
+        return false;
+    };
+    total <= OSC52_MAX_CAPTURE_BYTES
 }
 
 fn copy_with(argv: &[&str], text: &str) -> io::Result<()> {
@@ -850,5 +981,55 @@ mod tests {
         delete(&folder, true).unwrap();
         assert!(!renamed.exists() && !folder.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn base64_matches_rfc4648_test_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_handles_unicode_and_embedded_nul_bytes() {
+        // Cross-checked against the shell: `printf '%s' 'héllo→✓' | base64`.
+        assert_eq!(base64_encode("héllo→✓".as_bytes()), "aMOpbGxv4oaS4pyT");
+        // `printf 'a\x00b' | base64`.
+        assert_eq!(base64_encode(b"a\x00b"), "YQBi");
+    }
+
+    #[test]
+    fn osc52_size_check_accepts_up_to_the_limit_and_rejects_past_it() {
+        // libghostty-vt's capture holds "c;" (2 bytes) + the base64 payload
+        // + a trailing NUL (1 byte) within OSC52_MAX_CAPTURE_BYTES
+        // (8_388_608), so the payload budget is 8_388_608 - 3 == 8_388_605
+        // bytes. Base64 output length is always a multiple of 4, so the
+        // largest encoded length that fits is
+        // floor(8_388_605 / 4) * 4 == 2_097_151 * 4 == 8_388_604, i.e.
+        // ceil(n / 3) == 2_097_151; the largest raw n giving that is
+        // 3 * 2_097_151 == 6_291_453.
+        const MAX_FITTING_LEN: usize = 6_291_453;
+        assert!(osc52_sequence_fits(MAX_FITTING_LEN));
+        assert!(!osc52_sequence_fits(MAX_FITTING_LEN + 1));
+    }
+
+    #[test]
+    fn osc52_size_check_rejects_usize_max_without_panicking() {
+        assert!(!osc52_sequence_fits(usize::MAX));
+    }
+
+    #[test]
+    fn osc52_writer_emits_the_complete_terminal_sequence() {
+        let mut bytes = Vec::new();
+        assert_eq!(
+            write_osc52(&mut bytes, "hello").unwrap(),
+            ClipboardWrite::Osc52Unacknowledged
+        );
+        assert_eq!(bytes, b"\x1b]52;c;aGVsbG8=\x07");
+        assert!(write_osc52(Vec::new(), "").is_err());
     }
 }

@@ -672,6 +672,29 @@ pub fn focused_tab(pane_list_json: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The focused pane's workspace id from a `pane list` JSON (flag-safe, else
+/// empty). Creation hooks use this to avoid focusing a workspace or tab the
+/// caller deliberately created in the background.
+pub fn focused_workspace(pane_list_json: &str) -> String {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return String::new();
+    };
+    msg.result
+        .panes
+        .iter()
+        .find(|p| p.focused)
+        .and_then(|p| {
+            p.workspace_id.clone().or_else(|| {
+                p.tab_id
+                    .as_deref()
+                    .and_then(|tab| tab.split_once(':'))
+                    .map(|(workspace, _)| workspace.to_string())
+            })
+        })
+        .filter(|workspace| is_flag_safe(workspace))
+        .unwrap_or_default()
+}
+
 /// The tab containing `pane_id` ("" when absent) — the hide path snoozes it.
 pub fn tab_of(pane_list_json: &str, pane_id: &str) -> String {
     let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
@@ -1477,11 +1500,13 @@ mod tests {
             r#"{FOCUSED},{{"pane_id":"w1:p9","tab_id":"w1:t2"}}"#
         ));
         assert_eq!(focused_tab(&json), "w1:t1");
+        assert_eq!(focused_workspace(&json), "w1");
         assert_eq!(
             live_tabs(&json).into_iter().collect::<Vec<_>>(),
             vec!["w1:t1".to_string(), "w1:t2".to_string()]
         );
         assert_eq!(focused_tab("not json"), "");
+        assert_eq!(focused_workspace("not json"), "");
         assert!(live_tabs("not json").is_empty());
     }
 

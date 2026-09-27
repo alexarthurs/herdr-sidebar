@@ -21,7 +21,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
 
-use herdr_sidebar::actions::{copy_to_clipboard, open_external, reveal};
+use herdr_sidebar::actions::{ClipboardWrite, copy_to_clipboard, open_external, reveal};
 use herdr_sidebar::branch_ui::{
     BranchPicker, FooterZones, PickerAction, draw_git_footer, sync_glyph,
 };
@@ -271,6 +271,44 @@ fn drawer_spec(dref: &DrawerRef) -> Option<String> {
         DrawerRef::Worktree(p) => Some(p.clone()),
         DrawerRef::None => None,
     }
+}
+
+/// An object name safe to pass to git commands. Tags are fully qualified so
+/// their namespace is unambiguous; branch drawer rows can be local or remote,
+/// so they stay in git's displayed short form. Every command call site also
+/// terminates option parsing before this value.
+fn drawer_git_spec(dref: &DrawerRef) -> Option<String> {
+    match dref {
+        DrawerRef::Tag(name) => Some(format!("refs/tags/{name}")),
+        _ => drawer_spec(dref),
+    }
+}
+
+fn drawer_checkout_args(dref: &DrawerRef, spec: &str, git_spec: &str) -> Option<Vec<String>> {
+    match dref {
+        DrawerRef::Branch { .. } => Some(vec![
+            "checkout".into(),
+            "--end-of-options".into(),
+            spec.into(),
+        ]),
+        DrawerRef::Commit(_) | DrawerRef::Tag(_) => Some(vec![
+            "switch".into(),
+            "--detach".into(),
+            "--".into(),
+            git_spec.into(),
+        ]),
+        _ => None,
+    }
+}
+
+fn drawer_reset_args(git_spec: &str) -> Vec<String> {
+    vec![
+        "reset".into(),
+        "--mixed".into(),
+        "--end-of-options".into(),
+        git_spec.into(),
+        "--".into(),
+    ]
 }
 
 /// One discovered repository and its per-repo view state — including its own
@@ -877,11 +915,25 @@ impl App {
             return;
         }
         let Some(ctl) = &self.pane_ctl else { return };
-        if snooze
-            && let Ok(json) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({}))
-        {
-            let tab = herdr_sidebar::launch::tab_of(&json, &ctl.pane_id);
-            herdr_sidebar::snooze::set(&herdr_sidebar::snooze::dir(), &tab);
+        if snooze {
+            let tab = match herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) {
+                Ok(json) => herdr_sidebar::launch::tab_of(&json, &ctl.pane_id),
+                Err(e) => {
+                    self.flash = Some((format!("hide failed: {e}"), true));
+                    return;
+                }
+            };
+            if tab.is_empty() {
+                self.flash = Some(("hide failed: could not resolve this tab".into(), true));
+                return;
+            }
+            // Set the marker BEFORE closing: if it fails, closing anyway
+            // would let the very next focus event re-dock a sidebar the
+            // user just asked to hide.
+            if let Err(e) = herdr_sidebar::snooze::set(&herdr_sidebar::snooze::dir(), &tab) {
+                self.flash = Some((format!("hide failed: {e}"), true));
+                return;
+            }
         }
         let _ = herdr_sidebar::ipc::call_text(
             "pane.close",
@@ -2414,7 +2466,10 @@ impl App {
                     rel
                 };
                 self.flash = Some(match copy_to_clipboard(&text) {
-                    Ok(()) => (format!("copied: {text}"), false),
+                    Ok(ClipboardWrite::Native) => (format!("copied: {text}"), false),
+                    Ok(ClipboardWrite::Osc52Unacknowledged) => {
+                        (format!("sent to terminal clipboard: {text}"), false)
+                    }
                     Err(err) => (format!("copy failed: {err}"), true),
                 });
             }
@@ -2449,13 +2504,14 @@ impl App {
             DrawerRef::Worktree(p) => p.clone(),
             DrawerRef::None => return,
         };
+        let git_spec = drawer_git_spec(&dref).unwrap_or_else(|| spec.clone());
         match action {
             MenuAction::ShowRef => self.open_drawer_ref(kind, index),
             MenuAction::Reveal => reveal(std::path::Path::new(&spec), true),
             MenuAction::RemoveWorktree => self.confirm_git(
                 repo,
                 format!("Remove worktree '{spec}'? (y/N)"),
-                vec!["worktree".into(), "remove".into(), spec],
+                vec!["worktree".into(), "remove".into(), "--".into(), spec],
             ),
             MenuAction::CopyRef => {
                 let text = match &dref {
@@ -2463,36 +2519,48 @@ impl App {
                     _ => spec,
                 };
                 self.flash = Some(match copy_to_clipboard(&text) {
-                    Ok(()) => (format!("copied: {text}"), false),
+                    Ok(ClipboardWrite::Native) => (format!("copied: {text}"), false),
+                    Ok(ClipboardWrite::Osc52Unacknowledged) => {
+                        (format!("sent to terminal clipboard: {text}"), false)
+                    }
                     Err(err) => (format!("copy failed: {err}"), true),
                 });
             }
-            MenuAction::Checkout => self.run_git(repo, &["checkout", &spec]),
-            MenuAction::MergeInto => self.run_git(repo, &["merge", "--no-edit", &spec]),
-            MenuAction::CherryPick => self.run_git(repo, &["cherry-pick", &spec]),
-            MenuAction::Revert => self.run_git(repo, &["revert", "--no-edit", &spec]),
-            MenuAction::StashApply => self.run_git(repo, &["stash", "apply", &spec]),
-            MenuAction::StashPop => self.run_git(repo, &["stash", "pop", &spec]),
-            MenuAction::FetchRemote => self.run_git(repo, &["fetch", &spec]),
+            MenuAction::Checkout => {
+                if let Some(args) = drawer_checkout_args(&dref, &spec, &git_spec) {
+                    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+                    self.run_git(repo, &args);
+                }
+            }
+            MenuAction::MergeInto => {
+                self.run_git(repo, &["merge", "--no-edit", "--", &git_spec]);
+            }
+            MenuAction::CherryPick => self.run_git(repo, &["cherry-pick", "--", &git_spec]),
+            MenuAction::Revert => {
+                self.run_git(repo, &["revert", "--no-edit", "--", &git_spec]);
+            }
+            MenuAction::StashApply => self.run_git(repo, &["stash", "apply", "--", &spec]),
+            MenuAction::StashPop => self.run_git(repo, &["stash", "pop", "--", &spec]),
+            MenuAction::FetchRemote => self.run_git(repo, &["fetch", "--", &spec]),
             MenuAction::ResetHere => self.confirm_git(
                 repo,
                 format!("Reset current branch to {spec} (mixed)? (y/N)"),
-                vec!["reset".into(), "--mixed".into(), spec],
+                drawer_reset_args(&git_spec),
             ),
             MenuAction::DeleteBranch => self.confirm_git(
                 repo,
                 format!("Delete branch '{spec}'? (y/N)"),
-                vec!["branch".into(), "-D".into(), spec],
+                vec!["branch".into(), "-D".into(), "--".into(), spec],
             ),
             MenuAction::StashDrop => self.confirm_git(
                 repo,
                 format!("Drop {spec}? (y/N)"),
-                vec!["stash".into(), "drop".into(), spec],
+                vec!["stash".into(), "drop".into(), "--".into(), spec],
             ),
             MenuAction::DeleteTag => self.confirm_git(
                 repo,
                 format!("Delete tag '{spec}'? (y/N)"),
-                vec!["tag".into(), "-d".into(), spec],
+                vec!["tag".into(), "-d".into(), "--".into(), spec],
             ),
             _ => {}
         }
@@ -2565,12 +2633,12 @@ impl App {
         let Some(repo) = self.repos.get(self.active) else {
             return;
         };
-        let spec = match self.drawers[kind.index()].refs.get(index) {
-            Some(DrawerRef::Commit(h)) => h.clone(),
-            Some(DrawerRef::Stash(n)) => format!("stash@{{{n}}}"),
-            Some(DrawerRef::Branch { name, .. }) => name.clone(),
-            Some(DrawerRef::Tag(t)) => t.clone(),
-            _ => return,
+        let Some(spec) = self.drawers[kind.index()]
+            .refs
+            .get(index)
+            .and_then(drawer_git_spec)
+        else {
+            return;
         };
         let path = (kind == Drawer::FileHistory)
             .then(|| self.history_target.clone())
@@ -2646,16 +2714,7 @@ impl App {
             }
             Row::DrawerLine(kind, i) => {
                 let repo = self.repos.get(self.active)?;
-                let spec = match self.drawers[kind.index()].refs.get(*i)? {
-                    DrawerRef::Commit(h) => h.clone(),
-                    DrawerRef::Stash(n) => format!("stash@{{{n}}}"),
-                    DrawerRef::Branch { name, .. } => name.clone(),
-                    DrawerRef::Tag(t) => t.clone(),
-                    // No `git show` target — these rows don't open a preview.
-                    DrawerRef::None | DrawerRef::Remote { .. } | DrawerRef::Worktree(_) => {
-                        return None;
-                    }
-                };
+                let spec = drawer_git_spec(self.drawers[kind.index()].refs.get(*i)?)?;
                 let path = (*kind == Drawer::FileHistory)
                     .then(|| self.history_target.clone())
                     .flatten();
@@ -3250,11 +3309,19 @@ impl App {
         self.last_height = area.height;
 
         if self.repos.is_empty() {
-            let text = format!(
-                "Not a git repository.\n\n{}\n\nOpen this pane inside a repo,\nor press q to quit.",
-                self.discover_err,
-            );
-            frame.render_widget(Paragraph::new(text).dim().wrap(Wrap { trim: false }), area);
+            self.zones = ClickZones::default();
+            let [activity, body] = no_repo_layout(area, self.merged());
+            if self.merged() {
+                self.draw_activity_bar(frame, activity);
+            }
+            let hint = if self.merged() {
+                "Press 1 for Explorer, 2 for Search, or q to quit."
+            } else {
+                "Open this pane inside a repo,\nor press q to quit."
+            };
+            let text = format!("Not a git repository.\n\n{}\n\n{hint}", self.discover_err);
+            frame.render_widget(Paragraph::new(text).dim().wrap(Wrap { trim: false }), body);
+            self.draw_overlay(frame);
             return;
         }
 
@@ -3379,6 +3446,10 @@ impl App {
             footer_button,
         );
 
+        self.draw_overlay(frame);
+    }
+
+    fn draw_overlay(&mut self, frame: &mut Frame) {
         match self.overlay {
             Some(Overlay::BranchPicker(_)) => {
                 if let Some(Overlay::BranchPicker(picker)) = self.overlay.as_mut() {
@@ -4543,6 +4614,14 @@ fn pane_focused_in(pane_list_json: &str, pane_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn no_repo_layout(area: Rect, merged: bool) -> [Rect; 2] {
+    Layout::vertical([
+        Constraint::Length(if merged { 3 } else { 0 }),
+        Constraint::Min(0),
+    ])
+    .areas(area)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4758,6 +4837,114 @@ mod tests {
             parse_drawer_ref(Drawer::Worktrees, "(none)"),
             DrawerRef::None
         );
+    }
+
+    #[test]
+    fn drawer_git_specs_preserve_branch_kind_and_qualify_tags() {
+        assert_eq!(
+            drawer_git_spec(&DrawerRef::Branch {
+                name: "--upload-pack=bad".into(),
+                current: false,
+            })
+            .as_deref(),
+            Some("--upload-pack=bad")
+        );
+        assert_eq!(
+            drawer_git_spec(&DrawerRef::Tag("--output=pwned.txt".into())).as_deref(),
+            Some("refs/tags/--output=pwned.txt")
+        );
+        assert_eq!(
+            drawer_git_spec(&DrawerRef::Commit("deadbee".into())).as_deref(),
+            Some("deadbee")
+        );
+    }
+
+    #[test]
+    fn drawer_checkout_and_reset_arguments_work_in_a_real_repo() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-drawer-git-actions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        for message in ["one", "two"] {
+            assert!(
+                git(&[
+                    "-c",
+                    "user.email=test@example.com",
+                    "-c",
+                    "user.name=Test",
+                    "commit",
+                    "--allow-empty",
+                    "-q",
+                    "-m",
+                    message,
+                ])
+                .status
+                .success()
+            );
+        }
+        let second = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let first = String::from_utf8(git(&["rev-parse", "HEAD^"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let reset = drawer_reset_args(&first);
+        let reset = reset.iter().map(String::as_str).collect::<Vec<_>>();
+        assert!(git(&reset).status.success());
+        assert_eq!(
+            String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim(),
+            first
+        );
+
+        assert!(
+            git(&["update-ref", "refs/remotes/origin/topic", &second])
+                .status
+                .success()
+        );
+        let remote = DrawerRef::Branch {
+            name: "origin/topic".into(),
+            current: false,
+        };
+        let checkout = drawer_checkout_args(&remote, "origin/topic", "origin/topic").unwrap();
+        let checkout = checkout.iter().map(String::as_str).collect::<Vec<_>>();
+        assert!(git(&checkout).status.success());
+        assert_eq!(
+            String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim(),
+            second
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unified_no_repo_layout_keeps_the_activity_bar_visible() {
+        let area = Rect::new(4, 7, 40, 20);
+        let [activity, body] = no_repo_layout(area, true);
+        assert_eq!(activity, Rect::new(4, 7, 40, 3));
+        assert_eq!(body, Rect::new(4, 10, 40, 17));
+
+        let [activity, body] = no_repo_layout(area, false);
+        assert_eq!(activity.height, 0);
+        assert_eq!(body, area);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthChar;
 
-use crate::actions::{copy_to_clipboard, paste_from_clipboard};
+use crate::actions::{ClipboardWrite, copy_to_clipboard, paste_from_clipboard};
 
 const TAB_WIDTH: usize = 4;
 
@@ -219,7 +219,10 @@ impl Editor {
                         line
                     });
                     self.status = Some(match copy_to_clipboard(&text) {
-                        Ok(()) => "copied to clipboard".into(),
+                        Ok(ClipboardWrite::Native) => "copied to clipboard".into(),
+                        Ok(ClipboardWrite::Osc52Unacknowledged) => {
+                            "sent to terminal clipboard".into()
+                        }
                         Err(e) => format!("clipboard unavailable: {e}"),
                     });
                     return EditAction::None;
@@ -227,10 +230,20 @@ impl Editor {
                 KeyCode::Char('x') => {
                     if let Some(text) = self.selected_text() {
                         match copy_to_clipboard(&text) {
-                            Ok(()) => {
+                            Ok(ClipboardWrite::Native) => {
                                 self.delete_selection();
                                 self.mark_changed();
                                 self.status = Some("cut to clipboard".into());
+                            }
+                            Ok(ClipboardWrite::Osc52Unacknowledged) => {
+                                // The editor has no undo, and an OSC 52 write is never
+                                // acknowledged by the terminal: deleting here on an
+                                // unconfirmed copy could destroy text that never made
+                                // it to the clipboard. Leave the selection in place.
+                                self.status = Some(
+                                    "sent to terminal clipboard (cut skipped: copy can't be confirmed over SSH)"
+                                        .into(),
+                                );
                             }
                             Err(e) => self.status = Some(format!("clipboard unavailable: {e}")),
                         }

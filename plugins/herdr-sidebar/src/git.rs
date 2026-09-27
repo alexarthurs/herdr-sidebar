@@ -257,7 +257,11 @@ impl Git {
     /// belongs to the nested repo, never to the parent — the boundary rule
     /// issue #20 asks for.
     pub fn owner_of(path: &Path) -> Result<Git, String> {
-        let dir = if path.is_dir() {
+        // Directory symlinks expand like folders in the Explorer, but the Git
+        // object is the link at its parent path—not the target directory.
+        let is_symlink =
+            std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink());
+        let dir = if path.is_dir() && !is_symlink {
             path
         } else {
             path.parent().unwrap_or(path)
@@ -412,9 +416,14 @@ impl Git {
             return Ok(());
         }
         let args = if branch.remote {
-            vec!["checkout", "--track", branch.name.as_str()]
+            vec![
+                "checkout",
+                "--track",
+                "--end-of-options",
+                branch.name.as_str(),
+            ]
         } else {
-            vec!["checkout", branch.name.as_str()]
+            vec!["checkout", "--end-of-options", branch.name.as_str()]
         };
         run_in(&self.root, &args).map(drop)
     }
@@ -1094,6 +1103,23 @@ mod tests {
         })
         .unwrap();
         assert_eq!(git.status().unwrap().branch, original);
+        let topic = run_in(&git.root, &["rev-parse", "topic"])
+            .unwrap()
+            .trim()
+            .to_string();
+        run_in(&git.root, &["remote", "add", "origin", "."]).unwrap();
+        run_in(
+            &git.root,
+            &["update-ref", "refs/remotes/origin/remote-topic", &topic],
+        )
+        .unwrap();
+        git.checkout_branch(&Branch {
+            name: "origin/remote-topic".into(),
+            current: false,
+            remote: true,
+        })
+        .unwrap();
+        assert_eq!(git.status().unwrap().branch, "remote-topic");
         let _ = std::fs::remove_dir_all(&git.root);
     }
 
@@ -1408,6 +1434,33 @@ mod tests {
             inner_root
         );
         let _ = std::fs::remove_dir_all(&outer.root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_symlink_is_owned_and_staged_as_the_link_not_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let git = repo_with_head("directory-symlink-owner");
+        let target = std::env::temp_dir().join(format!(
+            "herdr-directory-symlink-target-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("outside.txt"), "outside").unwrap();
+        let link = git.root.join("linked");
+        symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            std::fs::canonicalize(Git::owner_of(&link).unwrap().root).unwrap(),
+            std::fs::canonicalize(&git.root).unwrap()
+        );
+        assert_eq!(git.stage_under(&link).unwrap().count, 1);
+        assert_eq!(git.status().unwrap().staged[0].path, "linked");
+
+        let _ = std::fs::remove_dir_all(&git.root);
+        let _ = std::fs::remove_dir_all(target);
     }
 
     #[test]
