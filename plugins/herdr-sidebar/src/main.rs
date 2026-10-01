@@ -45,6 +45,10 @@ fn main() -> std::io::Result<()> {
         Some("--quick-open") => {
             return ensure::run(ensure::Mode::Activate(ensure::Target::QuickOpen));
         }
+        Some("--update-latest") => {
+            return herdr_sidebar::updates::run().map_err(std::io::Error::other);
+        }
+        Some("--refresh-sidebars") => return herdr_sidebar::updates::refresh(),
         Some("--run-custom-editor") => return herdr_sidebar::actions::run_configured_editor(),
         Some("--launch-decision") => {
             // Optional second arg picks the source-control decision; default

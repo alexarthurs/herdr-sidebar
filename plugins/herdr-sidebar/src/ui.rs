@@ -488,6 +488,8 @@ pub enum TitleAction {
     NewFolder,
     Refresh,
     CollapseAll,
+    ViewAsTree,
+    ViewAsList,
 }
 
 /// How long the title-bar action buttons stay visible after the last mouse
@@ -510,10 +512,14 @@ pub fn title_action_icon(theme: IconTheme, action: TitleAction) -> &'static str 
         (IconTheme::Material, TitleAction::NewFolder) => "\u{ea80}", //  cod-new_folder
         (IconTheme::Material, TitleAction::Refresh) => "\u{eb37}", //  cod-refresh
         (IconTheme::Material, TitleAction::CollapseAll) => "\u{eac5}", //  cod-collapse_all
+        (IconTheme::Material, TitleAction::ViewAsTree) => "\u{eb86}", //  cod-list_tree
+        (IconTheme::Material, TitleAction::ViewAsList) => "\u{eb84}", //  cod-list_flat
         (IconTheme::Emoji, TitleAction::NewFile) => "📄",
         (IconTheme::Emoji, TitleAction::NewFolder) => "📁",
         (IconTheme::Emoji, TitleAction::Refresh) => "⟳",
         (IconTheme::Emoji, TitleAction::CollapseAll) => "⊟",
+        (IconTheme::Emoji, TitleAction::ViewAsTree) => "🌲",
+        (IconTheme::Emoji, TitleAction::ViewAsList) => "☰",
     }
 }
 

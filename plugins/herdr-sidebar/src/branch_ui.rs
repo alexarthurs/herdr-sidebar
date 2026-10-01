@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::Style;
@@ -8,7 +8,8 @@ use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
 use crate::git::{Branch, Git, Status};
 use crate::icons::IconTheme;
 use crate::ui::{
-    branch_icon, hits, hover_style, keep_visible_scroll, palette, selection_style, truncate_to,
+    branch_icon, hits, hover_style, input_tail, keep_visible_scroll, palette, selection_style,
+    truncate_to,
 };
 
 const SYNC_FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
@@ -29,7 +30,12 @@ pub enum PickerAction {
     None,
     Close,
     Checkout(Branch),
+    Create(String),
 }
+
+/// Mirrors the Explorer's New File / New Folder prompts: a row that opens a
+/// one-line name field.
+const NEW_BRANCH_ROW: &str = "New branch…";
 
 pub struct BranchPicker {
     pub git: Git,
@@ -37,6 +43,9 @@ pub struct BranchPicker {
     selected: usize,
     scroll: usize,
     rect: Rect,
+    /// `Some` while the name field is open; the picker list is frozen behind
+    /// it and every keystroke belongs to the field.
+    naming: Option<String>,
 }
 
 impl BranchPicker {
@@ -48,17 +57,68 @@ impl BranchPicker {
         let selected = branches
             .iter()
             .position(|branch| branch.current)
-            .unwrap_or(0);
+            .map_or(0, |index| index + 1);
         Ok(Self {
             git,
             branches,
             selected,
             scroll: 0,
             rect: Rect::default(),
+            naming: None,
         })
     }
 
+    fn row_count(&self) -> usize {
+        self.branches.len() + 1
+    }
+
+    fn branch_at(&self, row: usize) -> Option<&Branch> {
+        self.branches.get(row.checked_sub(1)?)
+    }
+
+    fn activate(&mut self, row: usize) -> PickerAction {
+        match self.branch_at(row) {
+            Some(branch) => PickerAction::Checkout(branch.clone()),
+            None => {
+                self.naming = Some(String::new());
+                PickerAction::None
+            }
+        }
+    }
+
     pub fn key(&mut self, key: KeyEvent) -> PickerAction {
+        // The name field owns every key while it is open, so a branch called
+        // `k` cannot be typed into a list that reads k as "move up".
+        if let Some(name) = &mut self.naming {
+            return match key.code {
+                KeyCode::Esc => {
+                    self.naming = None;
+                    PickerAction::None
+                }
+                KeyCode::Enter => {
+                    let typed = name.trim().to_string();
+                    if typed.is_empty() {
+                        PickerAction::None
+                    } else {
+                        self.naming = None;
+                        PickerAction::Create(typed)
+                    }
+                }
+                KeyCode::Backspace => {
+                    name.pop();
+                    PickerAction::None
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        || key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    name.push(c);
+                    PickerAction::None
+                }
+                _ => PickerAction::None,
+            };
+        }
+
         match key.code {
             KeyCode::Esc => PickerAction::Close,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -66,7 +126,7 @@ impl BranchPicker {
                 PickerAction::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.selected = (self.selected + 1).min(self.branches.len().saturating_sub(1));
+                self.selected = (self.selected + 1).min(self.row_count().saturating_sub(1));
                 PickerAction::None
             }
             KeyCode::Home => {
@@ -74,28 +134,38 @@ impl BranchPicker {
                 PickerAction::None
             }
             KeyCode::End => {
-                self.selected = self.branches.len().saturating_sub(1);
+                self.selected = self.row_count().saturating_sub(1);
                 PickerAction::None
             }
-            KeyCode::Enter | KeyCode::Char(' ') => self
-                .branches
-                .get(self.selected)
-                .cloned()
-                .map(PickerAction::Checkout)
-                .unwrap_or(PickerAction::None),
+            KeyCode::Enter | KeyCode::Char(' ') => self.activate(self.selected),
             _ => PickerAction::None,
         }
     }
 
     pub fn mouse(&mut self, mouse: MouseEvent) -> PickerAction {
+        // While naming, the list behind the field is inert: a stray click or
+        // scroll must not switch branches out from under a half-typed name.
+        if self.naming.is_some() {
+            return match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left)
+                    if !hits(self.rect, mouse.column, mouse.row) =>
+                {
+                    self.naming = None;
+                    PickerAction::Close
+                }
+                _ => PickerAction::None,
+            };
+        }
+
         let inner = self.rect.inner(ratatui::layout::Margin::new(1, 1));
+        let rows = self.row_count();
         let item_at = |row: u16, col: u16| {
             (col >= inner.x
                 && col < inner.x + inner.width
                 && row >= inner.y
                 && row < inner.y + inner.height)
                 .then(|| self.scroll + usize::from(row - inner.y))
-                .filter(|index| *index < self.branches.len())
+                .filter(|index| *index < rows)
         };
         match mouse.kind {
             MouseEventKind::Moved => {
@@ -109,19 +179,14 @@ impl BranchPicker {
                 PickerAction::None
             }
             MouseEventKind::ScrollDown => {
-                self.selected = (self.selected + 3).min(self.branches.len().saturating_sub(1));
+                self.selected = (self.selected + 3).min(rows.saturating_sub(1));
                 PickerAction::None
             }
-            MouseEventKind::Down(MouseButton::Left) => item_at(mouse.row, mouse.column)
-                .and_then(|index| self.branches.get(index).cloned())
-                .map(PickerAction::Checkout)
-                .unwrap_or_else(|| {
-                    if hits(self.rect, mouse.column, mouse.row) {
-                        PickerAction::None
-                    } else {
-                        PickerAction::Close
-                    }
-                }),
+            MouseEventKind::Down(MouseButton::Left) => match item_at(mouse.row, mouse.column) {
+                Some(index) => self.activate(index),
+                None if hits(self.rect, mouse.column, mouse.row) => PickerAction::None,
+                None => PickerAction::Close,
+            },
             _ => PickerAction::None,
         }
     }
@@ -132,11 +197,12 @@ impl BranchPicker {
             .branches
             .iter()
             .map(|branch| Span::raw(branch.name.as_str()).width() + 13)
+            .chain(std::iter::once(Span::raw(NEW_BRANCH_ROW).width() + 13))
             .max()
             .unwrap_or(28)
             .max(28) as u16;
         let width = desired_width.min(area.width);
-        let height = (self.branches.len() as u16 + 2).min(area.height).min(18);
+        let height = (self.row_count() as u16 + 2).min(area.height).min(18);
         let popup = Rect::new(
             (area.width.saturating_sub(width)) / 2,
             (area.height.saturating_sub(height)) / 3,
@@ -145,14 +211,73 @@ impl BranchPicker {
         );
         self.rect = popup;
         let visible = usize::from(height.saturating_sub(2));
-        self.scroll = keep_visible_scroll(self.selected, visible, self.branches.len());
+        self.scroll = keep_visible_scroll(self.selected, visible, self.row_count());
         let inner_width = usize::from(width.saturating_sub(2));
-        let items: Vec<ListItem> = self
+
+        if let Some(name) = &self.naming {
+            // The list is only as wide as its longest branch name, which is far
+            // too narrow for a name being typed — and a block TITLE is silently
+            // clipped rather than wrapped, so keep the title short and give the
+            // field its own minimum width.
+            const FIELD_MIN: u16 = 40;
+            let field_width = popup.width.max(FIELD_MIN).min(area.width);
+            let field = Rect::new(
+                (area.width.saturating_sub(field_width)) / 2,
+                popup.y,
+                field_width,
+                3.min(area.height),
+            );
+            self.rect = field;
+            let field_inner = usize::from(field_width.saturating_sub(2));
+
+            // Drop the hint before the name loses room, the way the Explorer's
+            // prompts do.
+            let hint = "  ⏎ ok · esc cancel";
+            let typed = input_tail(name, field_inner.saturating_sub(2));
+            let hint_fits =
+                Span::raw(typed.as_str()).width() + Span::raw(hint).width() + 2 <= field_inner;
+
+            let mut spans = vec![
+                Span::raw(" "),
+                // Tail, not head: a long name must keep its end — where the
+                // cursor is — on screen, exactly like the Explorer prompts.
+                Span::raw(typed),
+                Span::styled("█", Style::default().dim()),
+            ];
+            if hint_fits {
+                spans.push(Span::styled(hint, Style::default().dim()));
+            }
+
+            frame.render_widget(Clear, field);
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)).block(
+                    Block::bordered()
+                        .title(" New branch ")
+                        .border_style(Style::default().fg(palette().accent)),
+                ),
+                field,
+            );
+            return;
+        }
+
+        let new_row = std::iter::once({
+            let label = truncate_to(NEW_BRANCH_ROW.to_string(), inner_width.saturating_sub(3));
+            let line = Line::from(vec![
+                Span::raw("+ "),
+                Span::styled(label, Style::default().fg(palette().accent)),
+            ]);
+            if self.selected == 0 {
+                ListItem::new(line).style(selection_style(true))
+            } else {
+                ListItem::new(line)
+            }
+        });
+
+        let branch_rows = self
             .branches
             .iter()
             .enumerate()
-            .skip(self.scroll)
-            .take(visible)
+            .map(|(index, branch)| (index + 1, branch))
             .map(|(index, branch)| {
                 let mark = if branch.current { "✓ " } else { "  " };
                 let remote = if branch.remote { "  remote" } else { "" };
@@ -173,7 +298,13 @@ impl BranchPicker {
                 } else {
                     ListItem::new(line)
                 }
-            })
+            });
+
+        // Scrolling covers the combined list; New branch… is not pinned.
+        let items: Vec<ListItem> = new_row
+            .chain(branch_rows)
+            .skip(self.scroll)
+            .take(visible)
             .collect();
         frame.render_widget(Clear, popup);
         frame.render_widget(
@@ -242,10 +373,11 @@ pub fn draw_git_footer(
 mod tests {
     use super::*;
 
-    #[test]
-    fn picker_starts_on_current_branch() {
+    /// A throwaway one-commit repository, so the tests never depend on the
+    /// checkout being a git repo (release tarballs are not).
+    fn temp_repo(label: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "herdr-sidebar-branch-picker-{}-{}",
+            "herdr-sidebar-branch-picker-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -276,9 +408,15 @@ mod tests {
                     .success()
             );
         }
+        root
+    }
+
+    #[test]
+    fn picker_starts_on_current_branch() {
+        let root = temp_repo("current");
         let git = Git::discover(&root).unwrap();
         let picker = BranchPicker::open(git).unwrap();
-        assert!(picker.branches[picker.selected].current);
+        assert!(picker.branch_at(picker.selected).unwrap().current);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -286,5 +424,31 @@ mod tests {
     fn sync_glyph_restores_refresh_icon_when_idle() {
         assert_eq!(sync_glyph(false), "⟳");
         assert!(SYNC_FRAMES.contains(&sync_glyph(true)));
+    }
+
+    #[test]
+    fn branch_name_input_owns_navigation_keys_and_preserves_altgr() {
+        let root = temp_repo("naming");
+        let mut picker = BranchPicker::open(Git::discover(&root).unwrap()).unwrap();
+        assert!(matches!(picker.activate(0), PickerAction::None));
+        for character in "jk/topic".chars() {
+            picker.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        picker.key(KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert_eq!(picker.naming.as_deref(), Some("jk/topic@"));
+        assert!(
+            matches!(picker.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            PickerAction::Create(name) if name == "jk/topic@")
+        );
+        picker.activate(0);
+        assert!(matches!(
+            picker.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            PickerAction::None
+        ));
+        assert!(picker.naming.is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

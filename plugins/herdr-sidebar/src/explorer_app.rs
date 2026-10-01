@@ -282,6 +282,8 @@ struct ContentSearchResult {
 /// One row of the Settings modal.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Setting {
+    Version,
+    Update,
     UnifiedSidebar,
     DockRight,
     SidebarWidth,
@@ -1297,6 +1299,7 @@ impl App {
                 self.scroll = 0;
                 self.rebuild();
             }
+            TitleAction::ViewAsTree | TitleAction::ViewAsList => {}
         }
     }
 
@@ -1891,6 +1894,19 @@ impl App {
                 }
                 self.overlay = self.suspended_search.take();
             }
+            PickerAction::Create(name) => {
+                let Some(Overlay::BranchPicker(picker)) = self.overlay.take() else {
+                    return;
+                };
+                match picker.git.create_branch(&name) {
+                    Ok(()) => {
+                        self.notice = Some(format!("created {name}"));
+                        self.refresh_tree();
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+                self.overlay = self.suspended_search.take();
+            }
         }
     }
 
@@ -1938,6 +1954,7 @@ impl App {
     // ---- Settings modal ----
 
     fn open_settings(&mut self) {
+        herdr_sidebar::updates::check();
         self.suspend_search_for_modal();
         self.overlay = Some(Overlay::Settings {
             selected: 0,
@@ -2389,7 +2406,15 @@ impl App {
 
     /// The modal's rows for the current state.
     fn settings_rows(&self) -> Vec<SettingRow> {
+        let update = herdr_sidebar::updates::row();
         vec![
+            (
+                Setting::Version,
+                "Sidebar version",
+                herdr_sidebar::updates::VERSION.into(),
+                false,
+            ),
+            (Setting::Update, update.0, update.1, update.2),
             (
                 Setting::UnifiedSidebar,
                 "Unified sidebar",
@@ -2554,6 +2579,14 @@ impl App {
             return;
         }
         match setting {
+            Setting::Version => {}
+            Setting::Update => {
+                self.notice = Some(
+                    herdr_sidebar::updates::activate()
+                        .map(|_| "Update requested".into())
+                        .unwrap_or_else(|error| error),
+                );
+            }
             Setting::UnifiedSidebar => {
                 // The pane layout changes underneath the modal; close it.
                 self.overlay = None;
@@ -3394,8 +3427,10 @@ impl App {
 
     /// Esc: close the preview pane in this tab, if one is open.
     fn close_preview(&mut self) {
-        if let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) {
-            herdr_sidebar::viewer::close_in_tab(&pane_id);
+        if let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone())
+            && let Some(notice) = herdr_sidebar::viewer::close_in_tab(&pane_id)
+        {
+            self.notice = Some(notice);
         }
     }
 

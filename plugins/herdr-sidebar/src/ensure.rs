@@ -145,6 +145,252 @@ impl LaunchLock {
 
 use crate::snooze;
 
+/// One tab's sidebars, as the refresh found them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RefreshTab {
+    tab: String,
+    /// (pane id, shows Source Control only)
+    sidebars: Vec<(String, bool)>,
+}
+
+/// What the refresh will do: tabs it can restart, and tabs whose ONLY panes
+/// are sidebars (closing them would close the tab, so they keep the old
+/// build until the tab is next used and reported as such).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RefreshPlan {
+    tabs: Vec<RefreshTab>,
+    sidebar_only: Vec<(String, usize)>,
+}
+
+/// What a refresh did. `kept` sidebars did not close (a draft could not be
+/// saved, or the TUI is not responding) and still run the old build; nothing
+/// is ever killed to get past them.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RefreshReport {
+    pub refreshed: usize,
+    pub kept: usize,
+    pub errors: Vec<String>,
+}
+
+impl RefreshReport {
+    pub fn is_complete(&self) -> bool {
+        self.kept == 0 && self.errors.is_empty()
+    }
+}
+
+/// The tabs to refresh: every tab holding a sidebar plus at least one other
+/// pane (closing a tab's only pane would close the tab). Preview, editor,
+/// inline and takeover viewers are never closed — they may hold unsaved
+/// buffers — and simply get a fresh sidebar docked beside them.
+fn refresh_plan(panes_json: &str) -> Result<RefreshPlan, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(launch::strip_bom(panes_json)).map_err(|error| error.to_string())?;
+    let panes = value["result"]["panes"]
+        .as_array()
+        .ok_or("missing pane list")?;
+    let mut tabs = std::collections::BTreeMap::<String, Vec<(String, bool)>>::new();
+    for pane in panes {
+        let tokens = &pane["tokens"];
+        if tokens[crate::viewer::METADATA_SOURCE].is_string() {
+            continue;
+        }
+        let explorer = tokens[launch::METADATA_SOURCE].is_string();
+        let git = tokens[launch::SC_METADATA_SOURCE].is_string();
+        if (explorer || git)
+            && let (Some(id), Some(tab)) = (pane["pane_id"].as_str(), pane["tab_id"].as_str())
+        {
+            tabs.entry(tab.into())
+                .or_default()
+                .push((id.into(), !explorer));
+        }
+    }
+    let mut plan = RefreshPlan::default();
+    for (tab, sidebars) in tabs {
+        let has_other = panes.iter().any(|pane| {
+            pane["tab_id"] == tab.as_str()
+                && !sidebars
+                    .iter()
+                    .any(|(id, _)| pane["pane_id"] == id.as_str())
+        });
+        if has_other {
+            plan.tabs.push(RefreshTab { tab, sidebars });
+        } else {
+            plan.sidebar_only.push((tab, sidebars.len()));
+        }
+    }
+    Ok(plan)
+}
+
+/// Everything `refresh_with` needs from herdr, injectable for tests.
+trait RefreshHost {
+    fn list(&mut self) -> Result<String, String>;
+    /// Ask a sidebar to save its drafts and close itself (Ctrl+Q). Never a
+    /// hard close: even a pane that looked "starting" in an older snapshot may
+    /// be running by now, and one that never reacts is simply kept.
+    fn request_close(&mut self, pane: &str) -> Result<(), String>;
+    fn open(&mut self, panes_json: &str, tab: &str, view: View) -> Result<(), String>;
+    fn wait(&mut self);
+}
+
+/// 50 x 100ms: a generous bound for every sidebar to save and close.
+const REFRESH_CLOSE_WAIT_STEPS: usize = 50;
+
+fn refresh_with(host: &mut impl RefreshHost) -> Result<RefreshReport, String> {
+    let plan = refresh_plan(&host.list()?)?;
+    let mut report = RefreshReport::default();
+    for (tab, count) in &plan.sidebar_only {
+        report.kept += count;
+        report.errors.push(format!(
+            "{tab}: the sidebar is the tab's only pane; add another pane and retry"
+        ));
+    }
+    // Ask every sidebar first, so they all save and close in parallel.
+    let mut asked = Vec::new();
+    for tab in &plan.tabs {
+        for (id, git) in &tab.sidebars {
+            match host.request_close(id) {
+                Ok(()) => asked.push((tab.tab.clone(), id.clone(), *git)),
+                Err(error) => {
+                    report.kept += 1;
+                    report.errors.push(format!("{}: {error}", tab.tab));
+                }
+            }
+        }
+    }
+    // A bounded wait for them to close themselves. This is a one-off
+    // maintenance action, not a focus hook, so a short wait is acceptable; a
+    // sidebar that never closes is left running, never killed.
+    let mut snapshot = host.list()?;
+    for _ in 0..REFRESH_CLOSE_WAIT_STEPS {
+        if asked.iter().all(|(_, id, _)| !pane_present(&snapshot, id)) {
+            break;
+        }
+        host.wait();
+        snapshot = host.list()?;
+    }
+    let old: Vec<&str> = asked.iter().map(|(_, id, _)| id.as_str()).collect();
+    for tab in &plan.tabs {
+        let mut views = std::collections::BTreeSet::new();
+        for (tab_id, id, git) in asked.iter().filter(|(tab_id, ..)| *tab_id == tab.tab) {
+            if pane_present(&snapshot, id) {
+                report.kept += 1;
+                report
+                    .errors
+                    .push(format!("{tab_id}: a sidebar kept running (unsaved draft?)"));
+            } else {
+                views.insert(*git);
+            }
+        }
+        // Reopen per tab, independently: one failure never strands the rest.
+        for git in views {
+            let view = if git {
+                View::SourceControl
+            } else {
+                View::Explorer
+            };
+            let opened = host
+                .list()
+                .and_then(|fresh| host.open(&fresh, &tab.tab, view));
+            // `open` can return Ok without docking anything (no pane left in
+            // scope, a split that came back empty): count only a sidebar that
+            // is really there now.
+            let verified = opened
+                .and_then(|()| host.list())
+                .map(|after| fresh_sidebar_in(&after, &tab.tab, view, &old));
+            match verified {
+                Ok(true) => report.refreshed += 1,
+                Ok(false) => report
+                    .errors
+                    .push(format!("{}: no sidebar appeared after reopening", tab.tab)),
+                Err(error) => report
+                    .errors
+                    .push(format!("{}: reopen failed: {error}", tab.tab)),
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// A sidebar for `view` in `tab` that is not one of the panes just closed.
+fn fresh_sidebar_in(panes_json: &str, tab: &str, view: View, old: &[&str]) -> bool {
+    let token = match view {
+        View::SourceControl => launch::SC_METADATA_SOURCE,
+        View::Explorer => launch::METADATA_SOURCE,
+    };
+    serde_json::from_str::<serde_json::Value>(launch::strip_bom(panes_json))
+        .ok()
+        .and_then(|value| {
+            value["result"]["panes"].as_array().map(|panes| {
+                panes.iter().any(|pane| {
+                    pane["tab_id"] == tab
+                        && pane["tokens"][token].is_string()
+                        && pane["pane_id"]
+                            .as_str()
+                            .is_some_and(|id| !old.contains(&id))
+                })
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Whether `pane_id` is in a `pane.list` snapshot. An unreadable snapshot
+/// counts as present: never reopen over a pane that may still be there.
+fn pane_present(panes_json: &str, pane_id: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(launch::strip_bom(panes_json))
+        .ok()
+        .and_then(|value| {
+            value["result"]["panes"].as_array().map(|panes| {
+                panes
+                    .iter()
+                    .any(|pane| pane["pane_id"].as_str() == Some(pane_id))
+            })
+        })
+        .unwrap_or(true)
+}
+
+fn ipc_ok(response: &str) -> Result<(), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(launch::strip_bom(response)).map_err(|error| error.to_string())?;
+    match value.get("error") {
+        Some(error) => Err(error.to_string()),
+        None => Ok(()),
+    }
+}
+
+struct LiveRefresh;
+
+impl RefreshHost for LiveRefresh {
+    fn list(&mut self) -> Result<String, String> {
+        ipc::call_text("pane.list", serde_json::json!({})).map_err(|error| error.to_string())
+    }
+
+    fn request_close(&mut self, pane: &str) -> Result<(), String> {
+        let response = ipc::call_text(
+            "pane.send_input",
+            serde_json::json!({ "pane_id": pane, "text": "", "keys": ["ctrl+q"] }),
+        )
+        .map_err(|error| error.to_string())?;
+        ipc_ok(&response)
+    }
+
+    fn open(&mut self, panes_json: &str, tab: &str, view: View) -> Result<(), String> {
+        open(panes_json, false, tab, view, None, true).map_err(|error| error.to_string())
+    }
+
+    fn wait(&mut self) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Restart every docked sidebar on the installed build. Sidebars close
+/// themselves gracefully (Ctrl+Q saves drafts first); preview, editor, inline
+/// and takeover viewers are never touched.
+pub fn refresh_all() -> std::io::Result<RefreshReport> {
+    let _lock = LaunchLock::acquire(true)
+        .ok_or_else(|| std::io::Error::other("could not lock sidebar refresh"))?;
+    refresh_with(&mut LiveRefresh).map_err(std::io::Error::other)
+}
+
 /// Quiet mode (hooks): make sure the focused tab has an Explorer, never moving
 /// focus, and respecting a tab the user toggled closed. Toggle mode (the
 /// action): open-or-focus-or-close, like VS Code's explorer shortcut.
@@ -188,6 +434,11 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
         launch::event_scope_with_tab_context(&event_json, &panes, &context_tab)
     };
     let tab = snooze_tab_for_scope(&panes, &scope);
+    if !tab.is_empty() {
+        // Budgeted, and never touches a viewer that is still present.
+        crate::takeover::recover_locked(&tab, &panes);
+        panes = ipc::call_text("pane.list", serde_json::json!({}))?;
+    }
     let snooze_dir = snooze::dir();
     let live_tabs = launch::live_tabs(&panes);
     snooze::migrate_legacy(&snooze_dir, &live_tabs);
@@ -676,9 +927,197 @@ fn full_height_repair(pane_id: &str, dock_right: bool) {
     }
 }
 
+fn must_wait_for_lock(explicit: bool, event_json: &str) -> bool {
+    explicit || launch::event_kind(event_json) == "tab_created"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A simulated herdr for `refresh_with`: panes are (id, tab, tokens).
+    /// Sidebars in `closes` save and close themselves a few waits after
+    /// Ctrl+Q; everything else ignores it (unsaved draft, hung TUI, shell).
+    #[derive(Default)]
+    struct FakeRefresh {
+        panes: Vec<(String, String, serde_json::Value)>,
+        closes: std::collections::BTreeMap<String, usize>,
+        asked: Vec<String>,
+        refuse_input: Vec<String>,
+        open_noop: Vec<String>,
+        open_fails: Vec<String>,
+        next: usize,
+    }
+
+    impl FakeRefresh {
+        fn pane(&mut self, id: &str, tab: &str, tokens: serde_json::Value) {
+            self.panes.push((id.into(), tab.into(), tokens));
+        }
+        fn has(&self, id: &str) -> bool {
+            self.panes.iter().any(|(pane, ..)| pane == id)
+        }
+    }
+
+    impl RefreshHost for FakeRefresh {
+        fn list(&mut self) -> Result<String, String> {
+            let panes: Vec<_> = self
+                .panes
+                .iter()
+                .map(|(id, tab, tokens)| serde_json::json!({"pane_id": id, "tab_id": tab, "tokens": tokens}))
+                .collect();
+            Ok(serde_json::json!({"result": {"panes": panes}}).to_string())
+        }
+
+        fn request_close(&mut self, pane: &str) -> Result<(), String> {
+            if self.refuse_input.iter().any(|id| id == pane) {
+                return Err("input rejected".into());
+            }
+            self.asked.push(pane.into());
+            Ok(())
+        }
+
+        fn open(&mut self, _: &str, tab: &str, view: View) -> Result<(), String> {
+            if self.open_fails.iter().any(|t| t == tab) {
+                return Err("split failed".into());
+            }
+            if self.open_noop.iter().any(|t| t == tab) {
+                return Ok(()); // like `open` when nothing is in scope
+            }
+            self.next += 1;
+            let token = match view {
+                View::Explorer => launch::METADATA_SOURCE,
+                View::SourceControl => launch::SC_METADATA_SOURCE,
+            };
+            let id = format!("new{}", self.next);
+            self.pane(&id, tab, serde_json::json!({ token: "1" }));
+            Ok(())
+        }
+
+        fn wait(&mut self) {
+            let asked = self.asked.clone();
+            for id in asked {
+                if let Some(left) = self.closes.get_mut(&id) {
+                    if *left == 0 {
+                        self.panes.retain(|(pane, ..)| *pane != id);
+                    } else {
+                        *left -= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    fn sidebar() -> serde_json::Value {
+        serde_json::json!({ launch::METADATA_SOURCE: "1", launch::SC_METADATA_SOURCE: "1" })
+    }
+
+    #[test]
+    fn refresh_closes_sidebars_gracefully_and_never_touches_viewers() {
+        let mut host = FakeRefresh::default();
+        host.pane("s1", "w1:t1", sidebar());
+        host.pane("work", "w1:t1", serde_json::json!({}));
+        // An inline / takeover viewer with possibly unsaved edits.
+        host.pane("s2", "w1:t2", sidebar());
+        host.pane(
+            "viewer",
+            "w1:t2",
+            serde_json::json!({ crate::viewer::METADATA_SOURCE: "1", "hs-preview-inline": "1" }),
+        );
+        host.closes.insert("s1".into(), 2);
+        host.closes.insert("s2".into(), 0);
+        let report = refresh_with(&mut host).unwrap();
+        assert_eq!(host.asked, vec!["s1", "s2"], "every sidebar got Ctrl+Q");
+        assert!(host.has("viewer") && host.has("work"));
+        assert_eq!(report.refreshed, 2);
+        assert!(report.is_complete(), "{report:?}");
+    }
+
+    /// A sidebar that does not close (its draft could not be saved, or it is
+    /// hung) keeps running: it is reported, not killed, and not duplicated.
+    #[test]
+    fn a_sidebar_that_will_not_close_is_kept_and_reported() {
+        let mut host = FakeRefresh::default();
+        host.pane("busy", "w1:t1", sidebar());
+        host.pane("work", "w1:t1", serde_json::json!({}));
+        let report = refresh_with(&mut host).unwrap();
+        assert!(host.has("busy"));
+        assert_eq!(report.refreshed, 0);
+        assert_eq!(report.kept, 1);
+        assert!(!report.is_complete());
+        assert_eq!(host.next, 0, "no second sidebar docked beside it");
+    }
+
+    /// Even a pane whose snapshot said "starting" only gets Ctrl+Q: by the
+    /// time the request lands it may be a running TUI with state.
+    #[test]
+    fn starting_sidebars_are_asked_not_killed() {
+        let mut host = FakeRefresh::default();
+        let mut tokens = sidebar();
+        tokens[launch::STARTING_TOKEN] = serde_json::json!("1");
+        host.pane("young", "w1:t1", tokens);
+        host.pane("work", "w1:t1", serde_json::json!({}));
+        let report = refresh_with(&mut host).unwrap();
+        assert_eq!(host.asked, vec!["young"]);
+        assert!(host.has("young"), "never hard-closed");
+        assert_eq!(report.kept, 1);
+    }
+
+    #[test]
+    fn sidebar_only_tabs_are_reported_not_counted_as_refreshed() {
+        let mut host = FakeRefresh::default();
+        host.pane("alone", "w1:t9", sidebar());
+        let report = refresh_with(&mut host).unwrap();
+        assert!(host.asked.is_empty(), "closing it would close the tab");
+        assert_eq!(report.kept, 1);
+        assert!(!report.is_complete());
+        assert!(report.errors[0].contains("only pane"), "{report:?}");
+    }
+
+    /// `open` can succeed without docking anything; only a sidebar that is
+    /// really present counts, and one tab's failure never stops the others.
+    #[test]
+    fn reopen_is_verified_per_tab_and_failures_stay_local() {
+        let mut host = FakeRefresh::default();
+        for tab in ["w1:a", "w1:b", "w1:c"] {
+            host.pane(&format!("s-{tab}"), tab, sidebar());
+            host.pane(&format!("w-{tab}"), tab, serde_json::json!({}));
+            host.closes.insert(format!("s-{tab}"), 0);
+        }
+        host.open_noop.push("w1:a".into());
+        host.open_fails.push("w1:b".into());
+        let report = refresh_with(&mut host).unwrap();
+        assert_eq!(report.refreshed, 1, "only w1:c really got a sidebar");
+        assert_eq!(report.errors.len(), 2, "{report:?}");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("no sidebar appeared"))
+        );
+        assert!(report.errors.iter().any(|e| e.contains("reopen failed")));
+        assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn separated_panes_reopen_both_views() {
+        let mut host = FakeRefresh::default();
+        host.pane(
+            "explorer",
+            "w1:t1",
+            serde_json::json!({ launch::METADATA_SOURCE: "1" }),
+        );
+        host.pane(
+            "git",
+            "w1:t1",
+            serde_json::json!({ launch::SC_METADATA_SOURCE: "1" }),
+        );
+        host.pane("work", "w1:t1", serde_json::json!({}));
+        host.closes.insert("explorer".into(), 0);
+        host.closes.insert("git".into(), 0);
+        let report = refresh_with(&mut host).unwrap();
+        assert_eq!(report.refreshed, 2);
+        assert!(report.is_complete());
+    }
 
     #[test]
     fn snooze_set_clear_and_sweep() {
@@ -801,8 +1240,4 @@ mod tests {
         assert_eq!(Target::SourceControl.initial_view(), View::SourceControl);
         assert_eq!(Target::from_env_value("unknown"), None);
     }
-}
-
-fn must_wait_for_lock(explicit: bool, event_json: &str) -> bool {
-    explicit || launch::event_kind(event_json) == "tab_created"
 }

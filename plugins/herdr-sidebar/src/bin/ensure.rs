@@ -5,6 +5,23 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 fn main() {
+    match std::env::args().nth(1).as_deref() {
+        Some("--update-latest") => {
+            if let Err(error) = herdr_sidebar::updates::run() {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Some("--refresh-sidebars") => {
+            if let Err(error) = herdr_sidebar::updates::refresh() {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        _ => {}
+    }
     let mode = match std::env::args().nth(1).as_deref() {
         Some("--toggle") => {
             herdr_sidebar::ensure::Mode::Toggle(herdr_sidebar::state::View::Explorer)

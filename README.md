@@ -45,7 +45,8 @@ Use the mouse or press `1`, `2`, and `3`.
 - Navigate a real expandable tree with file icons, hover actions, Git decorations, and
   `m` / Ctrl+right-click context menus.
 - Click a file to reuse an ephemeral preview tab; double-click to pin it. Preview in the
-  same tab instead by setting **Preview opens in** to `pane`.
+  same tab with **Preview opens in: pane**, or opt into experimental `replace` mode:
+  working panes move to a temporary tab while you preview; Esc / `q` brings them back.
 - Preview text, Markdown, images, and—when `ffmpeg` is available—video poster frames.
   Read-only previews support mouse selection and clipboard copy, including OSC 52 over SSH.
 - Find files with `Ctrl+P`; search project contents with `Ctrl+F` or `Ctrl+Shift+F`.
@@ -55,6 +56,10 @@ Use the mouse or press `1`, `2`, and `3`.
 - Press `e` in a text preview for the experimental editor with selection, find,
   clipboard actions, explicit save, and external-change protection.
 
+**Takeover caveat:** after a herdr restart or an incomplete restore, move any remaining
+working panes back manually. Third-party TUIs are not yet verified with takeover;
+`tab` remains the default.
+
 ### Source Control
 
 <div align="center">
@@ -63,7 +68,10 @@ Use the mouse or press `1`, `2`, and `3`.
 
 - Stage, unstage, discard, commit, inspect diffs, and sync with the upstream.
 - Click the branch name—in the panel header, a repository row, or the Git footer—to
-  switch local branches or create a local tracking branch from a remote.
+  switch branches, create one with **New branch…**, or track a remote branch.
+  Deleting an unmerged branch requires a separate force-delete confirmation.
+- Toggle changed files between list and folder tree with `t`, the view button, or Settings.
+  In tree view, use `←→` to fold folders and `m` to stage or unstage a folder.
 - Use one commit box per repository in multi-repo folders.
 - Draft a commit message with the ✧ button through the local `claude` CLI, with a
   filename-based fallback when Claude is unavailable.
@@ -77,12 +85,16 @@ Use the mouse or press `1`, `2`, and `3`.
 <img src="plugins/herdr-sidebar/docs/media/settings.png" alt="Sidebar settings" width="920">
 </div>
 
+The current version appears at the top. Official GitHub installations offer **Update & refresh**
+when a newer stable release is available; linked development checkouts stay untouched.
+
 Settings persist across tabs and restarts. Configure:
 
 - Unified or separate Explorer and Source Control panes
 - Left/right docking and preferred width
 - Material/emoji icons and VS Code/light/terminal colors
-- Tab/pane preview placement and optional custom editor
+- Tab (default), split-pane, or temporary takeover previews and optional custom editor
+- Source Control list/tree view (shared across sidebars)
 - Hidden files, Git decorations, Git footer, and footer hotkeys
 - Auto-open, strict open/close toggle, focus-on-open, and live folder following
 
@@ -93,7 +105,7 @@ folder stays put until that pane changes directory again.
 
 | Explorer / Search | Action | Source Control | Action |
 |---|---|---|---|
-| `↑↓` / `jk` | move | `Enter` | stage / unstage |
+| `↑↓` / `jk` | move | `Enter` | stage / unstage file; fold folder |
 | `←→` / `hl` | fold / unfold | `a` / `u` | stage all / none |
 | `Enter` | toggle / preview | `c` | commit message |
 | `Ctrl+P` | quick open | `A` | draft message |
@@ -105,8 +117,8 @@ folder stays put until that pane changes directory again.
 | `b` | hide | `b` | hide |
 | `1` / `2` / `3` | change view | `1` / `2` / `3` | change view |
 
-Preview: drag to select, `Ctrl/Cmd+C` to copy, arrows/PageUp/PageDown to scroll,
-`w` to toggle wrapping, and `q` or Esc to close.
+Preview: drag to select, `Ctrl/Cmd+C` to copy, arrows/PageUp/PageDown or
+Space/`b` to scroll, `w` to toggle wrapping, and `q` or Esc to close.
 
 Host keybindings can invoke the direct `show-explorer`, `show-search`, `show-git`, and
 `quick-open` actions. For example, bind `cmd+p` to:
