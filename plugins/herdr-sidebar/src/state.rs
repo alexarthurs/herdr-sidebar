@@ -389,6 +389,93 @@ pub fn save_editor_command(command: &str) -> bool {
     std::fs::write(path, command).is_ok()
 }
 
+/// The preview's syntect theme, one choice per background brightness. Each
+/// value is a bundled theme name or a path to a user `.tmTheme`; `None` keeps
+/// the historical default. Kept beside `state.json` (like the editor command)
+/// because [`State`] stays `Copy`.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct SyntaxThemes {
+    pub dark: Option<String>,
+    pub light: Option<String>,
+    /// Paint the preview's background and line numbers with the theme's own
+    /// colors instead of leaving the terminal background showing.
+    pub background: bool,
+}
+
+impl SyntaxThemes {
+    pub fn for_mode(&self, light: bool) -> Option<&str> {
+        if light { &self.light } else { &self.dark }.as_deref()
+    }
+}
+
+fn syntax_themes_path() -> Option<PathBuf> {
+    Some(state_dir()?.join("syntax-theme.json"))
+}
+
+pub fn load_syntax_themes() -> SyntaxThemes {
+    syntax_themes_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|json| parse_syntax_themes(&json))
+        .unwrap_or_default()
+}
+
+/// Forgiving parse: a missing, blank or non-string value means "default".
+pub fn parse_syntax_themes(json: &str) -> SyntaxThemes {
+    let value: serde_json::Value =
+        serde_json::from_str(json.trim_start_matches('\u{feff}')).unwrap_or_default();
+    let field = |key: &str| {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    SyntaxThemes {
+        dark: field("dark"),
+        light: field("light"),
+        background: value
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    }
+}
+
+/// Set (or with `None`, reset) the theme for one mode, preserving the other
+/// under the same lock as every other settings write.
+pub fn save_syntax_theme(light: bool, theme: Option<&str>) -> SyntaxThemes {
+    let Some(path) = syntax_themes_path() else {
+        return SyntaxThemes::default();
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let Some(_lock) = StateWriteLock::acquire(&path) else {
+        return load_syntax_themes();
+    };
+    let mut themes = load_syntax_themes();
+    let theme = theme
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    if light {
+        themes.light = theme;
+    } else {
+        themes.dark = theme;
+    }
+    let mut map = serde_json::Map::new();
+    for (key, value) in [("dark", &themes.dark), ("light", &themes.light)] {
+        if let Some(value) = value {
+            map.insert(key.into(), serde_json::Value::String(value.clone()));
+        }
+    }
+    if themes.background {
+        map.insert("background".into(), serde_json::Value::Bool(true));
+    }
+    let _ = std::fs::write(&path, serde_json::Value::Object(map).to_string());
+    themes
+}
+
 pub(crate) fn state_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("HERDR_PLUGIN_STATE_DIR")
         && !dir.is_empty()
@@ -975,6 +1062,18 @@ pub fn parse_state(json: &str) -> State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn syntax_themes_parse_forgivingly_per_mode() {
+        let themes = parse_syntax_themes(r#"{"dark":"Darcula","light":" ~/x.tmTheme "}"#);
+        assert_eq!(themes.for_mode(false), Some("Darcula"));
+        assert_eq!(themes.for_mode(true), Some("~/x.tmTheme"));
+        assert!(!themes.background, "the background stays opt-in");
+        assert!(parse_syntax_themes(r#"{"background":true}"#).background);
+        for junk in ["", "garbage", "[]", r#"{"dark":42,"light":"  "}"#] {
+            assert_eq!(parse_syntax_themes(junk), SyntaxThemes::default(), "{junk}");
+        }
+    }
 
     /// A workspace can hold several unrelated project tabs. The caller
     /// combines its workspace label and normalized spawn cwd so a volatile tab

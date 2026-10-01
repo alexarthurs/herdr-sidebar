@@ -760,6 +760,7 @@ enum Setting {
     SidebarWidth,
     IconTheme,
     ColorTheme,
+    SyntaxTheme,
     PreviewPlacement,
     AutoOpen,
     StrictToggle,
@@ -2522,6 +2523,12 @@ impl App {
                 true,
             ),
             (
+                Setting::SyntaxTheme,
+                "Syntax theme",
+                herdr_sidebar::syntax::settings_value(),
+                true,
+            ),
+            (
                 Setting::PreviewPlacement,
                 "Preview opens in",
                 self.sidebar_state.preview_placement.label().to_string(),
@@ -2651,6 +2658,7 @@ impl App {
                 });
                 set_color_theme(self.sidebar_state.color_theme);
             }
+            Setting::SyntaxTheme => herdr_sidebar::syntax::cycle_configured_theme(),
             Setting::PreviewPlacement => {
                 self.sidebar_state = sidebar::update_state(|state| {
                     state.preview_placement = state.preview_placement.other();

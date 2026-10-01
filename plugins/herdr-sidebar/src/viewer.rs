@@ -711,6 +711,10 @@ fn build_rows(lines: &[Line<'static>], numbered: bool, wrap: bool, width: u16) -
     let number_width = lines.len().to_string().len();
     let gutter = if numbered { number_width + 1 } else { 0 };
     let content = usize::from(width).saturating_sub(gutter);
+    let gutter_style = match crate::syntax::preview_colors().and_then(|c| c.gutter) {
+        Some(color) => Style::default().fg(color),
+        None => Style::default().dim(),
+    };
     let mut rows = Vec::with_capacity(lines.len());
     for (src, line) in lines.iter().enumerate() {
         let contains_tab = line.spans.iter().any(|span| span.content.contains('\t'));
@@ -732,7 +736,7 @@ fn build_rows(lines: &[Line<'static>], numbered: bool, wrap: bool, width: u16) -
                     " ".repeat(gutter)
                 };
                 let style = row.style;
-                let mut spans = vec![Span::styled(label, Style::default().dim())];
+                let mut spans = vec![Span::styled(label, gutter_style)];
                 spans.append(&mut row.spans);
                 row = Line::from(spans);
                 row.style = style;
@@ -2214,6 +2218,19 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     result
 }
 
+/// Fill the pane with the syntax theme's editor colors when the user opted
+/// in (`"background": true` in syntax-theme.json). Spans without their own
+/// colors draw over it, so only the backdrop and plain text change.
+fn paint_preview_background(frame: &mut Frame, area: Rect) {
+    if let Some(colors) = crate::syntax::preview_colors() {
+        let mut style = Style::default().bg(colors.background);
+        if let Some(fg) = colors.foreground {
+            style = style.fg(fg);
+        }
+        frame.buffer_mut().set_style(area, style);
+    }
+}
+
 /// Header (✕ close + name + context), body, hint footer. Returns the page
 /// stride for PageUp/Down.
 fn draw_doc(
@@ -2230,6 +2247,7 @@ fn draw_doc(
         Constraint::Length(1),
     ])
     .areas(area);
+    paint_preview_background(frame, area);
 
     // Lay the body out for THIS width first: everything below (the clamp,
     // the slice, the page stride) counts rendered rows.
@@ -2338,6 +2356,7 @@ fn draw_editor(
         Constraint::Length(1),
     ])
     .areas(area);
+    paint_preview_background(frame, area);
     let name = editor.name();
     let file_icon = icon(theme, &name, false, false);
     let icon_style = ui_icon_style(file_icon.rgb);

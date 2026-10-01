@@ -35,6 +35,7 @@ syntect = { version = "5", default-features = false, features = [
     "parsing",
     "default-themes",
     "dump-load",
+    "plist-load",
     "regex-fancy",
 ] }
 # bat's extended grammar set (TypeScript, TOML, Dockerfile, …) — syntect's
