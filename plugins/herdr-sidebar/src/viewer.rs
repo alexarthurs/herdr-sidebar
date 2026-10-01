@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+    KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -397,6 +397,7 @@ struct Doc {
     selection: PreviewSelection,
 }
 
+#[derive(PartialEq)]
 struct MediaPreview {
     pixels: image::RgbaImage,
     source_width: u32,
@@ -816,17 +817,28 @@ fn start_preview_load(request: Request) -> (Request, std::sync::mpsc::Receiver<D
     (request, receiver)
 }
 
-fn apply_diff_refresh(doc: &mut Doc, mut refreshed: Doc) {
+/// Swap in a re-loaded copy of the document on screen. Returns false (and
+/// keeps the current doc, selection included) when nothing changed; otherwise
+/// the reader keeps wrap mode and their place by source line.
+fn apply_refresh(doc: &mut Doc, mut refreshed: Doc) -> bool {
     if doc.name == refreshed.name
         && doc.context == refreshed.context
         && doc.numbered == refreshed.numbered
         && doc.lines == refreshed.lines
+        && doc.media == refreshed.media
     {
-        return;
+        return false;
     }
     refreshed.wrap = doc.wrap;
     refreshed.pending_src = Some(doc.top_src());
     *doc = refreshed;
+    true
+}
+
+/// Requests whose content can change underneath the viewer. `git show`
+/// output is immutable, so it is never re-run.
+fn refreshable(request: &Request) -> bool {
+    matches!(request, Request::File { .. } | Request::Diff { .. })
 }
 
 enum ViewMode {
@@ -1779,7 +1791,10 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     );
     crossterm::style::force_color_output(true); // TUI colors ≠ pipeable output
     let mut terminal = ratatui::init();
-    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // Focus reporting: herdr forwards FocusIn/FocusOut (CSI I / CSI O) when
+    // the user switches to or away from this pane's tab (verified live), so
+    // returning to a preview re-reads it instead of polling in the background.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange);
     let mut page: usize = 20;
     let mut preview_body = Rect::default();
     let mut edit_width: usize = 1;
@@ -1789,7 +1804,12 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     let mut last_heartbeat = crate::state::unix_now();
     let mut last_external_check = Instant::now();
     let mut last_diff_refresh = Instant::now();
-    let mut diff_refresh: Option<(Request, std::sync::mpsc::Receiver<Doc>)> = None;
+    // A background re-load of the current document: the ~2s diff timer, a
+    // regained focus, or `r`. `manual` reports the outcome in the footer.
+    let mut refresh: Option<((Request, std::sync::mpsc::Receiver<Doc>), bool)> = None;
+    let mut refresh_requested: Option<bool> = None;
+    // Reload outcomes are transient; other notices stay until replaced.
+    let mut notice_expires: Option<(Instant, String)> = None;
     let mut identity_pending = false;
     let result = loop {
         let loaded =
@@ -2039,6 +2059,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         doc.pending_src = Some(doc.top_src());
                                         doc.wrap = !doc.wrap;
                                     }
+                                    KeyCode::Char('r') => refresh_requested = Some(true),
                                     _ => {}
                                 }
                             }
@@ -2122,6 +2143,15 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                         _ => {}
                     },
                 },
+                Event::FocusGained => match &mut mode {
+                    ViewMode::Preview(_) => {
+                        refresh_requested = Some(refresh_requested.unwrap_or(false));
+                    }
+                    ViewMode::Edit(editor) => {
+                        editor.poll_external(MAX_BYTES, MAX_LINES);
+                        last_external_check = Instant::now();
+                    }
+                },
                 _ => {} // resize etc: redraw
             }
         }
@@ -2163,6 +2193,9 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 } else {
                     mode = ViewMode::Preview(loading_doc(&request));
                     current = Some(request.clone());
+                    // A fresh load supersedes any re-load of the old document.
+                    refresh = None;
+                    refresh_requested = None;
                     preview_load = Some(start_preview_load(request));
                     identity_pending = true;
                     notice = None;
@@ -2176,40 +2209,66 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             last_external_check = Instant::now();
         }
         let refreshed =
-            diff_refresh
+            refresh
                 .as_ref()
-                .and_then(|(request, receiver)| match receiver.try_recv() {
-                    Ok(doc) => Some((request.clone(), Some(doc))),
+                .and_then(|((request, receiver), manual)| match receiver.try_recv() {
+                    Ok(doc) => Some((request.clone(), Some(doc), *manual)),
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        Some((request.clone(), None))
+                        Some((request.clone(), None, *manual))
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => None,
                 });
-        if let Some((request, refreshed)) = refreshed {
-            diff_refresh = None;
+        if let Some((request, refreshed, manual)) = refreshed {
+            refresh = None;
             if current.as_ref() == Some(&request)
                 && let (ViewMode::Preview(doc), Some(refreshed)) = (&mut mode, refreshed)
             {
-                apply_diff_refresh(doc, refreshed);
+                let changed = apply_refresh(doc, refreshed);
+                if manual {
+                    let text = if changed { "reloaded" } else { "no changes" };
+                    notice = Some(text.into());
+                    notice_expires = Some((Instant::now() + Duration::from_secs(2), text.into()));
+                }
             }
         }
+        if let Some((at, text)) = &notice_expires
+            && Instant::now() >= *at
+        {
+            if notice.as_deref() == Some(text.as_str()) {
+                notice = None;
+            }
+            notice_expires = None;
+        }
+        if take_refresh_signal(control) {
+            refresh_requested.get_or_insert(false);
+        }
         if last_diff_refresh.elapsed() >= Duration::from_secs(2) {
-            if preview_load.is_none()
-                && diff_refresh.is_none()
-                && matches!(mode, ViewMode::Preview(_))
-                && let Some(request @ Request::Diff { .. }) = current.clone()
-            {
-                let worker_request = request.clone();
-                let (sender, receiver) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
-                    let _ = sender.send(load(&worker_request));
-                });
-                diff_refresh = Some((request, receiver));
+            if matches!(current, Some(Request::Diff { .. })) {
+                refresh_requested.get_or_insert(false);
             }
             last_diff_refresh = Instant::now();
         }
+        if let Some(manual) = refresh_requested
+            && preview_load.is_none()
+            && matches!(mode, ViewMode::Preview(_))
+            && prompt.is_none()
+        {
+            refresh_requested = None;
+            match current.clone() {
+                Some(request) if refreshable(&request) => match refresh.as_mut() {
+                    None => refresh = Some((start_preview_load(request), manual)),
+                    Some((_, pending_manual)) => *pending_manual |= manual,
+                },
+                _ if manual => {
+                    let text = "nothing to reload";
+                    notice = Some(text.into());
+                    notice_expires = Some((Instant::now() + Duration::from_secs(2), text.into()));
+                }
+                _ => {}
+            }
+        }
     };
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, DisableFocusChange);
     ratatui::restore();
     result
 }
@@ -2298,7 +2357,10 @@ fn draw_doc(
             " image preview  q close".into()
         }
     } else if editable {
-        preview_hint(&["e edit", "space/b page", wrap_hint], footer.width)
+        preview_hint(
+            &["e edit", "r reload", "space/b page", wrap_hint],
+            footer.width,
+        )
     } else {
         preview_hint(&["space/b page", "↑↓ scroll", wrap_hint], footer.width)
     };
@@ -2785,6 +2847,45 @@ pub fn close_in_tab(my_pane_id: &str) -> Option<String> {
             })
         }
     }
+}
+
+/// Ask the live viewer in the caller's tab to re-read its document. Called
+/// when a sidebar regains focus: herdr hands a returning tab's focus to its
+/// last-focused pane, which in a preview tab is often the sidebar rather than
+/// the viewer, so the viewer's own FocusIn alone would miss the switch.
+///
+/// A separate signal file, never the control file: rewriting the control
+/// could race a file click from this same sidebar and drop that request.
+pub fn refresh_in_tab(my_pane_id: &str) {
+    let Ok(json) = ipc::call_text("pane.list", serde_json::json!({})) else {
+        return;
+    };
+    let Some((id, false)) = viewer_pane_in_tab(&json, my_pane_id) else {
+        return;
+    };
+    let control = previews_in(&json)
+        .into_iter()
+        .find(|preview| preview.pane_id == id)
+        .map(|preview| preview.control)
+        .unwrap_or_else(|| control_path_for_pane(&id));
+    let _ = write_scratch_file(&refresh_signal_path(&control), "");
+}
+
+/// Sibling of a viewer's control file that requests a re-read.
+fn refresh_signal_path(control: &Path) -> PathBuf {
+    let mut name = control.file_name().unwrap_or_default().to_os_string();
+    name.push(".refresh");
+    control.with_file_name(name)
+}
+
+/// Consume a pending refresh signal for `control`.
+fn take_refresh_signal(control: &Path) -> bool {
+    let signal = refresh_signal_path(control);
+    if !control_path_ok(&signal) || std::fs::symlink_metadata(&signal).is_err() {
+        return false;
+    }
+    remove_control_file(&signal);
+    true
 }
 
 /// The viewer pane in the same tab, by metadata token, plus whether its
@@ -3581,6 +3682,83 @@ mod tests {
     }
 
     #[test]
+    fn changed_refresh_keeps_wrap_mode_and_source_position() {
+        let lines = |marker: &str| -> Vec<Line<'static>> {
+            (0..50)
+                .map(|i| Line::raw(format!("{marker} line {i}")))
+                .collect()
+        };
+        let mut doc = doc_of(lines("old"), true);
+        doc.wrap = false;
+        doc.relayout(40, 10);
+        doc.scroll = 20;
+
+        assert!(apply_refresh(&mut doc, doc_of(lines("new"), true)));
+        doc.relayout(40, 10);
+
+        assert!(!doc.wrap, "the reader's wrap toggle survives a reload");
+        assert_eq!(doc.scroll, 20, "same source line stays at the top");
+        assert_eq!(doc.lines[0].to_string(), "new line 0");
+    }
+
+    #[test]
+    fn a_reload_picks_up_external_file_edits() {
+        let dir = std::env::temp_dir().join(format!("hs-refresh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, "first\n").unwrap();
+        let request = Request::File {
+            path: path.clone(),
+            line: None,
+        };
+        let mut doc = load(&request);
+        std::fs::write(&path, "first\nadded by an agent\n").unwrap();
+
+        assert!(apply_refresh(&mut doc, load(&request)));
+        assert!(
+            doc.lines
+                .iter()
+                .any(|l| l.to_string().contains("added by an agent"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn refresh_signal_sits_beside_the_control_file() {
+        let control = Path::new("/scratch/p-abc123");
+        assert_eq!(
+            refresh_signal_path(control),
+            Path::new("/scratch/p-abc123.refresh")
+        );
+        let legacy = Path::new("/scratch/herdr-sidebar-preview-w1_p2.ctl");
+        assert_eq!(
+            refresh_signal_path(legacy),
+            Path::new("/scratch/herdr-sidebar-preview-w1_p2.ctl.refresh")
+        );
+    }
+
+    #[test]
+    fn only_files_and_diffs_are_refreshable() {
+        let file = Request::File {
+            path: "a.md".into(),
+            line: None,
+        };
+        let diff = Request::Diff {
+            root: ".".into(),
+            rel: "a".into(),
+            kind: "worktree".into(),
+        };
+        let show = Request::Show {
+            root: ".".into(),
+            spec: "HEAD".into(),
+            path: None,
+        };
+        assert!(refreshable(&file) && refreshable(&diff));
+        assert!(!refreshable(&show), "git show output is immutable");
+        assert!(!refreshable(&Request::Close));
+    }
+
+    #[test]
     fn unchanged_diff_refresh_preserves_selection_and_layout() {
         let mut doc = doc_of(vec![Line::raw("-old"), Line::raw("+new")], false);
         doc.relayout(40, 20);
@@ -3591,7 +3769,7 @@ mod tests {
         let rows_key = doc.rows_key;
 
         let refreshed = doc_of(vec![Line::raw("-old"), Line::raw("+new")], false);
-        apply_diff_refresh(&mut doc, refreshed);
+        assert!(!apply_refresh(&mut doc, refreshed), "nothing changed");
 
         assert_eq!(doc.selection.anchor, selection.anchor);
         assert_eq!(doc.selection.cursor, selection.cursor);

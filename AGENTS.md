@@ -1010,6 +1010,17 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   `PreviewTarget.tab_id` (that is the preview tab itself). Reusing an ephemeral preview from
   its own sidebar preserves the original origin; focus it before closing because closing the
   current tab can kill the viewer before any follow-up IPC runs.
+- **herdr forwards terminal focus reporting** (verified live, herdr 0.9.3 on macOS): a pane
+  app that enables `?1004h` gets `CSI I` when its tab/pane is focused and `CSI O` when the
+  user leaves. File previews use it instead of polling: the viewer (`EnableFocusChange`)
+  re-reads on `FocusGained`. But a returning tab hands focus to its LAST-focused pane —
+  in a preview tab often the docked sidebar, not the viewer — so the sidebar also relays
+  its own `FocusGained` via `viewer::refresh_in_tab`, touching a `<control>.refresh`
+  signal the viewer consumes. Never write a refresh into the control file itself: the same
+  focus-then-click sequence would race and drop the click's file request. Refreshes run
+  on a worker through `apply_refresh` (unchanged output keeps selection; changes keep
+  wrap and source-line position). `r` reloads on demand; diffs keep their 2s timer;
+  `git show` is immutable and never reloads; edit mode polls `poll_external` on focus too.
 - Preview requests load on a worker after immediately replacing the pane with a lightweight
   `loading preview…` document. File reads, syntax setup, `glow`, image decode, video extraction,
   and git subprocesses must not block the viewer's event loop before it can acknowledge a click.

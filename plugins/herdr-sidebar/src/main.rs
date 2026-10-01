@@ -15,7 +15,9 @@ use std::io::Read;
 use std::rc::Rc;
 use std::time::Duration;
 
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use crossterm::event::{
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+};
 use herdr_sidebar::{ensure, launch, state, viewer};
 use state::{Exit, View};
 
@@ -238,7 +240,9 @@ fn main() -> std::io::Result<()> {
     // turns every pane we draw monochrome.
     crossterm::style::force_color_output(true);
     let mut terminal = ratatui::init();
-    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // Focus reporting lets a sidebar returning to view refresh the preview
+    // docked beside it (see `viewer::refresh_in_tab`).
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange);
     // First run on a machine without a Nerd Font: offer to install one
     // before any icons render. The prompt stamps the pane's identity token
     // itself (the app loops haven't started yet, and a token-less pane gets
@@ -295,9 +299,21 @@ fn main() -> std::io::Result<()> {
             Err(e) => break Err(e),
         }
     };
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, DisableFocusChange);
     ratatui::restore();
     result
+}
+
+/// Off the UI thread: the lookup is a socket round trip, and focus events
+/// arrive exactly when the user is about to interact.
+fn refresh_preview_in_tab() {
+    let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else {
+        return;
+    };
+    if pane_id.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || herdr_sidebar::viewer::refresh_in_tab(&pane_id));
 }
 
 fn read_stdin() -> std::io::Result<String> {
@@ -394,6 +410,10 @@ fn run_explorer(
                     app.on_resize(width);
                     None
                 }
+                Event::FocusGained => {
+                    refresh_preview_in_tab();
+                    None
+                }
                 _ => None, // resize, focus, … simply fall through to a redraw
             };
             if let Some(exit) = exit {
@@ -439,6 +459,10 @@ fn run_scm(
                 Event::Mouse(mouse) => app.on_mouse(mouse),
                 Event::Resize(width, _) => {
                     app.on_resize(width);
+                    None
+                }
+                Event::FocusGained => {
+                    refresh_preview_in_tab();
                     None
                 }
                 _ => None,
