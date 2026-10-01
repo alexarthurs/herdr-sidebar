@@ -1039,6 +1039,31 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   data is grammar-independent). Foreground colors only: the terminal owns the background.
   See `src/syntax.rs`; unknown extensions fall back to plain lines.
 
+- The syntect theme is configurable per mode in `syntax-theme.json` (beside `state.json`,
+  NOT in `State`, which must stay `Copy` — same reason as `editor-command.txt`; and
+  `write_state` rewrites the whole file, so unknown keys added to `state.json` get erased).
+  Values are a bundled name or a `.tmTheme` path; anything unresolvable falls back to
+  `base16-ocean.dark` / `InspiredGitHub`. The setting is re-read per highlighted document,
+  so no viewer restart is needed. User theme files are cached by mtime and LEAKED for the
+  `'static` lifetime `LineHighlighter` needs. Loading `.tmTheme` needs syntect's
+  `plist-load` feature. base16-ocean.dark colors the WHOLE `markup.list`/`markup.quote`
+  scope (why Markdown previews looked flat orange); the bundled `assets/themes/Darcula.tmTheme`
+  colors only list/quote markers. Markdown scope names in two-face's grammar: list marker
+  `punctuation.definition.list_item` (numbered: `markup.list.numbered.bullet`), item text
+  `meta.paragraph.list`, link text `meta.link.inline.description`.
+- Markdown grammar quirks the bundled themes work around: a lone `~` ("~50 %") opens a GFM
+  `markup.strikethrough` that never closes, so a gray strikethrough rule greys the REST of
+  the line — the themes keep strikethrough at the plain foreground. `[LABEL]` shortcut
+  references get no scope at all; `syntax::shortcut_references` finds them and restyles
+  only plain-foreground regions with the theme's style for the synthetic scope
+  `herdr-sidebar.shortcut-reference.markdown`. That scope must stay under its OWN top-level
+  name: base16-ocean.dark's generic `meta.link` rule matched a `meta.link.*` variant and
+  silently changed the default theme's output.
+- `"background": true` in `syntax-theme.json` paints the viewer (`paint_preview_background`)
+  with the theme's background/foreground and the gutter with `gutterForeground`. Off by
+  default. The config is cached for 2s in `syntax::configured` because the viewer asks
+  for it every frame.
+
 ### Experimental in-pane editor (issue #22)
 
 - `e` enters edit mode ONLY from a regular file preview. Diff / `git show`, binary,

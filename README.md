@@ -93,10 +93,39 @@ Settings persist across tabs and restarts. Configure:
 - Unified or separate Explorer and Source Control panes
 - Left/right docking and preferred width
 - Material/emoji icons and VS Code/light/terminal colors
+- Preview syntax theme, chosen separately for dark and light color themes
 - Tab (default), split-pane, or temporary takeover previews and optional custom editor
 - Source Control list/tree view (shared across sidebars)
 - Hidden files, Git decorations, Git footer, and footer hotkeys
 - Auto-open, strict open/close toggle, focus-on-open, and live folder following
+
+### Syntax theme
+
+The file preview highlights code (and Markdown, when `glow` isn't installed) with a
+syntect theme. **Syntax theme** in Settings cycles through the bundled themes for the
+active mode — `light` color theme sets the light choice, `vscode`/`terminal` set the dark
+one: `Darcula` and `IntelliJ Dark` (JetBrains-style, bundled with the plugin), `base16-ocean.dark`,
+`base16-eighties.dark`, `base16-mocha.dark`, `base16-ocean.light`, `InspiredGitHub`,
+`Solarized (dark)`, `Solarized (light)`, then back to `default`.
+
+To use your own `.tmTheme`, put its path in `syntax-theme.json` in the plugin state dir
+(`~/.local/state/herdr/plugins/herdr-sidebar/` on Linux/macOS,
+`%LOCALAPPDATA%\herdr\plugins\herdr-sidebar\` on Windows):
+
+```json
+{"dark": "~/themes/MyTheme.tmTheme", "light": "InspiredGitHub", "background": true}
+```
+
+Each value is a bundled theme name or a file path (`~` expands). A missing key, an unknown
+name, or a file that fails to load falls back to the defaults (`base16-ocean.dark` /
+`InspiredGitHub`). Changes apply to the next document a preview opens; edits to a theme
+file are picked up the same way. By default only foreground colors are used and your
+terminal keeps its background; `"background": true` paints the preview with the theme's
+own background, text and line-number colors, like an editor.
+
+The bundled JetBrains themes also color `[LABEL]` shortcut references (e.g. `[BUG]`),
+which the Markdown grammar leaves as plain text. A custom theme can do the same with a
+rule for the `herdr-sidebar.shortcut-reference.markdown` scope.
 
 The sidebar follows a neighbouring pane's working directory by default. A manually chosen
 folder stays put until that pane changes directory again.
