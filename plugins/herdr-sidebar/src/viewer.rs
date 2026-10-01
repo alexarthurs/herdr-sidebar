@@ -138,7 +138,11 @@ fn write_scratch_file(path: &Path, contents: &str) -> std::io::Result<()> {
     write_scratch_file_in(path, contents, parent)
 }
 
-fn write_scratch_file_in(path: &Path, contents: &str, expected_dir: &Path) -> std::io::Result<()> {
+pub(crate) fn write_scratch_file_in(
+    path: &Path,
+    contents: &str,
+    expected_dir: &Path,
+) -> std::io::Result<()> {
     if !control_path_ok_in(path, expected_dir) {
         return Err(control_path_err(path));
     }
@@ -867,9 +871,10 @@ fn apply_pending(
     preview_load: &mut Option<(Request, std::sync::mpsc::Receiver<Doc>)>,
     identity_pending: &mut bool,
     control: &Path,
+    notice: &mut Option<String>,
 ) -> bool {
     match pending {
-        Pending::Close => close_own_pane(control),
+        Pending::Close => close_own_pane(control, current, notice),
         Pending::LeaveEdit => {
             if let Some(request) = current.clone() {
                 *mode = ViewMode::Preview(loading_doc(&request));
@@ -880,7 +885,7 @@ fn apply_pending(
         }
         Pending::Switch(request) => {
             if request == Request::Close {
-                close_own_pane(control)
+                close_own_pane(control, current, notice)
             } else {
                 *mode = ViewMode::Preview(loading_doc(&request));
                 *current = Some(request.clone());
@@ -1505,10 +1510,19 @@ fn editor_pane_label(doc_name: &str) -> String {
     format!("{doc_name} · editor")
 }
 
+/// What the control file must hold after a close that did not happen: the
+/// document still on screen (or nothing), never the `close` request itself.
+fn control_after_failed_close(current: &Option<Request>) -> String {
+    current.as_ref().map(request_payload).unwrap_or_default()
+}
+
+/// Set once a takeover restore failed while this viewer tried to close.
+static RESTORE_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Close the whole preview tab. Closing only the viewer pane leaves its
 /// auto-docked sidebar behind as a convincing but unusable preview husk.
 /// An inline viewer owns nothing but its own pane, so it closes just that.
-fn close_own_pane(control: &Path) -> bool {
+fn close_own_pane(control: &Path, current: &Option<Request>, notice: &mut Option<String>) -> bool {
     let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else {
         return false;
     };
@@ -1516,6 +1530,31 @@ fn close_own_pane(control: &Path) -> bool {
         return false;
     }
     if runs_inline() {
+        let list = ipc::call_text("pane.list", serde_json::json!({})).unwrap_or_default();
+        let preview = previews_in(&list)
+            .into_iter()
+            .find(|preview| preview.pane_id == pane_id);
+        let tab = preview
+            .as_ref()
+            .map(|preview| preview.origin_tab_id.as_str())
+            .unwrap_or("");
+        if !tab.is_empty()
+            && let Err(error) = crate::takeover::restore(tab, &pane_id)
+        {
+            // Never trap the viewer: a second close gives up on the layout
+            // and leaves the working panes in their (relabelled) tab.
+            if !RESTORE_FAILED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                // A `close` request that asked for this must not stay in the
+                // control file: the loop would re-read it and silently take
+                // the failure's "close anyway" branch on the next iteration.
+                let _ = write_scratch_file(control, &control_after_failed_close(current));
+                *notice = Some(format!(
+                    "Cannot restore: {error}. Press q again to close anyway; your panes stay in the temporary tab."
+                ));
+                return false;
+            }
+            let _ = crate::takeover::abandon_tab(tab);
+        }
         let closed = pane_close_succeeded(ipc::call_text(
             "pane.close",
             serde_json::json!({ "pane_id": pane_id }),
@@ -1636,14 +1675,18 @@ fn sweep_orphan_controls_in(dir: &Path, previews: &[PreviewPane]) {
     if !crate::rundir::is_private(dir) {
         return;
     }
+    // A present viewer keeps its control file even while its heartbeat is
+    // stale (a suspended machine, a stalled loop): deleting it would leave a
+    // live, possibly dirty, editor unable to receive its close request. Only
+    // label-only panes from a server resume are known dead.
     let live: std::collections::BTreeSet<String> = previews
         .iter()
-        .filter(|preview| !preview.stale)
+        .filter(|preview| !preview.resumed)
         .map(|preview| preview.pane_id.replace(':', "_"))
         .collect();
     let live_controls: std::collections::BTreeSet<PathBuf> = previews
         .iter()
-        .filter(|preview| !preview.stale)
+        .filter(|preview| !preview.resumed)
         .map(|preview| preview.control.clone())
         .collect();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1671,6 +1714,12 @@ fn sweep_orphan_controls_in(dir: &Path, previews: &[PreviewPane]) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+/// Re-stamp every 5s of wall-clock time, and immediately after the clock
+/// jumps backwards (a correction must not silence the heartbeat).
+fn heartbeat_due(last: u64, now: u64) -> bool {
+    now < last || now - last >= 5
 }
 
 /// The viewer's event loop; returns when the user closes it.
@@ -1737,7 +1786,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     let mut edit_body = Rect::default();
     let mut prompt: Option<Prompt> = None;
     let mut notice: Option<String> = None;
-    let mut last_heartbeat = Instant::now();
+    let mut last_heartbeat = crate::state::unix_now();
     let mut last_external_check = Instant::now();
     let mut last_diff_refresh = Instant::now();
     let mut diff_refresh: Option<(Request, std::sync::mpsc::Receiver<Doc>)> = None;
@@ -1821,6 +1870,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                                 &mut preview_load,
                                                 &mut identity_pending,
                                                 control,
+                                                &mut notice,
                                             );
                                         }
                                         Ok(SaveOutcome::Conflict) => {
@@ -1841,6 +1891,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     &mut preview_load,
                                     &mut identity_pending,
                                     control,
+                                    &mut notice,
                                 );
                             }
                             (Prompt::Unsaved(_), KeyCode::Esc | KeyCode::Char('c')) => {
@@ -1863,6 +1914,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                                     &mut preview_load,
                                                     &mut identity_pending,
                                                     control,
+                                                    &mut notice,
                                                 );
                                             }
                                         }
@@ -1886,6 +1938,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                                     &mut preview_load,
                                                     &mut identity_pending,
                                                     control,
+                                                    &mut notice,
                                                 );
                                             }
                                         }
@@ -1935,7 +1988,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         });
                                     }
                                     KeyCode::Esc | KeyCode::Char('q') => {
-                                        should_close = close_own_pane(control);
+                                        should_close =
+                                            close_own_pane(control, &current, &mut notice);
                                     }
                                     KeyCode::Char('e') => {
                                         if doc.media.is_some() {
@@ -1971,8 +2025,14 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     KeyCode::Down | KeyCode::Char('j') => {
                                         doc.scroll = (doc.scroll + 1).min(max)
                                     }
-                                    KeyCode::PageUp => doc.scroll = doc.scroll.saturating_sub(page),
-                                    KeyCode::PageDown => doc.scroll = (doc.scroll + page).min(max),
+                                    // Shift+Space is byte-identical to Space without the
+                                    // kitty keyboard protocol, so page-back takes `b`.
+                                    KeyCode::PageUp | KeyCode::Char('b') => {
+                                        doc.scroll = doc.scroll.saturating_sub(page)
+                                    }
+                                    KeyCode::PageDown | KeyCode::Char(' ') => {
+                                        doc.scroll = (doc.scroll + page).min(max)
+                                    }
                                     KeyCode::Home | KeyCode::Char('g') => doc.scroll = 0,
                                     KeyCode::End | KeyCode::Char('G') => doc.scroll = max,
                                     KeyCode::Char('w') if doc.media.is_none() => {
@@ -2004,6 +2064,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                                 &mut preview_load,
                                                 &mut identity_pending,
                                                 control,
+                                                &mut notice,
                                             );
                                         }
                                     }
@@ -2011,7 +2072,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         if editor.dirty {
                                             prompt = Some(Prompt::Unsaved(Pending::Close));
                                         } else {
-                                            should_close = close_own_pane(control);
+                                            should_close =
+                                                close_own_pane(control, &current, &mut notice);
                                         }
                                     }
                                     EditAction::Save => match editor.save(false) {
@@ -2035,7 +2097,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                             MouseEventKind::Down(MouseButton::Left)
                                 if mouse.row == 0 && mouse.column < 3 =>
                             {
-                                should_close = close_own_pane(control);
+                                should_close = close_own_pane(control, &current, &mut notice);
                             }
                             _ => doc.on_mouse(&mouse, preview_body),
                         }
@@ -2053,7 +2115,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                             if editor.dirty {
                                 prompt = Some(Prompt::Unsaved(Pending::Close));
                             } else {
-                                should_close = close_own_pane(control);
+                                should_close = close_own_pane(control, &current, &mut notice);
                             }
                         }
                         _ if prompt.is_none() => editor.on_mouse(&mouse, edit_body),
@@ -2069,7 +2131,10 @@ pub fn run(control: &Path) -> std::io::Result<()> {
 
         // These checks run after every iteration, including sustained input;
         // otherwise a held key can starve the liveness heartbeat indefinitely.
-        if last_heartbeat.elapsed() >= Duration::from_secs(5) {
+        // Wall-clock, not `Instant`: a monotonic clock stops during suspend, so
+        // after a resume the viewer would wait out the rest of its interval
+        // while recovery code already reads the old stamp as stale.
+        if heartbeat_due(last_heartbeat, crate::state::unix_now()) {
             report_identity(
                 &mode,
                 current.as_ref().map(Request::doc_key).as_deref(),
@@ -2080,7 +2145,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             // tints and selection follow immediately — an already-highlighted
             // file keeps its syntax colors until it is reloaded.
             crate::ui::set_color_theme(crate::state::load_state().color_theme);
-            last_heartbeat = Instant::now();
+            last_heartbeat = crate::state::unix_now();
         }
         if prompt.is_none() {
             let target = read_control(control);
@@ -2092,7 +2157,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 {
                     prompt = Some(Prompt::Unsaved(Pending::Switch(request)));
                 } else if request == Request::Close {
-                    if close_own_pane(control) {
+                    if close_own_pane(control, &current, &mut notice) {
                         break Ok(());
                     }
                 } else {
@@ -2233,12 +2298,31 @@ fn draw_doc(
             " image preview  q close".into()
         }
     } else if editable {
-        format!(" drag select  Ctrl/Cmd+C copy  e edit  {wrap_hint}  q close")
+        preview_hint(&["e edit", "space/b page", wrap_hint], footer.width)
     } else {
-        format!(" drag select  Ctrl/Cmd+C copy  ↑↓ scroll  {wrap_hint}  q close")
+        preview_hint(&["space/b page", "↑↓ scroll", wrap_hint], footer.width)
     };
     frame.render_widget(Paragraph::new(Line::from(hint).dim()), footer);
     (usize::from(body.height).saturating_sub(1).max(1), body)
+}
+
+/// The read-only footer: `q close` first so a narrow inline or takeover pane
+/// never clips the way out, then as many optional hints as fit, then the
+/// selection/copy hint when there is room for everything.
+fn preview_hint(optional: &[&str], width: u16) -> String {
+    let width = usize::from(width);
+    let mut hint = String::from(" q close");
+    for part in optional
+        .iter()
+        .copied()
+        .chain(["drag select  Ctrl/Cmd+C copy"])
+    {
+        if hint.chars().count() + 2 + part.chars().count() <= width {
+            hint.push_str("  ");
+            hint.push_str(part);
+        }
+    }
+    hint
 }
 
 fn draw_editor(
@@ -2306,6 +2390,64 @@ fn draw_editor(
 // Client side: how the sidebar views open things in the viewer pane.
 // ---------------------------------------------------------------------------
 
+/// What a file click may do to a stale preview in its space.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StaleCleanup {
+    CloseTab { tab_id: String, control: PathBuf },
+    ClosePane { pane_id: String, control: PathBuf },
+}
+
+/// Only label-only panes left by a server resume are provably dead — their
+/// process metadata is gone, so nothing unsaved can live there. A pane that
+/// still carries a (stale) heartbeat may be a suspended or stalled viewer
+/// holding an unsaved editor buffer, including a temporary takeover viewer;
+/// a click never kills it. It is simply not routed to, and its own close
+/// (q / Esc / ✕) still works once it responds.
+pub(crate) fn stale_cleanup(previews: &[PreviewPane], pane_list_json: &str) -> Vec<StaleCleanup> {
+    previews
+        .iter()
+        .filter(|preview| preview.stale && preview.resumed)
+        .map(|preview| {
+            if tab_is_plugin_only(pane_list_json, &preview.tab_id) {
+                StaleCleanup::CloseTab {
+                    tab_id: preview.tab_id.clone(),
+                    control: preview.control.clone(),
+                }
+            } else {
+                StaleCleanup::ClosePane {
+                    pane_id: preview.pane_id.clone(),
+                    control: preview.control.clone(),
+                }
+            }
+        })
+        .collect()
+}
+
+/// Can a click route its document into `preview`? Stale viewers are never
+/// routed to (and never killed, see [`stale_cleanup`]); an inline viewer
+/// belongs to ONE tab, and a tab-mode click never adopts one. Pure and
+/// non-blocking: a stale viewer anywhere else in the workspace costs a click
+/// nothing.
+pub(crate) fn routable(preview: &PreviewPane, inline: bool, caller_tab: &str) -> bool {
+    !preview.stale && preview.inline == inline && (!inline || preview.tab_id == caller_tab)
+}
+
+/// Inline placement only: a present-but-unresponsive viewer already in the
+/// caller's own tab. Spawning another beside it would split the tab again on
+/// every click, so the click hands it the request and reports instead.
+pub(crate) fn unresponsive_inline_in<'a>(
+    previews: &'a [PreviewPane],
+    inline: bool,
+    caller_tab: &str,
+) -> Option<&'a PreviewPane> {
+    if !inline {
+        return None;
+    }
+    previews.iter().find(|preview| {
+        preview.inline && preview.tab_id == caller_tab && preview.stale && !preview.resumed
+    })
+}
+
 /// Open `payload` (identified by `doc_key`) where the `Preview placement`
 /// setting says.
 ///
@@ -2329,32 +2471,46 @@ pub fn open_in_pane(
     let list = ipc::call_text("pane.list", serde_json::json!({}))
         .map_err(|e| format!("preview failed: {e}"))?;
     let caller_tab_id = crate::launch::tab_of(&list, my_pane_id);
-    sweep_orphan_controls(&list);
+    // An unrestorable journal must never block ordinary previews in this
+    // tab. The takeover path below retries the restore and reports it.
+    if let Err(error) = crate::takeover::recover(&caller_tab_id) {
+        eprintln!("herdr-sidebar: temporary preview restore deferred: {error}");
+    }
+    let list =
+        ipc::call_text("pane.list", serde_json::json!({})).map_err(|error| error.to_string())?;
     // Route only within OUR space. A session-wide search reused another
     // project's ephemeral tab and focus jumped there, which reads as the
     // tree refusing to change.
     let my_workspace = crate::launch::workspace_of(&list, my_pane_id);
+    sweep_orphan_controls(&list);
     let mut previews: Vec<PreviewPane> = previews_in(&list)
         .into_iter()
         .filter(|p| p.workspace_id == my_workspace)
         .collect();
-    for stale in previews.iter().filter(|preview| preview.stale) {
-        remove_control_file(&stale.control);
-        if (stale.dedicated || stale.resumed) && tab_is_plugin_only(&list, &stale.tab_id) {
-            let _ = ipc::call_text("tab.close", serde_json::json!({ "tab_id": stale.tab_id }));
-        } else {
-            let _ = ipc::call_text(
-                "pane.close",
-                serde_json::json!({ "pane_id": stale.pane_id }),
-            );
+    for action in stale_cleanup(&previews, &list) {
+        match action {
+            StaleCleanup::CloseTab { tab_id, control } => {
+                remove_control_file(&control);
+                let _ = ipc::call_text("tab.close", serde_json::json!({ "tab_id": tab_id }));
+            }
+            StaleCleanup::ClosePane { pane_id, control } => {
+                remove_control_file(&control);
+                let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
+            }
         }
     }
-    previews.retain(|preview| !preview.stale);
+    if let Some(frozen) = unresponsive_inline_in(&previews, inline, &caller_tab_id) {
+        // Never wait here and never kill it: queue the document for when it
+        // responds (its own unsaved-changes prompt still guards a dirty buffer).
+        let _ = write_scratch_file(&frozen.control, payload);
+        return Err(
+            "the preview in this tab is not responding; it will show this file when it does \
+             (or close its pane from herdr)"
+                .into(),
+        );
+    }
+    previews.retain(|preview| routable(preview, inline, &caller_tab_id));
     previews.sort_by(|a, b| a.tab_id.cmp(&b.tab_id).then(a.pane_id.cmp(&b.pane_id)));
-    // An inline viewer belongs to ONE tab: never route this tab's clicks into
-    // another tab's pane, and never let a tab-mode click adopt one.
-    previews
-        .retain(|preview| preview.inline == inline && (!inline || preview.tab_id == caller_tab_id));
     let origin_tab_id = preview_origin_tab(&previews, &caller_tab_id);
 
     // 1. Already open — jump to it, pinned or not.
@@ -2388,7 +2544,17 @@ pub fn open_in_pane(
     }
 
     // 3. Nothing reusable — a pane beside the sidebar, or a tab of its own.
-    if inline {
+    if state.preview_placement == crate::state::PreviewPlacement::Replace {
+        crate::takeover::open(
+            my_pane_id,
+            spawn_cwd,
+            doc_key,
+            payload,
+            &caller_tab_id,
+            state.dock_right,
+            state.sidebar_width,
+        )
+    } else if inline {
         spawn_inline_pane(
             my_pane_id,
             spawn_cwd,
@@ -2501,7 +2667,7 @@ fn spawn_preview_tab(
 /// away from its dock edge, and leave focus in the sidebar: the preview is
 /// visible right there, so stealing focus would only stop the user from
 /// walking the tree with the arrow keys.
-fn spawn_inline_pane(
+pub(crate) fn spawn_inline_pane(
     my_pane_id: &str,
     spawn_cwd: &Path,
     doc_key: &str,
@@ -2551,32 +2717,72 @@ fn remember_origin(pane_id: &str, tab_id: &str) {
     );
 }
 
-/// Ask this tab's viewer to close (Esc from the sidebar). A live viewer owns
-/// the close so an editor with unsaved changes can confirm first; only a stale
-/// resumed pane is killed directly.
-pub fn close_in_tab(my_pane_id: &str) {
+/// How the sidebar's Esc treats this tab's viewer.
+#[derive(Debug, PartialEq, Eq)]
+enum EscClose {
+    /// Ask the viewer to close itself, so a dirty editor can confirm first.
+    Request,
+    /// A label-only pane from a server resume: provably no process left.
+    Kill,
+}
+
+/// Only a resumed husk (no heartbeat token at all) is killed. A stale stamp
+/// may be a suspended or stalled viewer with unsaved edits.
+fn esc_close_action(stale: bool, resumed: bool) -> EscClose {
+    if stale && resumed {
+        EscClose::Kill
+    } else {
+        EscClose::Request
+    }
+}
+
+/// Ask this tab's viewer to close (Esc from the sidebar). A viewer owns its
+/// close so an editor with unsaved changes can confirm first. Returns a
+/// notice for the sidebar when the viewer does not respond.
+pub fn close_in_tab(my_pane_id: &str) -> Option<String> {
     let Ok(json) = ipc::call_text("pane.list", serde_json::json!({})) else {
-        return;
+        return None;
     };
-    if let Some((id, stale)) = viewer_pane_in_tab(&json, my_pane_id) {
-        if stale {
-            if let Some(preview) = previews_in(&json)
-                .into_iter()
-                .find(|preview| preview.pane_id == id)
-                && (preview.dedicated || preview.resumed)
-                && tab_is_plugin_only(&json, &preview.tab_id)
-            {
-                close_preview_tab(&preview);
-            } else {
-                let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }));
+    let tab = crate::launch::tab_of(&json, my_pane_id);
+    let Some((id, stale)) = viewer_pane_in_tab(&json, my_pane_id) else {
+        // Nothing to close, but an orphaned takeover journal (its viewer was
+        // closed from herdr) can still bring the working panes back.
+        return crate::takeover::recover(&tab)
+            .err()
+            .map(|error| format!("cannot restore the working panes: {error}"));
+    };
+    let preview = previews_in(&json)
+        .into_iter()
+        .find(|preview| preview.pane_id == id);
+    let resumed = preview.as_ref().is_some_and(|preview| preview.resumed);
+    match esc_close_action(stale, resumed) {
+        EscClose::Kill => {
+            match preview {
+                Some(preview)
+                    if (preview.dedicated || preview.resumed)
+                        && tab_is_plugin_only(&json, &preview.tab_id) =>
+                {
+                    close_preview_tab(&preview);
+                }
+                _ => {
+                    let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }));
+                }
             }
-        } else {
-            let control = previews_in(&json)
-                .into_iter()
-                .find(|preview| preview.pane_id == id)
+            crate::takeover::recover(&tab)
+                .err()
+                .map(|error| format!("cannot restore the working panes: {error}"))
+        }
+        EscClose::Request => {
+            let control = preview
                 .map(|preview| preview.control)
                 .unwrap_or_else(|| control_path_for_pane(&id));
             let _ = write_scratch_file(&control, "close");
+            // No waiting: the request applies as soon as the viewer responds.
+            stale.then(|| {
+                "preview is not responding; it will close when it does (or close its pane \
+                 from herdr)"
+                    .to_string()
+            })
         }
     }
 }
@@ -2667,7 +2873,7 @@ pub struct PreviewPane {
 }
 
 /// Every preview pane in the session, from one `pane.list` payload.
-fn previews_in(pane_list_json: &str) -> Vec<PreviewPane> {
+pub(crate) fn previews_in(pane_list_json: &str) -> Vec<PreviewPane> {
     #[derive(serde::Deserialize)]
     struct Msg {
         result: Res,
@@ -4448,6 +4654,154 @@ mod tests {
             glow_args(120, false),
             ["--style", "dark", "--width", "120", "-"]
         );
+    }
+
+    #[test]
+    fn click_cleanup_only_kills_label_only_resumed_husks() {
+        let json = r#"{"result":{"panes":[
+            {"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","label":"Sidebar"},
+            {"pane_id":"w1:p2","tab_id":"w1:t1","workspace_id":"w1",
+             "tokens":{"herdr-sidebar-preview":"100","hs-preview-path":"0123456789abcdef","hs-preview-inline":"1"}},
+            {"pane_id":"w1:p3","tab_id":"w1:t2","workspace_id":"w1","label":"notes.md · preview"}
+        ]}}"#;
+        let previews = previews_in(json);
+        let stamped = previews.iter().find(|p| p.pane_id == "w1:p2").unwrap();
+        assert!(stamped.stale && !stamped.resumed);
+        let actions = stale_cleanup(&previews, json);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(matches!(
+            &actions[0],
+            StaleCleanup::CloseTab { tab_id, .. } if tab_id == "w1:t2"
+        ));
+    }
+
+    fn preview(pane: &str, tab: &str, inline: bool, stale: bool) -> PreviewPane {
+        PreviewPane {
+            pane_id: pane.into(),
+            tab_id: tab.into(),
+            workspace_id: "w1".into(),
+            doc_token: String::new(),
+            pinned: false,
+            control: PathBuf::from(format!("{pane}.ctl")),
+            stale,
+            dedicated: !inline,
+            inline,
+            origin_tab_id: tab.into(),
+            resumed: false,
+        }
+    }
+
+    /// A stale (dead-but-stamped) viewer in ANOTHER tab must not affect a
+    /// click at all: no wait, no refusal, just not a routing target.
+    #[test]
+    fn unrelated_stale_viewers_neither_block_nor_receive_clicks() {
+        let previews = vec![
+            preview("w1:p9", "w1:t9", false, true),
+            preview("w1:p8", "w1:t8", true, true),
+            preview("w1:p2", "w1:t1", true, false),
+        ];
+        for inline in [false, true] {
+            assert!(unresponsive_inline_in(&previews, inline, "w1:t1").is_none());
+        }
+        let routed: Vec<_> = previews
+            .iter()
+            .filter(|p| routable(p, true, "w1:t1"))
+            .map(|p| p.pane_id.as_str())
+            .collect();
+        assert_eq!(routed, vec!["w1:p2"]);
+        assert!(!previews.iter().any(|p| routable(p, false, "w1:t1")));
+    }
+
+    #[test]
+    fn a_stale_inline_viewer_in_the_callers_tab_is_reported_not_duplicated() {
+        let previews = vec![preview("w1:p2", "w1:t1", true, true)];
+        assert_eq!(
+            unresponsive_inline_in(&previews, true, "w1:t1").map(|p| p.pane_id.as_str()),
+            Some("w1:p2")
+        );
+        assert!(unresponsive_inline_in(&previews, false, "w1:t1").is_none());
+        assert!(!routable(&previews[0], true, "w1:t1"));
+    }
+
+    /// A takeover close that failed must not leave `close` in the control
+    /// file, or the next loop iteration would take the "close anyway" branch
+    /// without the user's second deliberate q.
+    #[test]
+    fn a_failed_close_never_leaves_the_close_request_behind() {
+        let file = Request::File {
+            path: PathBuf::from("/repo/a.rs"),
+            line: None,
+        };
+        let restored = control_after_failed_close(&Some(file.clone()));
+        assert_eq!(parse_request(&restored), Some(file));
+        assert_eq!(parse_request(&control_after_failed_close(&None)), None);
+    }
+
+    #[test]
+    fn preview_footer_keeps_close_visible_when_narrow() {
+        assert_eq!(preview_hint(&["space/b page"], 12), " q close");
+        let wide = preview_hint(&["space/b page", "↑↓ scroll", "w: wrap on"], 200);
+        assert!(wide.starts_with(" q close  space/b page"), "{wide}");
+        assert!(wide.ends_with("Ctrl/Cmd+C copy"), "{wide}");
+        assert!(
+            preview_hint(&["space/b page", "↑↓ scroll"], 30)
+                .chars()
+                .count()
+                <= 30
+        );
+    }
+
+    #[test]
+    fn sidebar_escape_never_kills_a_stamped_viewer() {
+        assert_eq!(esc_close_action(false, false), EscClose::Request);
+        assert_eq!(esc_close_action(true, false), EscClose::Request);
+        assert_eq!(esc_close_action(true, true), EscClose::Kill);
+    }
+
+    #[test]
+    fn heartbeat_follows_wall_clock_across_suspend_and_corrections() {
+        assert!(!heartbeat_due(1_000, 1_004));
+        assert!(heartbeat_due(1_000, 1_005));
+        // Resumed after an hour asleep: due at once, not after 5 more seconds.
+        assert!(heartbeat_due(1_000, 4_600));
+        // Clock corrected backwards: stamp again rather than go silent.
+        assert!(heartbeat_due(1_000, 900));
+    }
+
+    #[test]
+    fn orphan_sweep_keeps_the_control_of_a_present_stale_viewer() {
+        let dir = std::env::temp_dir().join(format!("herdr-viewer-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::rundir::ensure_private(&dir).unwrap();
+        let kept = dir.join("p-1-a-0.ctl");
+        let orphan = dir.join("p-1-b-0.ctl");
+        let old = std::time::SystemTime::now() - Duration::from_secs(600);
+        for path in [&kept, &orphan] {
+            std::fs::write(path, "close").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let present = PreviewPane {
+            pane_id: "w1:p2".into(),
+            tab_id: "w1:t1".into(),
+            workspace_id: "w1".into(),
+            doc_token: String::new(),
+            pinned: false,
+            control: kept.clone(),
+            stale: true,
+            dedicated: false,
+            inline: true,
+            origin_tab_id: "w1:t1".into(),
+            resumed: false,
+        };
+        sweep_orphan_controls_in(&dir, &[present]);
+        assert!(kept.exists(), "a present (stale) viewer keeps its control");
+        assert!(!orphan.exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

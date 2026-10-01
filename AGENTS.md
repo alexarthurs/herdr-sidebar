@@ -120,6 +120,55 @@ executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launch
 
 ### Release flow
 
+- Settings shows the running binary's Cargo version. `updates.rs` checks stable GitHub
+  releases on a background thread (bounded curl request, 30-minute cache); local/third-party
+  registrations never offer self-update. The explicit Update action uses Herdr's staged
+  `plugin install --ref vX.Y.Z --yes`, preserving the existing checksum-verifying build
+  scripts, then verifies the registered version before invoking the NEW installation's
+  refresh action. Herdr 0.9.1 exposes install only through its CLI, not the socket API;
+  its plugin action runner waits for child completion without an action timeout.
+  Update helpers serialize through a private runtime lock (`updates/install.lock`, an OS lock
+  the kernel releases on death) and keep install/error logs under the runtime `updates`
+  directory. Windows subprocesses use CREATE_NO_WINDOW with redirected streams. Local
+  development deployments must still build and refresh explicitly; no automatic background
+  installs.
+- Update flow invariants (`updates.rs`, `ensure::refresh_all`; hermetic tests drive both
+  through injected `UpdateHost` / `RefreshHost` fakes — no production URL/env overrides):
+  - The updater `set_current_dir`s into the private runtime dir before installing: herdr runs
+    actions with cwd = plugin root, and a process's cwd is the one handle that can block the
+    managed-directory rename on Windows.
+  - It ALWAYS hands off to the refresh action, even when the latest release is already
+    installed: a retry after an install whose refresh failed must restart the sidebars that
+    still offer the update. Install only happens for a strictly newer, verified release.
+  - Status is `installing` → `refreshing` → `finished`/`failed`, and `finished` is written by
+    the REFRESH action once every sidebar really restarted — never when it is merely queued.
+    An in-flight record whose install lock is free and that is older than 60s reads as
+    "Update interrupted" (retryable), so a killed updater cannot pin "installing…" for 30 min.
+  - The Settings row requests the update action on a worker thread (herdr runs actions
+    asynchronously, but the IPC round trip must not sit on the TUI loop).
+  - **Refresh never hard-closes a sidebar.** SCM commit drafts are NOT persisted per keystroke
+    (only on close/quit/switch paths), so `pane.close` would lose them. Every sidebar gets
+    Ctrl+Q (save drafts, close self) — even one whose snapshot said "starting", since it may be
+    running by the time input lands. Refresh waits up to 5s, reopens only the views whose panes
+    actually closed, and counts a reopen only when a fresh sidebar with that view's token is
+    present afterwards (`open` can return Ok without docking). Survivors (unsaved draft that
+    failed to save, hung TUI) keep running the old build and are reported. Preview, editor,
+    inline and takeover viewers are never closed. Sidebar-only tabs are not touched (closing
+    the last pane closes the tab) and are reported, so such a refresh is not "finished".
+- Live Windows evidence (maintainer host, herdr 0.9.1, 2026-09-30, disposable isolated session
+  with `XDG_CONFIG_HOME`/`XDG_STATE_HOME` redirected and socket/context env removed):
+  a REAL staged `plugin install` from v0.13.0 to v0.14.0 passed while an old v0.13 Sidebar was
+  running in the session — a loaded exe alone does NOT block herdr's managed-directory swap.
+  A failing install (nonexistent `--ref`) preserved the v0.14 registration and binary. The old
+  `.tmp-install` / previous checkout stayed behind because the still-running old exe prevented
+  full cleanup; nothing auto-deletes old viewers. A long scratch root made the source-build
+  fallback fail with MSVC LNK1104 (MAX_PATH); a short root succeeded. The NEW updater could
+  not be exercised end-to-end because published v0.14 has no refresh action yet. With fresh
+  debug builds of the new code in the same kind of isolated managed session, a typed but
+  unsubmitted SCM draft (`keep-this-draft`) survived `--refresh-sidebars`: the sidebar came
+  back with a NEW pane id and the draft visible, and a second sidebar in the session was
+  refreshed too (`target/refresh-smoke.ps1`, maintainer-local).
+
 - Bump the version in THREE files: `Cargo.toml`, `herdr-plugin.toml`, and `Cargo.lock`
   (any cargo command regenerates the lock entry). Commit as `vX.Y.Z`, `git tag vX.Y.Z`,
   push branch + tag.
@@ -739,12 +788,81 @@ HACKING.md — budget time for that before promising a patched build.
   closure requires a post-move `hs-preview-dedicated` ownership token AND an all-plugin pane
   whitelist; if the user added a shell/agent pane, only the viewer closes.
 
-### Preview tabs (TRIAL — combined PRs #15 + #17, branch `trial/preview-tabs-wrap`)
+### Preview placement and tabs
 
-Previews follow **VS Code's editor-tab semantics**, mapped onto herdr TABS. This
-REPLACED the old full-size park/restore mode: `preview_full`, `park_others`,
-`restore_parked`, `owner_frac`/`enforce_owner_width` and the "Full-size preview"
-setting are all gone.
+`Preview opens in` now cycles `tab` (unchanged default), `pane`, and `replace`.
+`replace` is temporary takeover (#64): `takeover.rs` journals the original split
+tree and terminal identities under a private, session-and-tab-keyed path BEFORE
+moving working panes to a snoozed background tab, then opens one inline viewer.
+All layout work holds `LaunchLock`, so queued creation hooks cannot dock a sidebar
+into the parking tab. Invariants (each has a hermetic test against a simulated
+host in `takeover::tests`):
+- **A present viewer is never moved or closed by recovery**, whatever its heartbeat:
+  a stale stamp can be a suspended laptop or a stalled loop holding unsaved edits.
+  Only the journal's own closing viewer (`restore(tab, closing_viewer)`), or a
+  viewer that is gone, lets a restore run. Replace clicks over a present viewer
+  report instead of spawning another.
+- **Restore is best-effort and always finishes**: panes the user closed or moved to
+  a third tab are pruned from the tree; a hidden sidebar is replaced by the first
+  surviving pane as anchor; panes added during the preview stay where they are; a
+  subtree whose move fails stays in the parking tab, relabelled
+  `Working panes (not restored)` and un-snoozed. The journal is deleted either way,
+  so a lost pane can never trap the tab. A closed previewed tab (or ids changed by a
+  server restart) abandons the journal on the next hook sweep of THIS session only.
+- **Hook retries are budgeted** (3 real attempts per 60s). A hook that finds the
+  viewer still open does not spend budget, so focus bursts never delay recovery.
+- If the viewer's own restore fails, the first q/Esc shows why and puts the
+  control file back to the current document; only a second deliberate close
+  abandons the layout (panes stay in the relabelled tab).
+- **Running-TUI transport (M1) — partly verified.** Takeover moves RUNNING user panes
+  across tabs, and the v0.8.0 finding above says moving a running crossterm TUI can
+  invalidate its Windows input handle. Evidence on the maintainer's Windows 11 host
+  (herdr 0.9.1, 2026-09-29), both ignored live tests run serially (8.91s), PASSED:
+  `takeover::tests::live_parked_running_tui_still_takes_input_after_restore` parked a
+  RUNNING read-only crossterm preview viewer in the temporary tab, restored it, and it
+  still took a key afterwards; `takeover::tests::live_takeover_roundtrip` restored
+  left/right-docked nested geometry exactly and recovered after a forced viewer close.
+  Both need an attached Herdr session (`HERDR_ENV=1`) and a fresh build on PATH, and
+  touch only their own disposable tabs. **Still untested:** third-party TUIs (Claude
+  Code, vim, other agents) and other hosts/versions — check those manually before
+  recommending `replace` on Windows.
+
+Stale previews are never killed from routing or Esc anymore: a click excludes a
+stamped-but-stale viewer from routing without waiting (an unrelated stale viewer
+costs nothing; a stale inline viewer in the caller's own tab is handed the request
+and reported), and the sidebar's Esc writes a close request. Only label-only panes
+from a server resume (no heartbeat token) are closed directly, and the orphan
+control sweep keeps a present viewer's control file. The viewer's heartbeat
+cadence uses wall-clock time: `Instant` stops during suspend, so after resume the
+old stamp would stay stale for up to 5s while recovery reads it.
+The ignored `takeover::tests::live_takeover_roundtrip` test requires an attached
+Herdr session and the newly built sidebar on PATH; it creates disposable test tabs,
+checks left/right docks with nested work panes, and verifies real `q` restoration.
+
+SCM tree/list mode (#66/#76) is toggled with `t`, the title action, or Settings.
+The mode is ONE global setting (`scm_tree_view`), re-read on every tick like the
+other shared settings; a per-folder copy used to override it forever. Collapsed
+folders persist per repository and staged/unstaged scope and are pruned to folders
+that still exist — judged against ALL current compacted folder paths, not the visible
+rows (a child hidden inside a collapsed parent keeps its state), and never against a
+not-yet-loaded, empty status. Folder
+stage/unstage goes through `Git::stage_under` / `Git::unstage_under` — batched and
+nested-repository-safe, never one process per file on the UI thread. The folder
+button only fires on the hovered row (a tap folds instead); keyboard parity is
+←/→ fold and `m` for a Stage/Unstage Folder menu.
+The branch picker supports New branch (#77); branch deletion first uses `-d`
+and asks separately before `-D` (#78). Keep `--` before branch names in both paths.
+Preview Space/`b` page down/up (#73); Shift+Space is indistinguishable in legacy
+terminal keyboard mode and must not be used as the sole page-up gesture.
+
+Windows agent-command note: if ordinary tool shells create visible Windows Terminal
+windows, run shell calls with a headless PTY (`tty: true`) and `login: false`.
+MCP helper processes can also create startup consoles; identify their parent PID
+before stopping any, and never kill the shared WindowsTerminal process.
+
+Tab placement follows **VS Code's editor-tab semantics**, mapped onto herdr TABS.
+It replaced the original pane-ID-keyed park/restore implementation; the optional
+`replace` mode above uses a new journal instead of reviving that implementation.
 
 - Clicking a file opens it in **its own tab** and jumps there. Clicking a different
   file **overwrites that same tab** — it is EPHEMERAL, and its tab label reads
@@ -779,9 +897,10 @@ setting are all gone.
   leaving a frozen first frame and a control file nobody reads. Viewer pane labels keep stable
   ` · preview` / ` · editor` suffixes so a server-resumed pane with lost tokens is still
   reclaimable; the classifier also retains the legacy `Preview · ` / `Editor · ` prefixes.
-- Preview routing treats a missing heartbeat as stale, includes label-only server-resumed viewers
-  as cleanup candidates, and closes their whole tab only when every pane is recognizably plugin-owned;
-  a real shell/agent pane forces narrow viewer cleanup. Redeploy closes/restarts sidebar panes but NEVER kills the shared
+- Preview routing never routes to a stale viewer, but only CLOSES label-only server-resumed
+  viewers (no heartbeat token) — their whole tab only when every pane is recognizably
+  plugin-owned; a real shell/agent pane forces narrow viewer cleanup. A stamped-but-stale
+  viewer may hold unsaved edits and is left alone (see Preview placement above). Redeploy closes/restarts sidebar panes but NEVER kills the shared
   `herdr-sidebar` process name wholesale: a spared Preview may contain an unsaved editor buffer.
 - Herdr truncates long metadata token values (an absolute `%TEMP%` control path was shortened to
   a different, valid-looking filename). Control metadata therefore carries only a compact basename,
@@ -936,8 +1055,8 @@ setting are all gone.
   coarse timestamps and same-length rewrites can miss real changes.
 - Sidebar Esc cannot directly `pane.close` a live preview anymore: pane close kills the TUI
   before it can confirm dirty state. `close_in_tab` writes a `close` control request; the
-  viewer confirms save/discard/cancel and then closes itself (stale viewers are still killed
-  directly). The same prompt guards control-file switches to another preview.
+  viewer confirms save/discard/cancel and then closes itself (only label-only resumed husks
+  are killed directly; a stale stamp gets the request and a notice). The same prompt guards control-file switches to another preview.
 - Clipboard is best-effort and command-backed: `clip` / PowerShell `Get-Clipboard` on
   Windows, `pbcopy`/`pbpaste` on macOS, and wl-clipboard or xclip on Linux. Over SSH, copy
   emits bounded OSC 52 only when stdout is a terminal, following herdr's own clipboard path;
@@ -1121,9 +1240,9 @@ end-to-end twice:
    `s` over the hero layout.
 5. **Frame**: `python tools/screenshots/frame_all.py <dir with crop-*.png>` writes the
    framed set straight into docs/media (gradient backdrop + macOS-style titlebar).
-6. **Teardown**: close the tab, PEB-scan-kill any process whose cwd is under acme-app
-   (see the feature-worktree skill for the snippet), delete acme-app + .acme-origin.git,
-   restore the window size.
+6. **Teardown**: close the disposable capture tab, stop only test processes still using
+   acme-app, verify the scratch paths before deleting acme-app + .acme-origin.git,
+   and restore the window size.
 
 Hard-won capture gotchas:
 
@@ -1227,4 +1346,5 @@ First clean install of both plugins on a Mac (driven over SSH), findings:
 
 `herdr-layout.yaml` at the repo root describes the workspace (Coordinator tab running claude,
 shell tab, git tab with lazygit). The Coordinator session delegates feature work to sibling
-panes — see `.claude/skills/feature-worktree/` (one feature = one git worktree = one pane).
+panes. Create feature worktrees only when explicitly requested; the old repository-local
+feature-worktree skill has been retired.

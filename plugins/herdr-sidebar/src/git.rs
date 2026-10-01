@@ -48,6 +48,17 @@ pub struct Branch {
     pub remote: bool,
 }
 
+/// Why a non-forcing branch delete did not happen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeleteRefused {
+    /// The branch holds commits reachable from nowhere else; deleting it loses
+    /// them. The only case worth re-asking about.
+    NotMerged,
+    /// Anything else — checked out in another worktree, no such branch, git
+    /// missing. Carries git's own message.
+    Failed(String),
+}
+
 /// What one [`Git::stage_under`] call did: how many paths it staged, and how
 /// many it deliberately left alone because they live at or inside a NESTED
 /// repository. The second number is what lets the UI explain a stage that
@@ -307,6 +318,46 @@ impl Git {
         })
     }
 
+    /// Unstage everything staged at or under the repo-relative `prefix`
+    /// (`/`-separated) with a handful of batched `reset` calls instead of one
+    /// process per file. A rename whose source or destination lies under the
+    /// prefix is unstaged as a pair, mirroring [`Self::stage_under`].
+    pub fn unstage_under(&self, prefix: &str) -> Result<usize, String> {
+        let status = self.status()?;
+        let mut paths: Vec<String> = Vec::new();
+        for entry in &status.staged {
+            let touches = under(&entry.path, Some(prefix))
+                || entry
+                    .orig
+                    .as_deref()
+                    .is_some_and(|original| under(original, Some(prefix)));
+            if !touches {
+                continue;
+            }
+            for path in std::iter::once(&entry.path).chain(entry.orig.iter()) {
+                if !paths.contains(path) {
+                    paths.push(path.clone());
+                }
+            }
+        }
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        // Same unborn-branch rule as `unstage`: without a HEAD there is
+        // nothing to reset against, and `rm --cached` is only safe then.
+        let has_head = self.has_head();
+        for chunk in paths.chunks(64) {
+            let mut args = if has_head {
+                vec!["reset", "-q", "--"]
+            } else {
+                vec!["rm", "--cached", "-r", "-q", "--"]
+            };
+            args.extend(chunk.iter().map(String::as_str));
+            run_in(&self.root, &args)?;
+        }
+        Ok(paths.len())
+    }
+
     /// `target` as a `/`-separated repo-relative path; `None` when it IS the
     /// repo root (no prefix = the whole repo). Refuse an outside or
     /// differently-normalized path rather than accidentally staging the whole
@@ -406,6 +457,96 @@ impl Git {
             ],
         )?;
         Ok(parse_branch_choices(&out))
+    }
+
+    /// Delete a branch without forcing. `NotMerged` is reported separately so
+    /// the caller can ask a second, informed question instead of destroying
+    /// commits behind a prompt that could not know they existed.
+    pub fn delete_branch(&self, name: &str) -> Result<(), DeleteRefused> {
+        let branch_ref = format!("refs/heads/{name}");
+        let worktrees = run_in(&self.root, &["worktree", "list", "--porcelain"])
+            .map_err(DeleteRefused::Failed)?;
+        if worktrees
+            .lines()
+            .any(|line| line.strip_prefix("branch ") == Some(&branch_ref))
+        {
+            return Err(DeleteRefused::Failed(format!(
+                "branch '{name}' is checked out in a worktree"
+            )));
+        }
+        match run_in(&self.root, &["branch", "-d", "--", name]) {
+            Ok(_) => Ok(()),
+            // git's refusal text is translated under a non-English locale, and
+            // nothing here pins one, so classify the failure structurally
+            // rather than by matching the message.
+            Err(message) => match self.branch_is_merged(name) {
+                Some(false) => Err(DeleteRefused::NotMerged),
+                _ => Err(DeleteRefused::Failed(message)),
+            },
+        }
+    }
+
+    /// `branch -D`: only for a caller that has confirmed the loss explicitly.
+    pub fn force_delete_branch(&self, name: &str) -> Result<(), String> {
+        run_in(&self.root, &["branch", "-D", "--", name]).map(drop)
+    }
+
+    /// Whether `name`'s tip is contained in its upstream (or HEAD). `None` when the ref
+    /// does not resolve, which keeps a missing branch — or any other failure —
+    /// from being mistaken for unmerged work.
+    fn branch_is_merged(&self, name: &str) -> Option<bool> {
+        let branch_ref = format!("refs/heads/{name}");
+        run_in(
+            &self.root,
+            &["rev-parse", "--verify", "--quiet", &branch_ref],
+        )
+        .ok()?;
+        let upstream = run_in(
+            &self.root,
+            &["for-each-ref", "--format=%(upstream)", &branch_ref],
+        )
+        .ok()?;
+        let destination = if upstream.trim().is_empty() {
+            "HEAD"
+        } else {
+            upstream.trim()
+        };
+        let status = git_command(
+            &self.root,
+            &["merge-base", "--is-ancestor", &branch_ref, destination],
+        )
+        .output()
+        .ok()?
+        .status;
+        match status.code() {
+            Some(0) => Some(true),
+            Some(1) => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Create a branch at HEAD and switch to it. `switch -c` refuses to
+    /// clobber an existing branch, so an in-use name is reported rather than
+    /// silently reset, and a dirty worktree carries over exactly as it does
+    /// for [`Self::checkout_branch`].
+    pub fn create_branch(&self, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("branch name is empty".to_string());
+        }
+        // Let git judge the name: its rules cover far more than a hand-rolled
+        // check (trailing `.lock`, `@{`, control characters, leading dashes).
+        let validated = run_in(&self.root, &["check-ref-format", "--branch", name])
+            .map_err(|_| format!("`{name}` is not a valid branch name"))?;
+        if validated.trim() != name {
+            return Err("enter a literal new branch name".into());
+        }
+        // `check-ref-format --branch` accepts `refs/heads/x`, which would
+        // create `refs/heads/refs/heads/x` — ambiguous everywhere after.
+        if name.starts_with("refs/") {
+            return Err("enter the branch name without a refs/ prefix".into());
+        }
+        run_in(&self.root, &["switch", "-c", name]).map(drop)
     }
 
     /// Checkout one picker entry. Remote refs become ordinary local tracking
@@ -1120,6 +1261,182 @@ mod tests {
         })
         .unwrap();
         assert_eq!(git.status().unwrap().branch, "remote-topic");
+        let _ = std::fs::remove_dir_all(&git.root);
+    }
+
+    #[test]
+    fn unstage_under_batches_a_large_directory_and_keeps_renames_paired() {
+        let git = repo_with_head("unstage-under");
+        std::fs::create_dir_all(git.root.join("big")).unwrap();
+        for index in 0..70 {
+            std::fs::write(git.root.join(format!("big/f{index}.txt")), "x").unwrap();
+        }
+        std::fs::write(git.root.join("keep.txt"), "keep").unwrap();
+        std::fs::write(git.root.join("old.txt"), "moved").unwrap();
+        run_in(&git.root, &["add", "-A"]).unwrap();
+        run_in(
+            &git.root,
+            &[
+                "-c",
+                "user.email=t@t.dev",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ],
+        )
+        .unwrap();
+        for index in 0..70 {
+            std::fs::write(git.root.join(format!("big/f{index}.txt")), "changed").unwrap();
+        }
+        std::fs::write(git.root.join("keep.txt"), "changed").unwrap();
+        run_in(&git.root, &["mv", "old.txt", "big/moved.txt"]).unwrap();
+        run_in(&git.root, &["add", "-A"]).unwrap();
+
+        let count = git.unstage_under("big").unwrap();
+        assert_eq!(count, 72, "70 files plus both sides of the rename");
+        let status = git.status().unwrap();
+        assert_eq!(
+            status
+                .staged
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep.txt"],
+            "only the path outside the prefix stays staged"
+        );
+        assert_eq!(git.unstage_under("big").unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&git.root);
+    }
+
+    #[test]
+    fn create_branch_makes_and_switches_to_the_new_branch() {
+        let git = repo_with_head("create-branch");
+        git.create_branch("feature/login").unwrap();
+        assert_eq!(git.status().unwrap().branch, "feature/login");
+        assert!(
+            git.branch_choices()
+                .unwrap()
+                .iter()
+                .any(|branch| branch.name == "feature/login" && branch.current)
+        );
+        let _ = std::fs::remove_dir_all(&git.root);
+    }
+
+    #[test]
+    fn create_branch_refuses_a_name_already_in_use() {
+        let git = repo_with_head("create-branch-existing");
+        let original = git.status().unwrap().branch;
+        git.create_branch("topic").unwrap();
+        git.checkout_branch(&Branch {
+            name: original.clone(),
+            current: false,
+            remote: false,
+        })
+        .unwrap();
+        assert!(git.create_branch("topic").is_err());
+        assert_eq!(git.status().unwrap().branch, original);
+        let _ = std::fs::remove_dir_all(&git.root);
+    }
+
+    #[test]
+    fn create_branch_rejects_a_malformed_name_before_running_switch() {
+        let git = repo_with_head("create-branch-invalid");
+        let original = git.status().unwrap().branch;
+        for bad in [
+            "",
+            "   ",
+            "has space",
+            "bad..name",
+            "-leading-dash",
+            "ends/",
+            "@{-1}",
+            "refs/heads/topic",
+        ] {
+            assert!(git.create_branch(bad).is_err(), "accepted {bad:?}");
+        }
+        assert_eq!(git.status().unwrap().branch, original);
+        let _ = std::fs::remove_dir_all(&git.root);
+    }
+
+    #[test]
+    fn delete_branch_removes_a_merged_branch_without_forcing() {
+        let git = repo_with_head("delete-merged");
+        run_in(&git.root, &["branch", "merged"]).unwrap();
+        assert_eq!(git.delete_branch("merged"), Ok(()));
+        assert!(
+            !git.branch_choices()
+                .unwrap()
+                .iter()
+                .any(|b| b.name == "merged")
+        );
+        let _ = std::fs::remove_dir_all(&git.root);
+    }
+
+    #[test]
+    fn delete_branch_reports_unmerged_work_instead_of_destroying_it() {
+        let git = repo_with_head("delete-unmerged");
+        let original = git.status().unwrap().branch;
+        run_in(&git.root, &["checkout", "-q", "-b", "wip"]).unwrap();
+        std::fs::write(git.root.join("w.txt"), "work").unwrap();
+        run_in(&git.root, &["add", "-A"]).unwrap();
+        run_in(
+            &git.root,
+            &[
+                "-c",
+                "user.email=t@t.dev",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "wip",
+            ],
+        )
+        .unwrap();
+        run_in(&git.root, &["checkout", "-q", &original]).unwrap();
+
+        assert_eq!(git.delete_branch("wip"), Err(DeleteRefused::NotMerged));
+        assert!(
+            git.branch_choices()
+                .unwrap()
+                .iter()
+                .any(|b| b.name == "wip"),
+            "a refused delete must leave the branch alone"
+        );
+        git.force_delete_branch("wip").unwrap();
+        assert!(
+            !git.branch_choices()
+                .unwrap()
+                .iter()
+                .any(|b| b.name == "wip")
+        );
+        let _ = std::fs::remove_dir_all(&git.root);
+    }
+
+    /// A branch that does not exist must not be reported as unmerged work —
+    /// that would offer to force-delete nothing and hide git's real message.
+    #[test]
+    fn delete_branch_separates_other_failures_from_unmerged() {
+        let git = repo_with_head("delete-missing");
+        match git.delete_branch("no-such-branch") {
+            Err(DeleteRefused::Failed(message)) => assert!(!message.is_empty()),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&git.root);
+    }
+
+    #[test]
+    fn delete_branch_does_not_offer_force_for_a_checked_out_branch() {
+        let git = repo_with_head("delete-checked-out");
+        let name = run_in(&git.root, &["branch", "--show-current"]).unwrap();
+        assert!(matches!(
+            git.delete_branch(name.trim()),
+            Err(DeleteRefused::Failed(_))
+        ));
+        assert!(run_in(&git.root, &["rev-parse", "--verify", "HEAD"]).is_ok());
         let _ = std::fs::remove_dir_all(&git.root);
     }
 

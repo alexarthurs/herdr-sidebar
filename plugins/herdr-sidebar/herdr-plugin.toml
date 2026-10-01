@@ -18,7 +18,7 @@
 
 id = "herdr-sidebar"
 name = "herdr-sidebar"
-version = "0.14.0"
+version = "0.15.0"
 description = "VS Code-style sidebar: file explorer + source control (with ✧ AI commit messages) in one herdr pane."
 min_herdr_version = "0.8.0"
 platforms = ["linux", "macos", "windows"]
@@ -147,6 +147,34 @@ platforms = ["linux", "macos"]
 title = "Redeploy sidebar panes"
 description = "Close all sidebar panes in every workspace so they respawn on the latest build."
 command = ["bash", "scripts/redeploy.sh"]
+
+[[actions]]
+id = "update"
+title = "Update sidebar"
+description = "Install the latest stable release and refresh sidebar panes; preserve previews."
+platforms = ["linux", "macos"]
+command = ["./target/release/herdr-sidebar", "--update-latest"]
+
+[[actions]]
+id = "update-windows"
+title = "Update sidebar"
+description = "Install the latest stable release and refresh sidebar panes; preserve previews."
+platforms = ["windows"]
+command = ['.\target\release\herdr-sidebar-ensure.exe', "--update-latest"]
+
+[[actions]]
+id = "refresh-sidebars"
+title = "Refresh all sidebars"
+description = "Refresh running sidebar views without closing preview or editor panes."
+platforms = ["linux", "macos"]
+command = ["./target/release/herdr-sidebar", "--refresh-sidebars"]
+
+[[actions]]
+id = "refresh-sidebars-windows"
+title = "Refresh all sidebars"
+description = "Refresh running sidebar views without closing preview or editor panes."
+platforms = ["windows"]
+command = ['.\target\release\herdr-sidebar-ensure.exe', "--refresh-sidebars"]
 
 [[actions]]
 id = "redeploy-windows"

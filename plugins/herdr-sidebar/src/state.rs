@@ -222,6 +222,7 @@ impl ColorTheme {
 pub enum PreviewPlacement {
     Tab,
     Pane,
+    Replace,
 }
 
 impl PreviewPlacement {
@@ -229,25 +230,28 @@ impl PreviewPlacement {
         match self {
             Self::Tab => "tab",
             Self::Pane => "pane",
+            Self::Replace => "replace",
         }
     }
 
     pub fn other(self) -> Self {
         match self {
             Self::Tab => Self::Pane,
-            Self::Pane => Self::Tab,
+            Self::Pane => Self::Replace,
+            Self::Replace => Self::Tab,
         }
     }
 
     /// True when previews share the caller's tab instead of getting one.
     pub fn is_inline(self) -> bool {
-        matches!(self, Self::Pane)
+        matches!(self, Self::Pane | Self::Replace)
     }
 
     fn from_state_name(name: &str) -> Option<Self> {
         match name {
             "tab" => Some(Self::Tab),
             "pane" => Some(Self::Pane),
+            "replace" => Some(Self::Replace),
             _ => None,
         }
     }
@@ -309,6 +313,8 @@ pub struct State {
     /// Replace mouse-click previews with the configured terminal editor.
     /// Keyboard Enter always retains the built-in preview path.
     pub custom_editor_on_click: bool,
+    /// View mode in Source Control: true for hierarchical tree view, false for flat list view.
+    pub scm_tree_view: bool,
 }
 
 impl Default for State {
@@ -331,6 +337,7 @@ impl Default for State {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             preview_placement: PreviewPlacement::Tab,
             custom_editor_on_click: false,
+            scm_tree_view: false,
         }
     }
 }
@@ -496,7 +503,7 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.search_active,
@@ -512,7 +519,8 @@ fn write_state(path: &Path, state: State) {
         clamp_sidebar_width(state.sidebar_width),
         state.color_theme.label(),
         state.preview_placement.label(),
-        state.custom_editor_on_click
+        state.custom_editor_on_click,
+        state.scm_tree_view
     );
     let _ = std::fs::write(path, json);
 }
@@ -662,6 +670,9 @@ pub struct ScmState {
     /// Draft roots this pane previously observed and has since emptied.
     /// Kept out of the JSON shape; it only scopes merge-on-write removals.
     pub cleared_drafts: std::collections::BTreeSet<String>,
+    /// Tree-view folders the user collapsed, as JSON `(repo root, staged,
+    /// path)` triples. The tree/list MODE itself is global (`scm_tree_view`).
+    pub collapsed_dirs: Vec<String>,
 }
 
 fn scm_path() -> Option<PathBuf> {
@@ -708,6 +719,15 @@ fn scm_state_for(file: &ScmFile, cwd: &Path) -> ScmState {
                 .collect()
         })
         .unwrap_or_default();
+    let collapsed_dirs = entry
+        .get("collapsed_dirs")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
     ScmState {
         drawers,
         active_root: entry
@@ -738,6 +758,7 @@ fn scm_state_for(file: &ScmFile, cwd: &Path) -> ScmState {
             })
             .unwrap_or_default(),
         cleared_drafts: std::collections::BTreeSet::new(),
+        collapsed_dirs,
     }
 }
 
@@ -778,6 +799,7 @@ pub fn save_scm_state(cwd: &Path, state: &ScmState) -> bool {
             "history_target": state.history_target,
             "scroll": state.scroll,
             "drafts": drafts,
+            "collapsed_dirs": state.collapsed_dirs,
         }),
     );
     serde_json::to_string(&file)
@@ -943,6 +965,10 @@ pub fn parse_state(json: &str) -> State {
             .get("custom_editor_on_click")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.custom_editor_on_click),
+        scm_tree_view: value
+            .get("scm_tree_view")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.scm_tree_view),
     }
 }
 
@@ -1087,8 +1113,9 @@ mod tests {
             sidebar_width: 44,
             preview_placement: PreviewPlacement::Pane,
             custom_editor_on_click: true,
+            scm_tree_view: true,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
@@ -1146,6 +1173,28 @@ mod tests {
         );
         assert_eq!(parse_state("garbage"), State::default());
         assert_eq!(parse_state("{\"active\":\"bogus\"}"), State::default());
+        assert!(parse_state("{\"scm_tree_view\":true}").scm_tree_view);
+    }
+
+    #[test]
+    fn scm_state_roundtrips_collapsed_dirs_and_ignores_legacy_tree_view() {
+        let json = r#"{"/repo/project":{"tree_view":true,"collapsed_dirs":["src","tests"]}}"#;
+        let file = decode_scm_file(json);
+        let st = scm_state_for(&file, Path::new("/repo/project"));
+        assert_eq!(st.collapsed_dirs, vec!["src", "tests"]);
+    }
+
+    #[test]
+    fn preview_cycle_keeps_tab_default_and_persists_takeover() {
+        assert_eq!(State::default().preview_placement, PreviewPlacement::Tab);
+        assert_eq!(PreviewPlacement::Tab.other(), PreviewPlacement::Pane);
+        assert_eq!(PreviewPlacement::Pane.other(), PreviewPlacement::Replace);
+        assert_eq!(PreviewPlacement::Replace.other(), PreviewPlacement::Tab);
+        assert_eq!(
+            parse_state(r#"{"preview_placement":"replace"}"#).preview_placement,
+            PreviewPlacement::Replace
+        );
+        assert!(PreviewPlacement::Replace.is_inline());
     }
 
     #[test]
