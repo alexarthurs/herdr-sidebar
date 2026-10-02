@@ -946,6 +946,14 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   key also preserves an explicit manual root across restarts. v0.10 label-only entries migrate
   only when the remembered path contains the tab's spawn cwd. Every successful manual or
   followed re-root is written to `roots.json`; a read-only `load_root` API is dead behavior.
+- **Herdr labels an unnamed workspace after its live folder** (verified live, 0.9.3: created
+  at `alpha` → label `alpha`; `cd beta` → label `beta`). A workspace created from another
+  project's folder therefore starts with THAT project's label and key, so its sidebar used to
+  write its followed `cd` over the other project's `roots.json` entry (user-reported: sx-flow's
+  sidebar showed GCP). `RootMemory` re-reads the label at SAVE time — the follow lands ~5s after
+  the `cd`, when the label has already moved. The root is also resolved once per process: a view
+  switch keeps the in-process root instead of re-reading `roots.json`, which was the channel that
+  pushed a clobbered entry into an already-running, healthy sidebar.
 - The ensure hook roots a docked sidebar from **the event's own tab**
   (`event_scope_in` → `launch_decision_in` / `focused_pane_in`): during a workspace
   switch the globally focused pane is still the space you came from. Both the Unix main-binary
