@@ -78,6 +78,9 @@ working panes back manually. Third-party TUIs are not yet verified with takeover
 - Browse commits, file history, branches, worktrees, remotes, stashes, and tags.
 - Keep branch and sync controls visible in every sidebar view with the compact Git footer;
   hide it from Settings if you prefer the extra row.
+- Status refreshes while the pane is focused. To keep a Source Control pane updating as a
+  passive monitor (for example beside an agent), launch it with
+  `HERDR_SIDEBAR_BACKGROUND_REFRESH=1` in its environment.
 
 ## Settings
 
