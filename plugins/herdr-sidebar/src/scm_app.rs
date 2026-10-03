@@ -983,6 +983,8 @@ pub struct App {
     persisted_draft_roots: std::collections::BTreeSet<String>,
     pending_unified_width: Option<(u16, std::time::Instant)>,
     pub tree_view: bool,
+    /// Keep polling Git status while unfocused ([`sidebar::BACKGROUND_REFRESH_ENV`]).
+    background_refresh: bool,
 }
 
 const MY_VIEW: View = View::SourceControl;
@@ -1099,6 +1101,9 @@ impl App {
             persisted_draft_roots,
             pending_unified_width: None,
             tree_view,
+            background_refresh: sidebar::background_refresh_enabled(
+                std::env::var(sidebar::BACKGROUND_REFRESH_ENV).ok().as_deref(),
+            ),
         };
         app.apply_identity();
         app.refresh();
@@ -1352,7 +1357,7 @@ impl App {
                 }
             }
         }
-        if !self.pane_is_focused() {
+        if !self.background_refresh && !self.pane_is_focused() {
             return;
         }
         if self.repos.is_empty() {
@@ -5632,6 +5637,16 @@ mod tests {
         ]}}"#;
         assert!(!pane_focused_in(panes, "w1:p1"));
         assert!(pane_focused_in(panes, "w1:p2"));
+    }
+
+    #[test]
+    fn background_refresh_is_opt_in() {
+        assert!(!sidebar::background_refresh_enabled(None));
+        assert!(!sidebar::background_refresh_enabled(Some("")));
+        assert!(!sidebar::background_refresh_enabled(Some("0")));
+        assert!(!sidebar::background_refresh_enabled(Some("true")));
+        assert!(sidebar::background_refresh_enabled(Some("1")));
+        assert!(sidebar::background_refresh_enabled(Some(" 1 ")));
     }
 
     #[test]

@@ -65,6 +65,16 @@ pub const PREVIEW_INLINE_ENV: &str = "HERDR_SIDEBAR_PREVIEW_INLINE";
 /// sidebar pane.
 pub const INITIAL_ACTIVITY_ENV: &str = "HERDR_SIDEBAR_INITIAL_ACTIVITY";
 
+/// Opt-in (`1`) for a Source Control pane that keeps polling Git status while
+/// unfocused. Meant for panes used as a passive "what changed" monitor next to
+/// an agent; by default an unfocused pane backs off to save `git status` runs.
+pub const BACKGROUND_REFRESH_ENV: &str = "HERDR_SIDEBAR_BACKGROUND_REFRESH";
+
+/// Whether a [`BACKGROUND_REFRESH_ENV`] value enables background refresh.
+pub fn background_refresh_enabled(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1"))
+}
+
 /// Unix seconds now — the heartbeat clock for pane identity tokens.
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
