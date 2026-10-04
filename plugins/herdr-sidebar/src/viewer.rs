@@ -460,14 +460,15 @@ impl Doc {
         }
     }
 
-    fn on_mouse(&mut self, mouse: &MouseEvent, body: Rect) {
+    /// True when a mouse release finishes a non-empty selection.
+    fn on_mouse(&mut self, mouse: &MouseEvent, body: Rect) -> bool {
         if self.media.is_some() {
-            return;
+            return false;
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let Some(position) = self.text_position_at(body, mouse.column, mouse.row) else {
-                    return;
+                    return false;
                 };
                 let extending = mouse.modifiers.contains(KeyModifiers::SHIFT);
                 let anchor = if extending {
@@ -481,22 +482,26 @@ impl Doc {
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 let Some(anchor) = self.selection.mouse_anchor else {
-                    return;
+                    return false;
                 };
                 let Some(position) = self.text_position_at(body, mouse.column, mouse.row) else {
-                    return;
+                    return false;
                 };
                 self.selection.anchor = Some(anchor);
                 self.selection.cursor = Some(position);
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                if self.selection.mouse_anchor.take().is_none() {
+                    return false;
+                }
                 if let Some(position) = self.text_position_at(body, mouse.column, mouse.row) {
                     self.selection.cursor = Some(position);
                 }
-                self.selection.mouse_anchor = None;
+                return self.selection_range().is_some();
             }
             _ => {}
         }
+        false
     }
 
     fn text_position_at(&self, body: Rect, column: u16, row: u16) -> Option<RenderPos> {
@@ -814,6 +819,19 @@ fn start_preview_load(request: Request) -> (Request, std::sync::mpsc::Receiver<D
         let _ = sender.send(load(&worker_request));
     });
     (request, receiver)
+}
+
+fn copy_selection(doc: &Doc) -> String {
+    let Some(text) = doc.selected_text() else {
+        return "select text before copying".into();
+    };
+    match crate::actions::copy_to_clipboard(&text) {
+        Ok(crate::actions::ClipboardWrite::Native) => "copied selection".into(),
+        Ok(crate::actions::ClipboardWrite::Osc52Unacknowledged) => {
+            "sent selection to terminal clipboard".into()
+        }
+        Err(error) => format!("clipboard unavailable: {error}"),
+    }
 }
 
 fn apply_diff_refresh(doc: &mut Doc, mut refreshed: Doc) {
@@ -1969,23 +1987,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                 match key.code {
                                     KeyCode::Char('a') if shortcut => doc.select_all(),
                                     KeyCode::Char('c') if shortcut => {
-                                        notice = Some(match doc.selected_text() {
-                                            Some(text) => {
-                                                match crate::actions::copy_to_clipboard(&text) {
-                                                    Ok(crate::actions::ClipboardWrite::Native) => {
-                                                        "copied selection".into()
-                                                    }
-                                                    Ok(
-                                                        crate::actions::ClipboardWrite::Osc52Unacknowledged,
-                                                    ) => "sent selection to terminal clipboard"
-                                                        .into(),
-                                                    Err(error) => {
-                                                        format!("clipboard unavailable: {error}")
-                                                    }
-                                                }
-                                            }
-                                            None => "select text before copying".into(),
-                                        });
+                                        notice = Some(copy_selection(doc));
                                     }
                                     KeyCode::Esc | KeyCode::Char('q') => {
                                         should_close =
@@ -2099,7 +2101,11 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                             {
                                 should_close = close_own_pane(control, &current, &mut notice);
                             }
-                            _ => doc.on_mouse(&mouse, preview_body),
+                            _ => {
+                                if doc.on_mouse(&mouse, preview_body) {
+                                    notice = Some(copy_selection(doc));
+                                }
+                            }
                         }
                     }
                     ViewMode::Edit(editor) => match mouse.kind {
@@ -3562,6 +3568,26 @@ mod tests {
         doc.selection.anchor = Some(RenderPos { row: 0, col: 1 });
         doc.selection.cursor = Some(RenderPos { row: 1, col: 2 });
         assert_eq!(doc.selected_text().as_deref(), Some("lpha beta\nga"));
+    }
+
+    #[test]
+    fn only_a_mouse_release_that_selects_text_asks_for_a_copy() {
+        let mut doc = doc_of(vec![Line::raw("alpha beta")], false);
+        doc.relayout(40, 20);
+        let body = Rect::new(0, 0, 40, 20);
+        let at = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(!doc.on_mouse(&at(MouseEventKind::Down(MouseButton::Left), 2), body));
+        assert!(!doc.on_mouse(&at(MouseEventKind::Up(MouseButton::Left), 2), body));
+        assert!(!doc.on_mouse(&at(MouseEventKind::Down(MouseButton::Left), 0), body));
+        assert!(!doc.on_mouse(&at(MouseEventKind::Drag(MouseButton::Left), 5), body));
+        assert!(doc.on_mouse(&at(MouseEventKind::Up(MouseButton::Left), 5), body));
+        assert_eq!(doc.selected_text().as_deref(), Some("alpha"));
+        assert!(!doc.on_mouse(&at(MouseEventKind::Up(MouseButton::Left), 5), body));
     }
 
     #[test]
