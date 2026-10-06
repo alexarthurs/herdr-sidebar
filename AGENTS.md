@@ -768,7 +768,9 @@ HACKING.md — budget time for that before promising a patched build.
   and never force, stash, discard, or otherwise mutate work to make the switch succeed.
 - Periodic Source Control status/drawer refresh backs off while its pane is unfocused, just
   like Explorer decorations. Suggestion/sync worker results are still collected first so a
-  hidden pane never strands completed background work.
+  hidden pane never strands completed background work. A pane launched with
+  `HERDR_SIDEBAR_BACKGROUND_REFRESH=1` (read once at startup, `state::BACKGROUND_REFRESH_ENV`)
+  skips only that focus guard, for passive monitor panes; Explorer is unaffected.
 - Hotkey hints render as keycap chips (`wrap_hints` takes `(key, label)` pairs, shared in
   `ui.rs`). They live in the ⚙ Settings modal; the FOOTER copy is opt-in via the
   "Footer hotkeys" setting (persisted as `hotkeys` in the state file, default hidden —
