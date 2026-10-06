@@ -248,6 +248,14 @@ fn main() -> std::io::Result<()> {
     let workspace_label = workspace_label();
     let spawn_cwd = std::env::current_dir()?;
     let root_key = remembered_root_key(&workspace_label, &spawn_cwd);
+    // Resolved ONCE per process. A view switch rebuilds the app but keeps
+    // this root: re-reading roots.json there let another workspace's entry
+    // (see `RootMemory`) silently re-root a healthy sidebar.
+    let mut roots = RootMemory {
+        root: resolve_root(&root_key, &workspace_label, &spawn_cwd)?,
+        startup_label: workspace_label,
+        spawn_cwd,
+    };
     // Some(focus_query) opens the Search view on the next Explorer render;
     // None doesn't. A resumed search restores unfocused (a switch, not a find).
     let mut search_on_open: Option<bool> = if initial_activity == Some(ensure::Target::Search) {
@@ -265,19 +273,11 @@ fn main() -> std::io::Result<()> {
             View::Explorer => run_explorer(
                 &mut terminal,
                 Rc::clone(&cwd_follower),
-                &root_key,
-                &workspace_label,
-                &spawn_cwd,
+                &mut roots,
                 std::mem::take(&mut search_on_open),
                 std::mem::take(&mut quick_open_on_open),
             ),
-            View::SourceControl => run_scm(
-                &mut terminal,
-                Rc::clone(&cwd_follower),
-                &root_key,
-                &workspace_label,
-                &spawn_cwd,
-            ),
+            View::SourceControl => run_scm(&mut terminal, Rc::clone(&cwd_follower), &mut roots),
         };
         match exit {
             Ok(Exit::Quit) => break Ok(()),
@@ -304,6 +304,47 @@ fn read_stdin() -> std::io::Result<String> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
     Ok(buf)
+}
+
+/// This process's root and where it is remembered across restarts.
+///
+/// The key's label is re-read on every save. Herdr names an unlabelled
+/// workspace after its live folder, so a workspace created from another
+/// project's folder starts with that project's label — and therefore that
+/// project's key — until its pane `cd`s elsewhere. With a startup-only label,
+/// following that `cd` wrote the new folder over the other project's entry,
+/// and every sidebar later opened in that project (or switching views there)
+/// came up in the wrong folder.
+struct RootMemory {
+    root: std::path::PathBuf,
+    startup_label: String,
+    spawn_cwd: std::path::PathBuf,
+}
+
+impl RootMemory {
+    fn record(&mut self, root: &std::path::Path) {
+        if let Some(key) = self.save_key(root, || {
+            let label = workspace_label();
+            (!label.is_empty()).then_some(label)
+        }) {
+            herdr_sidebar::state::save_root(&key, root);
+        }
+    }
+
+    /// The key to persist a root change under, `None` when nothing changed.
+    /// The live label wins; a failed lookup falls back to the startup label.
+    fn save_key(
+        &mut self,
+        root: &std::path::Path,
+        live_label: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        if root == self.root {
+            return None;
+        }
+        self.root = root.to_path_buf();
+        let label = live_label().unwrap_or_else(|| self.startup_label.clone());
+        Some(remembered_root_key(&label, &self.spawn_cwd))
+    }
 }
 
 /// The label of the space this pane lives in, or "" when it can't be
@@ -362,15 +403,11 @@ fn resolve_root(
 fn run_explorer(
     terminal: &mut ratatui::DefaultTerminal,
     cwd_follower: Rc<RefCell<launch::CwdFollower>>,
-    root_key: &str,
-    legacy_workspace_label: &str,
-    spawn_cwd: &std::path::Path,
+    roots: &mut RootMemory,
     search_on_open: Option<bool>,
     quick_open_on_open: bool,
 ) -> std::io::Result<Exit> {
-    let root = resolve_root(root_key, legacy_workspace_label, spawn_cwd)?;
-    let mut remembered_root = root.clone();
-    let mut app = explorer_app::App::new(root, cwd_follower);
+    let mut app = explorer_app::App::new(roots.root.clone(), cwd_follower);
     if let Some(focus_query) = search_on_open {
         app.open_content_search(focus_query);
     }
@@ -406,11 +443,7 @@ fn run_explorer(
         app.heartbeat();
         app.poll_picker();
         app.tick();
-        let root = app.root_path();
-        if root != remembered_root {
-            herdr_sidebar::state::save_root(root_key, &root);
-            remembered_root = root;
-        }
+        roots.record(&app.root_path());
     }
 }
 
@@ -419,13 +452,9 @@ fn run_explorer(
 fn run_scm(
     terminal: &mut ratatui::DefaultTerminal,
     cwd_follower: Rc<RefCell<launch::CwdFollower>>,
-    root_key: &str,
-    legacy_workspace_label: &str,
-    spawn_cwd: &std::path::Path,
+    roots: &mut RootMemory,
 ) -> std::io::Result<Exit> {
-    let cwd = resolve_root(root_key, legacy_workspace_label, spawn_cwd)?;
-    let mut remembered_root = cwd.clone();
-    let mut app = scm_app::App::new(cwd, cwd_follower);
+    let mut app = scm_app::App::new(roots.root.clone(), cwd_follower);
     let mut last_tick = std::time::Instant::now();
     loop {
         terminal.draw(|frame| app.draw(frame))?;
@@ -462,17 +491,51 @@ fn run_scm(
             app.tick();
             last_tick = std::time::Instant::now();
         }
-        let root = app.root_path().to_path_buf();
-        if root != remembered_root {
-            herdr_sidebar::state::save_root(root_key, &root);
-            remembered_root = root;
-        }
+        roots.record(app.root_path());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn memory(root: &str, label: &str, spawn_cwd: &str) -> RootMemory {
+        RootMemory {
+            root: root.into(),
+            startup_label: label.into(),
+            spawn_cwd: spawn_cwd.into(),
+        }
+    }
+
+    /// The reported bug: a workspace created from sx-flow's folder is named
+    /// "sx-flow" until its pane moves to GCP. Its sidebar must not save GCP
+    /// under the real sx-flow workspace's key.
+    #[test]
+    fn a_followed_root_is_saved_under_the_workspace_s_current_label() {
+        let mut roots = memory("/dev/sx-flow", "sx-flow", "/dev/sx-flow");
+        let key = roots.save_key(Path::new("/dev/GCP"), || Some("GCP".into()));
+        assert_eq!(key.as_deref(), Some("GCP::/dev/sx-flow"));
+        assert_ne!(
+            key,
+            Some(remembered_root_key("sx-flow", Path::new("/dev/sx-flow")))
+        );
+        assert_eq!(roots.root, Path::new("/dev/GCP"));
+    }
+
+    #[test]
+    fn an_unchanged_root_is_not_rewritten() {
+        let mut roots = memory("/dev/app", "app", "/dev/app");
+        let key = roots.save_key(Path::new("/dev/app"), || panic!("no lookup needed"));
+        assert_eq!(key, None);
+    }
+
+    #[test]
+    fn a_failed_label_lookup_keeps_the_startup_label() {
+        let mut roots = memory("/dev/app", "app", "/dev/app");
+        let key = roots.save_key(Path::new("/dev/app/sub"), || None);
+        assert_eq!(key.as_deref(), Some("app::/dev/app"));
+    }
 
     #[test]
     fn remembered_root_keys_are_project_stable_not_tab_scoped() {
