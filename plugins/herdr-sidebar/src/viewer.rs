@@ -816,8 +816,24 @@ fn start_preview_load(request: Request) -> (Request, std::sync::mpsc::Receiver<D
     (request, receiver)
 }
 
+type FileStamp = (std::time::SystemTime, u64);
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// Records `path`'s modified time and size; true only when the same path's stamp changed.
+fn file_changed(watched: &mut Option<(PathBuf, Option<FileStamp>)>, path: &Path) -> bool {
+    let stamp = file_stamp(path);
+    let changed = matches!(watched, Some((seen, old)) if seen == path && *old != stamp);
+    *watched = Some((path.to_path_buf(), stamp));
+    changed
+}
+
 fn apply_diff_refresh(doc: &mut Doc, mut refreshed: Doc) {
-    if doc.name == refreshed.name
+    if doc.media.is_none()
+        && doc.name == refreshed.name
         && doc.context == refreshed.context
         && doc.numbered == refreshed.numbered
         && doc.lines == refreshed.lines
@@ -1790,6 +1806,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     let mut last_external_check = Instant::now();
     let mut last_diff_refresh = Instant::now();
     let mut diff_refresh: Option<(Request, std::sync::mpsc::Receiver<Doc>)> = None;
+    let mut watched_file: Option<(PathBuf, Option<FileStamp>)> = None;
     let mut identity_pending = false;
     let result = loop {
         let loaded =
@@ -2197,7 +2214,12 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             if preview_load.is_none()
                 && diff_refresh.is_none()
                 && matches!(mode, ViewMode::Preview(_))
-                && let Some(request @ Request::Diff { .. }) = current.clone()
+                && let Some(request) = current.clone()
+                && match &request {
+                    Request::Diff { .. } => true,
+                    Request::File { path, .. } => file_changed(&mut watched_file, path),
+                    _ => false,
+                }
             {
                 let worker_request = request.clone();
                 let (sender, receiver) = std::sync::mpsc::channel();
@@ -3597,6 +3619,29 @@ mod tests {
         assert_eq!(doc.selection.cursor, selection.cursor);
         assert_eq!(doc.rows_key, rows_key);
         assert_eq!(doc.scroll, 1);
+    }
+
+    #[test]
+    fn file_refresh_fires_only_when_the_watched_file_changes() {
+        let path = std::env::temp_dir().join(format!("viewer-watch-{}", std::process::id()));
+        std::fs::write(&path, "one").unwrap();
+        let mut watched = None;
+        assert!(
+            !file_changed(&mut watched, &path),
+            "first sight is the baseline"
+        );
+        assert!(!file_changed(&mut watched, &path));
+        std::fs::write(&path, "one two").unwrap();
+        assert!(file_changed(&mut watched, &path));
+        assert!(!file_changed(&mut watched, &path));
+        let other = path.with_extension("other");
+        std::fs::write(&other, "x").unwrap();
+        assert!(
+            !file_changed(&mut watched, &other),
+            "a new file resets the baseline"
+        );
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(other);
     }
 
     #[test]

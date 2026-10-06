@@ -981,6 +981,8 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   The refresh runs on a worker thread so a slow Git process cannot starve the viewer heartbeat;
   unchanged output is left in place so a mouse selection is not erased every two seconds.
   Staged rows show `--cached`; untracked files render via `diff --no-index NUL <file>`.
+  Plain file previews ride the same 2s tick but stat first: they reload only when the file's
+  modified time or size changed, and media previews are always replaced on reload.
 
 ### Long-line wrapping in the preview (`src/wrap.rs`)
 
