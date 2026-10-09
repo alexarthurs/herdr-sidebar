@@ -871,13 +871,15 @@ struct InFlight;
 
 impl InFlight {
     fn claim() -> Option<Self> {
+        // Claim, then back out if over the cap: `fetch_update` is deprecated
+        // on current stable and its `try_update` rename is newer than our MSRV.
         let order = std::sync::atomic::Ordering::SeqCst;
-        REFRESH_IN_FLIGHT
-            .fetch_update(order, order, |running| {
-                (running < MAX_REFRESH_IN_FLIGHT).then_some(running + 1)
-            })
-            .ok()
-            .map(|_| Self)
+        if REFRESH_IN_FLIGHT.fetch_add(1, order) < MAX_REFRESH_IN_FLIGHT {
+            Some(Self)
+        } else {
+            REFRESH_IN_FLIGHT.fetch_sub(1, order);
+            None
+        }
     }
 }
 

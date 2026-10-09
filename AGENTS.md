@@ -32,6 +32,11 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
+CI uses the LATEST stable toolchain (`dtolnay/rust-toolchain@stable`), so a stale local
+`stable` can pass clippy while CI fails on a newly deprecated API (v0.15.1: `fetch_update` →
+`try_update`, which is also newer than our `rust-version = 1.89` MSRV — rewrite instead of
+renaming). Run `rustup update stable` (or `cargo +<latest> clippy`) before tagging a release.
+
 `plugins/herdr-sidebar/scripts/.gitattributes` pins every shell script to LF. The
 repository has Windows contributors and `core.autocrlf` is common, but these files are
 executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launcher runs.
