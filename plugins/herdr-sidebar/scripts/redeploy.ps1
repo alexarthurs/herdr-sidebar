@@ -11,6 +11,18 @@
 #   herdr plugin action invoke herdr-sidebar.redeploy-windows
 
 $ErrorActionPreference = 'Continue'
+
+# Herdr started from PowerShell 7 hands its PSModulePath to this Windows
+# PowerShell 5.1 child. 5.1 then autoloads PS7's CoreCLR modules first and
+# cmdlets such as Get-FileHash/Select-String silently vanish (issue #96). Keep
+# only 5.1's own module directories, before any cmdlet triggers an autoload.
+if ($PSVersionTable.PSVersion.Major -le 5) {
+    $env:PSModulePath = @(
+        [IO.Path]::Combine([Environment]::GetFolderPath('MyDocuments'), 'WindowsPowerShell', 'Modules'),
+        [IO.Path]::Combine($env:ProgramFiles, 'WindowsPowerShell', 'Modules'),
+        [IO.Path]::Combine($env:SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules')
+    ) -join ';'
+}
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [Console]::OutputEncoding = $Utf8NoBom
 $OutputEncoding = $Utf8NoBom
