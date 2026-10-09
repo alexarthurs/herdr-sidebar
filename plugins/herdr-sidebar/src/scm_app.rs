@@ -1102,7 +1102,9 @@ impl App {
             pending_unified_width: None,
             tree_view,
             background_refresh: sidebar::background_refresh_enabled(
-                std::env::var(sidebar::BACKGROUND_REFRESH_ENV).ok().as_deref(),
+                std::env::var(sidebar::BACKGROUND_REFRESH_ENV)
+                    .ok()
+                    .as_deref(),
             ),
         };
         app.apply_identity();
@@ -1167,6 +1169,9 @@ impl App {
     }
 
     fn close(&mut self, snooze: bool) {
+        // Closing our own pane kills this process: save a pending remembered
+        // root first (the outer loop's flush never runs on this path).
+        crate::flush_pending_root();
         // A direct pane close kills the process without a Drop/signal hook.
         // Persist drafts first; failure keeps the live pane open with the
         // existing error notice from persist_scm().

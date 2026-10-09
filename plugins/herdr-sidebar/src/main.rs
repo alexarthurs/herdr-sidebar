@@ -255,6 +255,8 @@ fn main() -> std::io::Result<()> {
         root: resolve_root(&root_key, &workspace_label, &spawn_cwd)?,
         startup_label: workspace_label,
         spawn_cwd,
+        pending: false,
+        last_attempt: None,
     };
     // Some(focus_query) opens the Search view on the next Explorer render;
     // None doesn't. A resumed search restores unfocused (a switch, not a find).
@@ -280,7 +282,11 @@ fn main() -> std::io::Result<()> {
             View::SourceControl => run_scm(&mut terminal, Rc::clone(&cwd_follower), &mut roots),
         };
         match exit {
-            Ok(Exit::Quit) => break Ok(()),
+            Ok(Exit::Quit) => {
+                roots.flush();
+                publish_pending(&roots);
+                break Ok(());
+            }
             Ok(Exit::Switch) => {
                 view = view.other();
             }
@@ -292,7 +298,10 @@ fn main() -> std::io::Result<()> {
                 view = View::Explorer;
                 quick_open_on_open = true;
             }
-            Err(e) => break Err(e),
+            Err(e) => {
+                roots.flush();
+                break Err(e);
+            }
         }
     };
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
@@ -315,36 +324,130 @@ fn read_stdin() -> std::io::Result<String> {
 /// following that `cd` wrote the new folder over the other project's entry,
 /// and every sidebar later opened in that project (or switching views there)
 /// came up in the wrong folder.
+#[derive(Clone)]
 struct RootMemory {
     root: std::path::PathBuf,
     startup_label: String,
     spawn_cwd: std::path::PathBuf,
+    /// A root change not yet persisted because the live label was unknown.
+    pending: bool,
+    last_attempt: Option<std::time::Instant>,
 }
+
+/// How often a pending save retries the live-label lookup. The lookup is a
+/// socket round trip on the UI thread, so a host that is not answering must
+/// not be asked on every loop iteration.
+const ROOT_SAVE_RETRY: Duration = Duration::from_secs(15);
 
 impl RootMemory {
     fn record(&mut self, root: &std::path::Path) {
-        if let Some(key) = self.save_key(root, || {
-            let label = workspace_label();
-            (!label.is_empty()).then_some(label)
-        }) {
-            herdr_sidebar::state::save_root(&key, root);
+        if let Some(key) = self.record_with(root, std::time::Instant::now, live_workspace_label) {
+            herdr_sidebar::state::save_root(&key, &self.root);
+        }
+        publish_pending(self);
+    }
+
+    /// One loop iteration's worth of `record`, minus the disk write. The
+    /// retry clock restarts when an attempt that really ran FINISHES — a
+    /// lookup that took its whole socket timeout must not leave the next retry
+    /// immediately due — and never on iterations the throttle skipped.
+    fn record_with(
+        &mut self,
+        root: &std::path::Path,
+        clock: impl Fn() -> std::time::Instant,
+        live_label: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        let before = self.last_attempt;
+        let key = self.save_key(root, clock(), live_label);
+        if self.pending && self.last_attempt != before {
+            self.last_attempt = Some(clock());
+        }
+        key
+    }
+
+    /// Quitting: one last attempt, ignoring the retry clock. If the label is
+    /// still unknown the choice is NOT saved under a guessed key (that is the
+    /// overwrite this type exists to prevent); it is reported instead.
+    fn flush(&mut self) {
+        if !self.pending {
+            return;
+        }
+        self.last_attempt = None;
+        let root = self.root.clone();
+        if let Some(key) = self.save_key(&root, std::time::Instant::now(), live_workspace_label) {
+            herdr_sidebar::state::save_root(&key, &self.root);
+        } else {
+            eprintln!(
+                "herdr-sidebar: could not resolve this workspace; {} was not remembered",
+                self.root.display()
+            );
         }
     }
 
-    /// The key to persist a root change under, `None` when nothing changed.
-    /// The live label wins; a failed lookup falls back to the startup label.
+    /// The key to persist the current root under, or `None` when there is
+    /// nothing to save yet. A failed label lookup DEFERS the save: falling
+    /// back to the startup label would write this workspace's folder over the
+    /// project whose label it inherited — the very bug this type prevents.
+    /// The in-process root still follows immediately; only persistence waits.
     fn save_key(
         &mut self,
         root: &std::path::Path,
+        now: std::time::Instant,
         live_label: impl FnOnce() -> Option<String>,
     ) -> Option<String> {
-        if root == self.root {
+        if root != self.root {
+            self.root = root.to_path_buf();
+            self.pending = true;
+            self.last_attempt = None;
+        }
+        if !self.pending
+            || self
+                .last_attempt
+                .is_some_and(|at| now.duration_since(at) < ROOT_SAVE_RETRY)
+        {
             return None;
         }
-        self.root = root.to_path_buf();
-        let label = live_label().unwrap_or_else(|| self.startup_label.clone());
+        self.last_attempt = Some(now);
+        let label = match live_label() {
+            Some(label) => label,
+            // A process that never had a label keys roots by folder alone, so
+            // there is no other workspace's entry to collide with.
+            None if self.startup_label.is_empty() => String::new(),
+            None => return None,
+        };
+        self.pending = false;
         Some(remembered_root_key(&label, &self.spawn_cwd))
     }
+}
+
+/// The pending save, mirrored where the apps' own close paths can reach it:
+/// hiding the sidebar or Ctrl+Q closes the pane from inside the app, which
+/// kills the process before the outer loop's `flush` could run.
+static PENDING_ROOT: std::sync::Mutex<Option<RootMemory>> = std::sync::Mutex::new(None);
+
+fn publish_pending(roots: &RootMemory) {
+    if let Ok(mut pending) = PENDING_ROOT.lock() {
+        *pending = roots.pending.then(|| roots.clone());
+    }
+}
+
+/// Called by the apps right before they close their own pane.
+pub(crate) fn flush_pending_root() {
+    let pending = PENDING_ROOT.lock().ok().and_then(|mut slot| slot.take());
+    if let Some(mut roots) = pending {
+        roots.flush();
+    }
+}
+
+/// The workspace's CURRENT label, or `None` when it cannot be determined
+/// (socket error, workspace not listed). Outside herdr there is no label.
+fn live_workspace_label() -> Option<String> {
+    let Ok(ws_id) = std::env::var("HERDR_WORKSPACE_ID") else {
+        return Some(String::new());
+    };
+    let json = herdr_sidebar::ipc::call_text("workspace.list", serde_json::json!({})).ok()?;
+    let label = herdr_sidebar::launch::workspace_label(&json, &ws_id);
+    (!label.is_empty()).then_some(label)
 }
 
 /// The label of the space this pane lives in, or "" when it can't be
@@ -505,6 +608,8 @@ mod tests {
             root: root.into(),
             startup_label: label.into(),
             spawn_cwd: spawn_cwd.into(),
+            pending: false,
+            last_attempt: None,
         }
     }
 
@@ -514,7 +619,8 @@ mod tests {
     #[test]
     fn a_followed_root_is_saved_under_the_workspace_s_current_label() {
         let mut roots = memory("/dev/sx-flow", "sx-flow", "/dev/sx-flow");
-        let key = roots.save_key(Path::new("/dev/GCP"), || Some("GCP".into()));
+        let now = std::time::Instant::now();
+        let key = roots.save_key(Path::new("/dev/GCP"), now, || Some("GCP".into()));
         assert_eq!(key.as_deref(), Some("GCP::/dev/sx-flow"));
         assert_ne!(
             key,
@@ -526,15 +632,102 @@ mod tests {
     #[test]
     fn an_unchanged_root_is_not_rewritten() {
         let mut roots = memory("/dev/app", "app", "/dev/app");
-        let key = roots.save_key(Path::new("/dev/app"), || panic!("no lookup needed"));
+        let now = std::time::Instant::now();
+        let key = roots.save_key(Path::new("/dev/app"), now, || panic!("no lookup needed"));
         assert_eq!(key, None);
     }
 
+    /// Astra #2: a failed lookup must never fall back to the startup label
+    /// (that recreates the cross-workspace overwrite). The save waits, retries
+    /// at a bounded rate, and lands under the live label once it is known.
     #[test]
-    fn a_failed_label_lookup_keeps_the_startup_label() {
-        let mut roots = memory("/dev/app", "app", "/dev/app");
-        let key = roots.save_key(Path::new("/dev/app/sub"), || None);
-        assert_eq!(key.as_deref(), Some("app::/dev/app"));
+    fn a_failed_label_lookup_defers_the_save_instead_of_guessing() {
+        let mut roots = memory("/dev/sx-flow", "sx-flow", "/dev/sx-flow");
+        let start = std::time::Instant::now();
+        assert_eq!(roots.save_key(Path::new("/dev/GCP"), start, || None), None);
+        assert_eq!(roots.root, Path::new("/dev/GCP"), "the view still follows");
+        assert_eq!(
+            roots.save_key(Path::new("/dev/GCP"), start, || panic!("retry throttled")),
+            None
+        );
+        let later = start + ROOT_SAVE_RETRY;
+        let key = roots.save_key(Path::new("/dev/GCP"), later, || Some("GCP".into()));
+        assert_eq!(key.as_deref(), Some("GCP::/dev/sx-flow"));
+        assert_eq!(
+            roots.save_key(Path::new("/dev/GCP"), later + ROOT_SAVE_RETRY, || {
+                panic!("nothing pending")
+            }),
+            None
+        );
+    }
+
+    /// Astra rounds 2+3 #1/#2: over many ordinary loop iterations, a slow
+    /// failed lookup is retried once per window measured from when it
+    /// FINISHED — not instantly, and not pushed back by throttled iterations.
+    #[test]
+    fn pending_saves_retry_once_per_window_across_loop_iterations() {
+        let mut roots = memory("/dev/a", "a", "/dev/a");
+        let start = std::time::Instant::now();
+        let now = std::cell::Cell::new(start);
+        let lookups = std::cell::Cell::new(0);
+        let slow_failure = || {
+            lookups.set(lookups.get() + 1);
+            now.set(now.get() + Duration::from_secs(5)); // the socket timed out
+            None
+        };
+        assert_eq!(
+            roots.record_with(Path::new("/dev/b"), || now.get(), slow_failure),
+            None
+        );
+        assert_eq!(lookups.get(), 1);
+        let finished = now.get();
+        // Ordinary iterations, 1s apart, up to just before the window ends.
+        while now.get() + Duration::from_secs(1) < finished + ROOT_SAVE_RETRY {
+            now.set(now.get() + Duration::from_secs(1));
+            let key = roots.record_with(
+                Path::new("/dev/b"),
+                || now.get(),
+                || panic!("throttled: no lookup before the window ends"),
+            );
+            assert_eq!(key, None);
+        }
+        now.set(finished + ROOT_SAVE_RETRY);
+        let key = roots.record_with(Path::new("/dev/b"), || now.get(), || Some("b".into()));
+        assert_eq!(
+            key.as_deref(),
+            Some("b::/dev/a"),
+            "retried once the window passed"
+        );
+    }
+
+    /// Astra round 3 #3: the apps' own close paths reach the pending save.
+    #[test]
+    fn a_pending_root_is_published_for_the_apps_close_paths() {
+        let mut roots = memory("/dev/a", "a", "/dev/a");
+        let start = std::time::Instant::now();
+        roots.record_with(Path::new("/dev/b"), || start, || None);
+        publish_pending(&roots);
+        let published = PENDING_ROOT
+            .lock()
+            .unwrap()
+            .take()
+            .expect("pending save published");
+        assert_eq!(published.root, Path::new("/dev/b"));
+        assert!(published.pending);
+        roots.pending = false;
+        publish_pending(&roots);
+        assert!(
+            PENDING_ROOT.lock().unwrap().is_none(),
+            "nothing pending, nothing published"
+        );
+    }
+
+    #[test]
+    fn a_process_that_never_had_a_label_still_saves_by_folder() {
+        let mut roots = memory("/dev/app", "", "/dev/app");
+        let now = std::time::Instant::now();
+        let key = roots.save_key(Path::new("/dev/app/sub"), now, || None);
+        assert_eq!(key, Some(remembered_root_key("", Path::new("/dev/app"))));
     }
 
     #[test]

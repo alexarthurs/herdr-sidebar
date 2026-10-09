@@ -395,6 +395,9 @@ struct Doc {
     /// row index underneath them changed.
     pending_src: Option<usize>,
     selection: PreviewSelection,
+    /// A file preview's modified-time/size stamp, taken on the load worker
+    /// BEFORE the content was read: the baseline later polls compare against.
+    stamp: Option<FileStamp>,
 }
 
 struct MediaPreview {
@@ -771,8 +774,16 @@ fn load(request: &Request) -> Doc {
             rows_key: None,
             pending_src: None,
             selection: PreviewSelection::default(),
+            stamp: None,
         },
-        Request::File { path, line } => load_file(path, *line),
+        Request::File { path, line } => {
+            // Stat before reading: a write that lands during the read leaves
+            // the stamp behind the content, so the next poll reloads again.
+            let stamp = file_stamp(path);
+            let mut doc = load_file(path, *line);
+            doc.stamp = stamp;
+            doc
+        }
         Request::Diff { root, rel, kind } => load_diff(root, rel, kind),
         Request::Show { root, spec, path } => load_show(root, spec, path.as_deref()),
     }
@@ -809,10 +820,22 @@ fn loading_doc(request: &Request) -> Doc {
         rows_key: None,
         pending_src: None,
         selection: PreviewSelection::default(),
+        stamp: None,
     }
 }
 
+/// Bumped by every fresh document load. A background refresh carries the
+/// generation it started under and is discarded once another load began, so
+/// a stale result (A→B→A, leaving edit mode) can never be applied and a stuck
+/// refresh of an old document never blocks refreshes of the new one.
+static LOAD_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn load_generation() -> u64 {
+    LOAD_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn start_preview_load(request: Request) -> (Request, std::sync::mpsc::Receiver<Doc>) {
+    LOAD_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let worker_request = request.clone();
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -828,12 +851,278 @@ fn file_stamp(path: &Path) -> Option<FileStamp> {
     Some((meta.modified().ok()?, meta.len()))
 }
 
-/// Records `path`'s modified time and size; true only when the same path's stamp changed.
-fn file_changed(watched: &mut Option<(PathBuf, Option<FileStamp>)>, path: &Path) -> bool {
-    let stamp = file_stamp(path);
-    let changed = matches!(watched, Some((seen, old)) if seen == path && *old != stamp);
-    *watched = Some((path.to_path_buf(), stamp));
-    changed
+/// Whether a file preview must reload: its current stamp differs from the one
+/// taken when the displayed content was read. Runs on the refresh worker —
+/// a `stat` on a stalled network or cloud drive can block indefinitely.
+fn file_refresh_needed(path: &Path, baseline: Option<FileStamp>) -> bool {
+    file_stamp(path) != baseline
+}
+
+/// Refresh workers still running. A stall on a dead network drive can block
+/// a worker forever and dropping its receiver cannot cancel it, so new
+/// refreshes pause while this many are outstanding instead of piling up.
+static REFRESH_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const MAX_REFRESH_IN_FLIGHT: usize = 2;
+/// A refresh still unanswered after this long is abandoned so the document
+/// can retry (bounded by [`MAX_REFRESH_IN_FLIGHT`]).
+const REFRESH_ABANDON_AFTER: Duration = Duration::from_secs(30);
+
+struct InFlight;
+
+impl InFlight {
+    fn claim() -> Option<Self> {
+        let order = std::sync::atomic::Ordering::SeqCst;
+        REFRESH_IN_FLIGHT
+            .fetch_update(order, order, |running| {
+                (running < MAX_REFRESH_IN_FLIGHT).then_some(running + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        REFRESH_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Whether a finished refresh still describes what is on screen.
+fn refresh_is_current(
+    started: u64,
+    request: &Request,
+    generation: u64,
+    current: Option<&Request>,
+) -> bool {
+    started == generation && current == Some(request)
+}
+
+/// herdr's own `[ui] copy_on_select` (default on), as herdr's LIVE loader
+/// sees it: a missing file means defaults, but an unreadable or half-edited
+/// file keeps the last good value instead of silently re-enabling copying.
+/// Mouse capture means herdr cannot copy a preview selection itself, so the
+/// viewer mirrors the host's behavior — and its opt-out.
+fn herdr_copy_on_select(last_good: &mut Option<bool>) -> bool {
+    let read = herdr_config_path().map(std::fs::read_to_string);
+    copy_on_select_now(read, last_good)
+}
+
+fn copy_on_select_now(read: Option<std::io::Result<String>>, last_good: &mut Option<bool>) -> bool {
+    let value = match read {
+        None => Some(true),
+        Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Some(true),
+        Some(Err(_)) => None,
+        Some(Ok(config)) => copy_on_select_parsed(&config),
+    };
+    match value {
+        Some(value) => {
+            *last_good = Some(value);
+            value
+        }
+        None => last_good.unwrap_or(true),
+    }
+}
+
+/// Where herdr 0.9 reads its config (`src/config/io.rs`): `HERDR_CONFIG_PATH`,
+/// then `$XDG_CONFIG_HOME/herdr` (honored on Windows too), then on Windows
+/// `%APPDATA%\herdr`, `%USERPROFILE%\AppData\Roaming\herdr` or
+/// `$HOME/.config/herdr`, elsewhere `~/.config/herdr`.
+fn herdr_config_path() -> Option<PathBuf> {
+    let set = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+    if let Some(path) = set("HERDR_CONFIG_PATH") {
+        return Some(PathBuf::from(path));
+    }
+    let dir = if let Some(dir) = set("XDG_CONFIG_HOME") {
+        PathBuf::from(dir).join("herdr")
+    } else if cfg!(windows) {
+        if let Some(dir) = set("APPDATA") {
+            PathBuf::from(dir).join("herdr")
+        } else if let Some(profile) = set("USERPROFILE") {
+            PathBuf::from(profile)
+                .join("AppData")
+                .join("Roaming")
+                .join("herdr")
+        } else {
+            PathBuf::from(set("HOME")?).join(".config").join("herdr")
+        }
+    } else {
+        PathBuf::from(set("HOME")?).join(".config").join("herdr")
+    };
+    Some(dir.join("config.toml"))
+}
+
+/// `[ui] copy_on_select` parsed the way herdr does: BOMs stripped, then real
+/// TOML (`[ ui ]`, `["ui"]`, dotted keys and inline tables all count). `None`
+/// when the file is not valid TOML.
+fn copy_on_select_parsed(config: &str) -> Option<bool> {
+    let table = config.replace('\u{feff}', "").parse::<toml::Table>().ok()?;
+    // A present but wrongly-typed value is a schema error: herdr's loader
+    // rejects it and keeps its current config, so it must not read as "on".
+    match table.get("ui") {
+        None => Some(true),
+        Some(toml::Value::Table(ui)) => match ui.get("copy_on_select") {
+            None => Some(true),
+            Some(value) => value.as_bool(),
+        },
+        Some(_) => None,
+    }
+}
+
+/// The first-load view of [`copy_on_select_parsed`]: invalid TOML means
+/// herdr starts on defaults.
+#[cfg(test)]
+fn copy_on_select_from(config: &str) -> bool {
+    copy_on_select_parsed(config).unwrap_or(true)
+}
+
+/// What the copy worker reports back to the event loop.
+#[derive(Debug, PartialEq, Eq)]
+enum ReleaseCopy {
+    /// herdr's `copy_on_select` is off: nothing was copied.
+    Disabled,
+    Copied,
+    /// OSC 52 is wanted; the event loop writes it (it owns stdout).
+    Osc52(String),
+    Failed(String),
+}
+
+/// Decide and perform one copy. Pure apart from its arguments, so the
+/// routing is testable without a clipboard.
+fn release_copy(
+    text: String,
+    enabled: bool,
+    prefer_osc52: bool,
+    native: impl FnOnce(&str) -> std::io::Result<()>,
+    fallback_osc52: bool,
+) -> ReleaseCopy {
+    if !enabled {
+        return ReleaseCopy::Disabled;
+    }
+    if prefer_osc52 {
+        return ReleaseCopy::Osc52(text);
+    }
+    match native(&text) {
+        Ok(()) => ReleaseCopy::Copied,
+        Err(_) if fallback_osc52 => ReleaseCopy::Osc52(text),
+        Err(error) => ReleaseCopy::Failed(error.to_string()),
+    }
+}
+
+/// A copy request. Automatic (mouse-release) copies honor `copy_on_select`;
+/// explicit Ctrl/Cmd+C always copies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CopyRequest {
+    text: String,
+    automatic: bool,
+}
+
+/// Queue a request in order. A newer automatic copy replaces any automatic
+/// copy still waiting — only the latest drag matters — so a stalled
+/// clipboard can never build an unbounded backlog; explicit copies are kept
+/// and stay ordered against automatic ones, so an older release can never
+/// overwrite a newer Ctrl+C.
+fn enqueue_copy(queue: &mut std::collections::VecDeque<CopyRequest>, request: CopyRequest) {
+    if request.automatic {
+        queue.retain(|queued| !queued.automatic);
+    }
+    queue.push_back(request);
+}
+
+type CopyQueue = std::sync::Arc<(
+    std::sync::Mutex<std::collections::VecDeque<CopyRequest>>,
+    std::sync::Condvar,
+)>;
+
+/// One worker for every preview copy, so copies stay in order and a hung
+/// clipboard tool (or a config on a stalled drive) can never freeze the
+/// viewer's event loop. The helper itself is time-limited in `actions`.
+struct ReleaseCopier {
+    queue: CopyQueue,
+    results: std::sync::mpsc::Receiver<ReleaseCopy>,
+    /// Released by the event loop after it wrote an OSC 52 copy, so a later
+    /// native copy cannot finish first and then be overwritten by it.
+    written: std::sync::mpsc::Sender<()>,
+}
+
+impl ReleaseCopier {
+    fn start() -> Option<Self> {
+        let queue: CopyQueue = std::sync::Arc::default();
+        let (outbox, results) = std::sync::mpsc::channel();
+        let (written, osc52_done) = std::sync::mpsc::channel::<()>();
+        let worker_queue = queue.clone();
+        std::thread::Builder::new()
+            .name("preview-copy".into())
+            .spawn(move || {
+                let mut last_good = None;
+                loop {
+                    let request = {
+                        let (lock, ready) = &*worker_queue;
+                        let Ok(mut pending) = lock.lock() else { return };
+                        loop {
+                            if let Some(request) = pending.pop_front() {
+                                break request;
+                            }
+                            let Ok(next) = ready.wait(pending) else {
+                                return;
+                            };
+                            pending = next;
+                        }
+                    };
+                    let enabled = !request.automatic || herdr_copy_on_select(&mut last_good);
+                    let result = release_copy(
+                        request.text,
+                        enabled,
+                        crate::actions::osc52_preferred(),
+                        crate::actions::copy_native,
+                        crate::actions::osc52_fallback_available(),
+                    );
+                    let wait_for_terminal = matches!(result, ReleaseCopy::Osc52(_));
+                    if outbox.send(result).is_err() {
+                        return;
+                    }
+                    if wait_for_terminal && osc52_done.recv().is_err() {
+                        return;
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self {
+            queue,
+            results,
+            written,
+        })
+    }
+
+    /// Forget drags still waiting: entering edit mode starts explicit,
+    /// synchronous editor copies that a late read-only copy must not follow.
+    fn drop_waiting_automatic(&self) {
+        let (lock, _) = &*self.queue;
+        if let Ok(mut pending) = lock.lock() {
+            pending.retain(|queued| !queued.automatic);
+        }
+    }
+
+    fn submit(&self, request: CopyRequest) {
+        let (lock, ready) = &*self.queue;
+        if let Ok(mut pending) = lock.lock() {
+            enqueue_copy(&mut pending, request);
+            ready.notify_one();
+        }
+    }
+}
+
+/// The footer notice for a finished copy, writing OSC 52 here on the drawing
+/// thread when the worker asked for it.
+fn release_copy_notice(result: ReleaseCopy) -> Option<String> {
+    match result {
+        ReleaseCopy::Disabled => None,
+        ReleaseCopy::Copied => Some("copied selection".into()),
+        ReleaseCopy::Osc52(text) => Some(match crate::actions::write_osc52_stdout(&text) {
+            Ok(_) => "sent selection to terminal clipboard".into(),
+            Err(error) => format!("clipboard unavailable: {error}"),
+        }),
+        ReleaseCopy::Failed(error) => Some(format!("clipboard unavailable: {error}")),
+    }
 }
 
 fn copy_selection(doc: &Doc) -> String {
@@ -856,6 +1145,7 @@ fn apply_diff_refresh(doc: &mut Doc, mut refreshed: Doc) {
         && doc.numbered == refreshed.numbered
         && doc.lines == refreshed.lines
     {
+        doc.stamp = refreshed.stamp;
         return;
     }
     refreshed.wrap = doc.wrap;
@@ -989,6 +1279,7 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
         rows_key: None,
         pending_src: None,
         selection: PreviewSelection::default(),
+        stamp: None,
     }
 }
 
@@ -1306,6 +1597,7 @@ fn load_media_file(target: &Path, name: String, video_poster: bool) -> Doc {
         rows_key: None,
         pending_src: None,
         selection: PreviewSelection::default(),
+        stamp: None,
     }
 }
 
@@ -1375,6 +1667,7 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
         rows_key: None,
         pending_src: target_line.map(|line| line.saturating_sub(1)),
         selection: PreviewSelection::default(),
+        stamp: None,
     }
 }
 
@@ -1444,6 +1737,7 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         rows_key: None,
         pending_src: None,
         selection: PreviewSelection::default(),
+        stamp: None,
     }
 }
 
@@ -1796,6 +2090,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         rows_key: None,
         pending_src: None,
         selection: PreviewSelection::default(),
+        stamp: None,
     });
     let mut mode = ViewMode::Preview(doc);
     report_identity(
@@ -1823,8 +2118,13 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     let mut last_heartbeat = crate::state::unix_now();
     let mut last_external_check = Instant::now();
     let mut last_diff_refresh = Instant::now();
-    let mut diff_refresh: Option<(Request, std::sync::mpsc::Receiver<Doc>)> = None;
-    let mut watched_file: Option<(PathBuf, Option<FileStamp>)> = None;
+    let mut diff_refresh: Option<(
+        u64,
+        Request,
+        std::sync::mpsc::Receiver<Option<Doc>>,
+        Instant,
+    )> = None;
+    let mut copier: Option<ReleaseCopier> = None;
     let mut identity_pending = false;
     let result = loop {
         let loaded =
@@ -2004,13 +2304,34 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                 match key.code {
                                     KeyCode::Char('a') if shortcut => doc.select_all(),
                                     KeyCode::Char('c') if shortcut => {
-                                        notice = Some(copy_selection(doc));
+                                        // Same ordered queue as release copies, so an older
+                                        // automatic copy cannot land after this one.
+                                        match doc.selected_text() {
+                                            None => {
+                                                notice = Some("select text before copying".into())
+                                            }
+                                            Some(text) => {
+                                                if copier.is_none() {
+                                                    copier = ReleaseCopier::start();
+                                                }
+                                                match &copier {
+                                                    Some(copier) => copier.submit(CopyRequest {
+                                                        text,
+                                                        automatic: false,
+                                                    }),
+                                                    None => notice = Some(copy_selection(doc)),
+                                                }
+                                            }
+                                        }
                                     }
                                     KeyCode::Esc | KeyCode::Char('q') => {
                                         should_close =
                                             close_own_pane(control, &current, &mut notice);
                                     }
                                     KeyCode::Char('e') => {
+                                        if let Some(copier) = &copier {
+                                            copier.drop_waiting_automatic();
+                                        }
                                         if doc.media.is_some() {
                                             notice = Some("media previews are read-only".into());
                                         } else if let Some(Request::File { path, .. }) =
@@ -2119,8 +2440,23 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                 should_close = close_own_pane(control, &current, &mut notice);
                             }
                             _ => {
-                                if doc.on_mouse(&mouse, preview_body) {
-                                    notice = Some(copy_selection(doc));
+                                // Copy on release, like herdr's own panes — unless the
+                                // user turned that off in herdr (`[ui] copy_on_select`).
+                                // Off the event loop: a hung clipboard tool must not
+                                // freeze the preview.
+                                if doc.on_mouse(&mouse, preview_body)
+                                    && let Some(text) = doc.selected_text()
+                                {
+                                    if copier.is_none() {
+                                        copier = ReleaseCopier::start();
+                                    }
+                                    match &copier {
+                                        Some(copier) => copier.submit(CopyRequest {
+                                            text,
+                                            automatic: true,
+                                        }),
+                                        None => notice = Some(copy_selection(doc)),
+                                    }
                                 }
                             }
                         }
@@ -2198,19 +2534,38 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             }
             last_external_check = Instant::now();
         }
-        let refreshed =
-            diff_refresh
-                .as_ref()
-                .and_then(|(request, receiver)| match receiver.try_recv() {
-                    Ok(doc) => Some((request.clone(), Some(doc))),
+        if let Some(copier) = &copier {
+            while let Ok(result) = copier.results.try_recv() {
+                let osc52 = matches!(result, ReleaseCopy::Osc52(_));
+                if let Some(text) = release_copy_notice(result) {
+                    notice = Some(text);
+                }
+                if osc52 {
+                    let _ = copier.written.send(());
+                }
+            }
+        }
+        // A refresh started for an earlier document is abandoned, not awaited:
+        // its worker may be stuck on a stalled drive.
+        if diff_refresh.as_ref().is_some_and(|(started, _, _, at)| {
+            *started != load_generation() || at.elapsed() >= REFRESH_ABANDON_AFTER
+        }) {
+            diff_refresh = None;
+        }
+        let refreshed = diff_refresh
+            .as_ref()
+            .and_then(
+                |(started, request, receiver, _)| match receiver.try_recv() {
+                    Ok(doc) => Some((*started, request.clone(), doc)),
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        Some((request.clone(), None))
+                        Some((*started, request.clone(), None))
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                });
-        if let Some((request, refreshed)) = refreshed {
+                },
+            );
+        if let Some((started, request, refreshed)) = refreshed {
             diff_refresh = None;
-            if current.as_ref() == Some(&request)
+            if refresh_is_current(started, &request, load_generation(), current.as_ref())
                 && let (ViewMode::Preview(doc), Some(refreshed)) = (&mut mode, refreshed)
             {
                 apply_diff_refresh(doc, refreshed);
@@ -2219,20 +2574,25 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         if last_diff_refresh.elapsed() >= Duration::from_secs(2) {
             if preview_load.is_none()
                 && diff_refresh.is_none()
-                && matches!(mode, ViewMode::Preview(_))
-                && let Some(request) = current.clone()
-                && match &request {
-                    Request::Diff { .. } => true,
-                    Request::File { path, .. } => file_changed(&mut watched_file, path),
-                    _ => false,
-                }
+                && let ViewMode::Preview(doc) = &mode
+                && let Some(request @ (Request::Diff { .. } | Request::File { .. })) =
+                    current.clone()
+                && let Some(in_flight) = InFlight::claim()
             {
+                let baseline = doc.stamp;
                 let worker_request = request.clone();
                 let (sender, receiver) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
-                    let _ = sender.send(load(&worker_request));
+                    let _in_flight = in_flight;
+                    // Files stat first, here on the worker; only a changed
+                    // stamp pays for a reload. Diffs always re-run.
+                    let reload = match &worker_request {
+                        Request::File { path, .. } => file_refresh_needed(path, baseline),
+                        _ => true,
+                    };
+                    let _ = sender.send(reload.then(|| load(&worker_request)));
                 });
-                diff_refresh = Some((request, receiver));
+                diff_refresh = Some((load_generation(), request, receiver, Instant::now()));
             }
             last_diff_refresh = Instant::now();
         }
@@ -3434,6 +3794,7 @@ mod tests {
             rows_key: None,
             pending_src: None,
             selection: PreviewSelection::default(),
+            stamp: None,
         }
     }
 
@@ -3593,6 +3954,135 @@ mod tests {
     }
 
     #[test]
+    fn copy_on_release_follows_herdrs_copy_on_select_setting() {
+        assert!(copy_on_select_from(""), "herdr's default is on");
+        assert!(copy_on_select_from("[ui]\n# copy_on_select = false\n"));
+        assert!(!copy_on_select_from("[ui]\ncopy_on_select = false # off\n"));
+        assert!(copy_on_select_from("[ui]\ncopy_on_select = true\n"));
+        assert!(
+            copy_on_select_from("[other]\ncopy_on_select = false\n[ui]\nmouse_capture = true\n"),
+            "only the [ui] table counts"
+        );
+        // Astra #5: every TOML spelling herdr accepts.
+        assert!(!copy_on_select_from("[ ui ]\ncopy_on_select = false\n"));
+        assert!(!copy_on_select_from("[\"ui\"]\ncopy_on_select = false\n"));
+        assert!(!copy_on_select_from("ui.copy_on_select = false\n"));
+        assert!(!copy_on_select_from("ui = { copy_on_select = false }\n"));
+        assert!(!copy_on_select_from(
+            "\u{feff}[ui]\ncopy_on_select = false\n"
+        ));
+        assert!(
+            !copy_on_select_from(
+                "[keys]\nlist = [\n  \"[ui]\",\n]\n[ui]\ncopy_on_select = false\n"
+            ),
+            "array lines that look like headers are not tables"
+        );
+        assert!(
+            copy_on_select_from("[ui\ncopy_on_select = false\n"),
+            "invalid TOML: herdr defaults"
+        );
+    }
+
+    /// Astra round 2 #6: herdr's live loader keeps its current config when the
+    /// file turns unreadable or invalid mid-edit; so does the viewer. A
+    /// missing file means defaults, exactly as in herdr.
+    #[test]
+    fn a_broken_config_reload_keeps_the_last_good_setting() {
+        let mut last_good = None;
+        let off = Some(Ok("[ui]\ncopy_on_select = false\n".to_string()));
+        assert!(!copy_on_select_now(off, &mut last_good));
+        let wrong_type = Some(Ok("[ui]\ncopy_on_select = \"false\"\n".to_string()));
+        assert!(
+            !copy_on_select_now(wrong_type, &mut last_good),
+            "schema error keeps last good"
+        );
+        let half_edited = Some(Ok("[ui\ncopy_on".to_string()));
+        assert!(!copy_on_select_now(half_edited, &mut last_good));
+        let locked = Some(Err(std::io::Error::other("sharing violation")));
+        assert!(!copy_on_select_now(locked, &mut last_good));
+        let missing = Some(Err(std::io::Error::from(std::io::ErrorKind::NotFound)));
+        assert!(
+            copy_on_select_now(missing, &mut last_good),
+            "no file: defaults"
+        );
+        assert!(
+            copy_on_select_now(None, &mut None),
+            "no config location: defaults"
+        );
+        let mut fresh = None;
+        assert!(
+            copy_on_select_now(Some(Ok("[ui".to_string())), &mut fresh),
+            "an invalid file at first load: defaults"
+        );
+    }
+
+    /// Astra round 2 #2/#4: copies stay ordered across kinds, and pending
+    /// automatic copies coalesce so a stalled clipboard cannot grow a backlog.
+    #[test]
+    fn copy_queue_orders_explicit_copies_and_coalesces_automatic_ones() {
+        let auto = |text: &str| CopyRequest {
+            text: text.into(),
+            automatic: true,
+        };
+        let explicit = |text: &str| CopyRequest {
+            text: text.into(),
+            automatic: false,
+        };
+        let mut queue = std::collections::VecDeque::new();
+        for drag in 0..1000 {
+            enqueue_copy(&mut queue, auto(&format!("drag {drag}")));
+        }
+        assert_eq!(queue, [auto("drag 999")], "only the latest drag waits");
+        enqueue_copy(&mut queue, explicit("ctrl-c"));
+        assert_eq!(queue, [auto("drag 999"), explicit("ctrl-c")]);
+        enqueue_copy(&mut queue, auto("later drag"));
+        assert_eq!(
+            queue,
+            [explicit("ctrl-c"), auto("later drag")],
+            "the explicit copy stays ahead of the newer drag and is never dropped"
+        );
+    }
+
+    #[test]
+    fn refresh_workers_are_capped() {
+        let held: Vec<_> = std::iter::from_fn(InFlight::claim).take(10).collect();
+        assert_eq!(held.len(), MAX_REFRESH_IN_FLIGHT);
+        assert!(InFlight::claim().is_none());
+        drop(held);
+        assert!(
+            InFlight::claim().is_some(),
+            "finished workers free their slot"
+        );
+    }
+
+    #[test]
+    fn release_copies_route_without_touching_the_clipboard_when_off() {
+        let never = |_: &str| -> std::io::Result<()> { panic!("must not run the clipboard tool") };
+        assert_eq!(
+            release_copy("t".into(), false, false, never, true),
+            ReleaseCopy::Disabled
+        );
+        assert_eq!(
+            release_copy("t".into(), true, true, never, true),
+            ReleaseCopy::Osc52("t".into())
+        );
+        assert_eq!(
+            release_copy("t".into(), true, false, |_| Ok(()), false),
+            ReleaseCopy::Copied
+        );
+        let broken = |_: &str| -> std::io::Result<()> { Err(std::io::Error::other("no tool")) };
+        assert_eq!(
+            release_copy("t".into(), true, false, broken, true),
+            ReleaseCopy::Osc52("t".into())
+        );
+        assert!(matches!(
+            release_copy("t".into(), true, false, broken, false),
+            ReleaseCopy::Failed(_)
+        ));
+        assert_eq!(release_copy_notice(ReleaseCopy::Disabled), None);
+    }
+
+    #[test]
     fn only_a_mouse_release_that_selects_text_asks_for_a_copy() {
         let mut doc = doc_of(vec![Line::raw("alpha beta")], false);
         doc.relayout(40, 20);
@@ -3647,27 +4137,71 @@ mod tests {
         assert_eq!(doc.scroll, 1);
     }
 
+    /// Astra #3: a change saved before the first poll must still reload. The
+    /// baseline is the stamp taken when the shown content was read, not
+    /// whatever the first poll happens to see.
     #[test]
-    fn file_refresh_fires_only_when_the_watched_file_changes() {
+    fn a_change_before_the_first_poll_still_reloads() {
         let path = std::env::temp_dir().join(format!("viewer-watch-{}", std::process::id()));
-        std::fs::write(&path, "one").unwrap();
-        let mut watched = None;
+        std::fs::write(&path, "version A").unwrap();
+        let request = Request::File {
+            path: path.clone(),
+            line: None,
+        };
+        let shown = load(&request);
+        assert!(shown.stamp.is_some(), "file loads carry their stamp");
         assert!(
-            !file_changed(&mut watched, &path),
-            "first sight is the baseline"
+            !file_refresh_needed(&path, shown.stamp),
+            "nothing changed yet"
         );
-        assert!(!file_changed(&mut watched, &path));
-        std::fs::write(&path, "one two").unwrap();
-        assert!(file_changed(&mut watched, &path));
-        assert!(!file_changed(&mut watched, &path));
-        let other = path.with_extension("other");
-        std::fs::write(&other, "x").unwrap();
+        std::fs::write(&path, "version B, saved before any poll").unwrap();
         assert!(
-            !file_changed(&mut watched, &other),
-            "a new file resets the baseline"
+            file_refresh_needed(&path, shown.stamp),
+            "the very first poll after the save must reload"
+        );
+        let mut doc = shown;
+        let reloaded = load(&request);
+        let new_stamp = reloaded.stamp;
+        apply_diff_refresh(&mut doc, reloaded);
+        assert_eq!(doc.stamp, new_stamp);
+        assert!(
+            !file_refresh_needed(&path, doc.stamp),
+            "settles after reloading"
         );
         let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(other);
+    }
+
+    /// An unchanged reload (a `touch`) adopts the new stamp, or the viewer
+    /// would reload the same content every two seconds forever.
+    #[test]
+    fn an_identical_reload_adopts_the_new_stamp() {
+        let mut doc = doc_of(vec![Line::raw("same")], false);
+        let mut refreshed = doc_of(vec![Line::raw("same")], false);
+        let stamp = Some((std::time::SystemTime::UNIX_EPOCH, 4));
+        refreshed.stamp = stamp;
+        apply_diff_refresh(&mut doc, refreshed);
+        assert_eq!(doc.stamp, stamp);
+    }
+
+    /// Astra #4: a refresh started under an earlier load never applies, even
+    /// when the document key matches again (A→B→A).
+    #[test]
+    fn stale_refreshes_are_rejected_by_generation() {
+        let a = Request::File {
+            path: "a.md".into(),
+            line: None,
+        };
+        let b = Request::File {
+            path: "b.md".into(),
+            line: None,
+        };
+        assert!(refresh_is_current(7, &a, 7, Some(&a)));
+        assert!(!refresh_is_current(7, &a, 7, Some(&b)), "another document");
+        assert!(
+            !refresh_is_current(7, &a, 9, Some(&a)),
+            "A, then B, then A again"
+        );
+        assert!(!refresh_is_current(7, &a, 7, None));
     }
 
     #[test]
@@ -4707,6 +5241,7 @@ mod tests {
             rows_key: None,
             pending_src: None,
             selection: PreviewSelection::default(),
+            stamp: None,
         };
         assert!(!doc.wrap, "glow output must not be generically re-wrapped");
         assert!(!doc.numbered, "glow formats its own layout, no gutter");

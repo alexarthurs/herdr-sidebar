@@ -150,23 +150,41 @@ const OSC52_MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 /// to the platform's clipboard tool (a console child of the TUI's own pty —
 /// no window is created), then falls back to OSC 52 when stdout is a terminal.
 pub fn copy_to_clipboard(text: &str) -> io::Result<ClipboardWrite> {
-    // Mirrors core herdr's SSH presence check; deliberately narrower than its
-    // `should_prefer_osc52` (no WSL/VS Code detection — those aren't "we have
-    // no local clipboard tool" cases the way SSH is).
-    #[cfg(not(windows))]
-    let stdout_is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
-    #[cfg(not(windows))]
-    let prefer_osc52 = (std::env::var_os("SSH_CONNECTION").is_some()
-        || std::env::var_os("SSH_TTY").is_some())
-        && stdout_is_terminal;
-    #[cfg(windows)]
-    let prefer_osc52 = false;
-
-    if prefer_osc52 {
-        let stdout = io::stdout();
-        return write_osc52(stdout.lock(), text);
+    if osc52_preferred() {
+        return write_osc52_stdout(text);
     }
+    match copy_native(text) {
+        Ok(()) => Ok(ClipboardWrite::Native),
+        Err(_) if osc52_fallback_available() => write_osc52_stdout(text),
+        Err(err) => Err(err),
+    }
+}
 
+/// Over SSH there is no local clipboard tool to trust, so OSC 52 goes first.
+/// Mirrors core herdr's SSH presence check; deliberately narrower than its
+/// `should_prefer_osc52` (no WSL/VS Code detection — those aren't "we have
+/// no local clipboard tool" cases the way SSH is).
+pub fn osc52_preferred() -> bool {
+    #[cfg(not(windows))]
+    {
+        (std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some())
+            && std::io::IsTerminal::is_terminal(&std::io::stdout())
+    }
+    #[cfg(windows)]
+    {
+        false
+    }
+}
+
+/// Whether a failed native copy may fall back to OSC 52 (Unix, on a TTY).
+pub fn osc52_fallback_available() -> bool {
+    cfg!(not(windows)) && std::io::IsTerminal::is_terminal(&std::io::stdout())
+}
+
+/// Copy through the platform's clipboard tool (a console child of the TUI's
+/// own pty — no window is created). Blocks until the tool exits, so callers
+/// on a UI thread should run it on a worker.
+pub fn copy_native(text: &str) -> io::Result<()> {
     #[cfg(windows)]
     let candidates: &[&[&str]] = &[&["clip"]];
     #[cfg(not(windows))]
@@ -179,16 +197,18 @@ pub fn copy_to_clipboard(text: &str) -> io::Result<ClipboardWrite> {
     let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no clipboard tool found");
     for argv in candidates {
         match copy_with(argv, text) {
-            Ok(()) => return Ok(ClipboardWrite::Native),
+            Ok(()) => return Ok(()),
             Err(err) => last_err = err,
         }
     }
-    #[cfg(not(windows))]
-    if stdout_is_terminal {
-        let stdout = io::stdout();
-        return write_osc52(stdout.lock(), text);
-    }
     Err(last_err)
+}
+
+/// Emit OSC 52 on stdout. Must run on the thread that draws the TUI, or the
+/// escape sequence could interleave with a frame being written.
+pub fn write_osc52_stdout(text: &str) -> io::Result<ClipboardWrite> {
+    let stdout = io::stdout();
+    write_osc52(stdout.lock(), text)
 }
 
 fn write_osc52(mut out: impl std::io::Write, text: &str) -> io::Result<ClipboardWrite> {
@@ -273,11 +293,14 @@ fn osc52_sequence_fits(input_len: usize) -> bool {
     total <= OSC52_MAX_CAPTURE_BYTES
 }
 
+/// How long a clipboard helper may take before it is killed. `clip` and
+/// friends exit in milliseconds; one that hangs must not wedge its caller.
+const CLIPBOARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn copy_with(argv: &[&str], text: &str) -> io::Result<()> {
     use std::io::Write;
 
-    let mut child = std::process::Command::new(argv[0])
-        .args(&argv[1..])
+    let mut child = clipboard_command(argv)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -288,9 +311,53 @@ fn copy_with(argv: &[&str], text: &str) -> io::Result<()> {
             format!("{} opened without stdin", argv[0]),
         ));
     };
-    stdin.write_all(text.as_bytes())?;
-    drop(stdin);
-    let status = child.wait()?;
+    // Write on a helper thread: a helper that never reads would block the
+    // write forever once the pipe buffer fills. One deadline covers BOTH the
+    // delivery and the exit, and the copy only counts when every byte was
+    // delivered AND the helper succeeded — callers such as the editor's cut
+    // delete text on success, and there is no undo.
+    let bytes = text.as_bytes().to_vec();
+    let (sent, delivery) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = stdin.write_all(&bytes);
+        drop(stdin);
+        let _ = sent.send(result);
+    });
+    let deadline = std::time::Instant::now() + CLIPBOARD_TIMEOUT;
+    let mut delivered: Option<io::Result<()>> = None;
+    let mut exited = None;
+    loop {
+        if delivered.is_none() {
+            match delivery.try_recv() {
+                Ok(result) => delivered = Some(result),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    delivered = Some(Err(io::Error::other("clipboard writer failed")));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if exited.is_none() {
+            exited = child.try_wait()?;
+        }
+        if let (Some(_), Some(_)) = (&delivered, &exited) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            // A descendant that inherited the pipe can outlive the helper;
+            // the writer thread is then abandoned rather than awaited.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{} did not finish in time", argv[0]),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let (Some(delivered), Some(status)) = (delivered, exited) else {
+        unreachable!("the loop only exits with both outcomes");
+    };
+    delivered.map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", argv[0])))?;
     if status.success() {
         Ok(())
     } else {
@@ -299,6 +366,19 @@ fn copy_with(argv: &[&str], text: &str) -> io::Result<()> {
             argv[0]
         )))
     }
+}
+
+/// A clipboard helper process. Windows PowerShell children must not inherit
+/// a PowerShell 7 `PSModulePath` (issue #96): 5.1 would autoload PS7's
+/// CoreCLR modules and lose `Get-Clipboard`. Without the variable, 5.1 uses
+/// its own defaults.
+fn clipboard_command(argv: &[&str]) -> std::process::Command {
+    let mut command = std::process::Command::new(argv[0]);
+    command.args(&argv[1..]);
+    if argv[0].eq_ignore_ascii_case("powershell") {
+        command.env_remove("PSModulePath");
+    }
+    command
 }
 
 /// Read text from the system clipboard when a platform clipboard command is
@@ -323,10 +403,7 @@ pub fn paste_from_clipboard() -> io::Result<String> {
 
     let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no clipboard tool found");
     for argv in candidates {
-        match std::process::Command::new(argv[0])
-            .args(&argv[1..])
-            .output()
-        {
+        match clipboard_command(argv).output() {
             Ok(output) if output.status.success() => {
                 return String::from_utf8(output.stdout)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
@@ -981,6 +1058,34 @@ mod tests {
         delete(&folder, true).unwrap();
         assert!(!renamed.exists() && !folder.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Astra round 3 HIGH: a helper that exits 0 without reading its input
+    /// did NOT copy. Reporting success would let the editor's cut delete the
+    /// selection with nothing on the clipboard.
+    #[test]
+    fn a_helper_that_ignores_its_input_is_not_a_successful_copy() {
+        let big = "x".repeat(4 * 1024 * 1024);
+        #[cfg(unix)]
+        let argv: &[&str] = &["sh", "-c", "exit 0"];
+        #[cfg(windows)]
+        let argv: &[&str] = &["cmd", "/c", "exit 0"];
+        assert!(
+            copy_with(argv, &big).is_err(),
+            "undelivered input must fail"
+        );
+    }
+
+    #[test]
+    fn powershell_clipboard_helpers_drop_an_inherited_module_path() {
+        let command = clipboard_command(&["powershell", "-NoProfile"]);
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "PSModulePath" && value.is_none()),
+            "PSModulePath must be removed for Windows PowerShell children"
+        );
+        assert!(clipboard_command(&["clip"]).get_envs().next().is_none());
     }
 
     #[test]

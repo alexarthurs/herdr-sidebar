@@ -1085,10 +1085,17 @@ fn child_dirs(dir: &Path, depth: usize) -> Vec<PathBuf> {
         return out;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
+        // Never follow a symlink while scanning (issue #87): a link into a
+        // cloud or network mount (OneDrive's File Provider trash, an offline
+        // SMB share) can block `stat` forever and the sidebar never draws.
+        // `file_type()` does not traverse links; it usually comes from
+        // readdir's d_type, falling back to a non-following lstat where the
+        // filesystem gives none. Quick Open's walker already skips links. This
+        // does not make enumerating a stalled mount itself non-blocking.
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
+        let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if matches!(
@@ -1106,6 +1113,21 @@ fn child_dirs(dir: &Path, depth: usize) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #87: repository discovery must not descend through directory
+    /// symlinks (a link into a stalled cloud mount hung the sidebar).
+    #[cfg(unix)]
+    #[test]
+    fn child_dirs_does_not_follow_directory_symlinks() {
+        let base = std::env::temp_dir().join(format!("aa-git-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real/inner")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        let dirs = child_dirs(&base, 2);
+        assert!(dirs.contains(&base.join("real/inner")));
+        assert!(!dirs.iter().any(|dir| dir.starts_with(base.join("link"))));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     fn entry(path: &str, letter: char, orig: Option<&str>) -> FileEntry {
         FileEntry {

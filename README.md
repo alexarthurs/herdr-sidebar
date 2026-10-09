@@ -48,7 +48,8 @@ Use the mouse or press `1`, `2`, and `3`.
   same tab with **Preview opens in: pane**, or opt into experimental `replace` mode:
   working panes move to a temporary tab while you preview; Esc / `q` brings them back.
 - Preview text, Markdown, images, and—when `ffmpeg` is available—video poster frames.
-  Read-only previews support mouse selection and clipboard copy, including OSC 52 over SSH.
+  Read-only previews support mouse selection and clipboard copy, including OSC 52 over SSH,
+  and reload on their own when the file changes on disk.
 - Find files with `Ctrl+P`; search project contents with `Ctrl+F` or `Ctrl+Shift+F`.
   Search supports case, whole-word, regex, and include/exclude filters.
 - Stage files or folders from the tree without crossing nested-repository boundaries.
@@ -120,7 +121,8 @@ folder stays put until that pane changes directory again.
 | `b` | hide | `b` | hide |
 | `1` / `2` / `3` | change view | `1` / `2` / `3` | change view |
 
-Preview: drag to select, `Ctrl/Cmd+C` to copy, arrows/PageUp/PageDown or
+Preview: drag to select (releasing copies, following herdr's `copy_on_select`),
+`Ctrl/Cmd+C` to copy, arrows/PageUp/PageDown or
 Space/`b` to scroll, `w` to toggle wrapping, and `q` or Esc to close.
 
 Host keybindings can invoke the direct `show-explorer`, `show-search`, `show-git`, and

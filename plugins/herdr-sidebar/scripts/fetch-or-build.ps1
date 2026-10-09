@@ -2,6 +2,18 @@
 # Compatible with the Windows PowerShell 5.1 host used by herdr actions.
 $ErrorActionPreference = 'Stop'
 
+# Herdr started from PowerShell 7 hands its PSModulePath to this Windows
+# PowerShell 5.1 child. 5.1 then autoloads PS7's CoreCLR modules first and
+# cmdlets such as Get-FileHash/Select-String silently vanish (issue #96). Keep
+# only 5.1's own module directories, before any cmdlet triggers an autoload.
+if ($PSVersionTable.PSVersion.Major -le 5) {
+    $env:PSModulePath = @(
+        [IO.Path]::Combine([Environment]::GetFolderPath('MyDocuments'), 'WindowsPowerShell', 'Modules'),
+        [IO.Path]::Combine($env:ProgramFiles, 'WindowsPowerShell', 'Modules'),
+        [IO.Path]::Combine($env:SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules')
+    ) -join ';'
+}
+
 $Repo = 'alexarthurs/herdr-sidebar'
 $TestMode = $env:HS_TEST_MODE -eq '1'
 function Remove-HsVerbatimPrefix([string]$Path) {
@@ -37,6 +49,16 @@ function Build-HsFromSource {
     } finally {
         Pop-Location
     }
+}
+
+# .NET, not Get-FileHash: hashing must not depend on module autoloading.
+function Get-HsSha256([string]$Path) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [IO.File]::OpenRead($Path)
+        try { $bytes = $sha.ComputeHash($stream) } finally { $stream.Dispose() }
+    } finally { $sha.Dispose() }
+    return [BitConverter]::ToString($bytes).Replace('-', '').ToLowerInvariant()
 }
 
 function Get-HsAsset {
@@ -82,9 +104,9 @@ foreach ($Asset in $Assets) {
     if (-not $Line) { Build-HsFromSource "the release does not list a checksum for $Asset" }
     $Expected = ([regex]::Match($Line, '^[0-9a-fA-F]{64}').Value).ToLowerInvariant()
     try {
-        $Actual = (Get-FileHash -LiteralPath $Downloaded -Algorithm SHA256).Hash.ToLowerInvariant()
+        $Actual = Get-HsSha256 $Downloaded
     } catch {
-        Build-HsFromSource "could not calculate SHA-256 for $Asset"
+        Build-HsFromSource "could not read the downloaded $Asset to verify it ($($_.Exception.Message))"
     }
     if ($Actual -ne $Expected) { Build-HsFromSource "checksum verification failed for $Asset" }
 }

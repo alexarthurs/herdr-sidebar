@@ -868,6 +868,9 @@ impl App {
     }
 
     fn close(&mut self, snooze: bool) {
+        // Closing our own pane kills this process: save a pending remembered
+        // root first (the outer loop's flush never runs on this path).
+        crate::flush_pending_root();
         let Some(ctl) = &self.pane_ctl else { return };
         if snooze {
             let tab = match herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) {
