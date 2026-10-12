@@ -166,7 +166,7 @@ fn main() -> std::io::Result<()> {
             // (and a dark syntax theme) whatever the user chose.
             let persisted = state::load_state();
             herdr_sidebar::ui::set_color_theme(persisted.color_theme);
-            herdr_sidebar::syntax::set_themes(persisted.syntax_dark, persisted.syntax_light);
+            herdr_sidebar::syntax::apply_settings(&persisted);
             return viewer::run(std::path::Path::new(&control));
         }
         Some("--view") => {}
