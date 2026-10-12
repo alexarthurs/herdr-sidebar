@@ -1018,6 +1018,13 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   receiver cannot cancel a thread blocked in the kernel, so at most `MAX_REFRESH_IN_FLIGHT` (2)
   refresh workers may exist; new refreshes pause while both are stuck, and a refresh unanswered
   for 30s is abandoned so the same document can retry within that cap.
+- **herdr forwards terminal focus reporting** (verified live, herdr 0.9.3 on macOS): a pane app
+  that enables `?1004h` gets `CSI I` when its pane is focused and `CSI O` when the user leaves.
+  The viewer (`EnableFocusChange`) runs the same stamp check immediately on `FocusGained`
+  instead of waiting for the 2s tick; edit mode runs `poll_external`. `r` requests a refresh
+  that ignores the stamp (coarse mtimes and same-size rewrites can leave it unchanged) and
+  reports `reloaded` / `no changes`; it waits for a refresh already in flight rather than being
+  dropped, and `git show` answers `nothing to reload` because its output is immutable.
 
 ### Long-line wrapping in the preview (`src/wrap.rs`)
 

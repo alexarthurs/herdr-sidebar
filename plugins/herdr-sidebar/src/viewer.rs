@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+    KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -1140,7 +1140,9 @@ fn copy_selection(doc: &Doc) -> String {
     }
 }
 
-fn apply_diff_refresh(doc: &mut Doc, mut refreshed: Doc) {
+/// Swap in a re-loaded copy of the document on screen. Returns false (and
+/// keeps the current doc, selection included) when nothing changed.
+fn apply_diff_refresh(doc: &mut Doc, mut refreshed: Doc) -> bool {
     if doc.media.is_none()
         && doc.name == refreshed.name
         && doc.context == refreshed.context
@@ -1148,11 +1150,12 @@ fn apply_diff_refresh(doc: &mut Doc, mut refreshed: Doc) {
         && doc.lines == refreshed.lines
     {
         doc.stamp = refreshed.stamp;
-        return;
+        return false;
     }
     refreshed.wrap = doc.wrap;
     refreshed.pending_src = Some(doc.top_src());
     *doc = refreshed;
+    true
 }
 
 enum ViewMode {
@@ -2110,7 +2113,9 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     );
     crossterm::style::force_color_output(true); // TUI colors ≠ pipeable output
     let mut terminal = ratatui::init();
-    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // herdr forwards focus reporting (CSI I / CSI O) when the user switches
+    // to or away from this pane, so returning to a preview checks it at once.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange);
     let mut page: usize = 20;
     let mut preview_body = Rect::default();
     let mut edit_width: usize = 1;
@@ -2126,6 +2131,11 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         std::sync::mpsc::Receiver<Option<Doc>>,
         Instant,
     )> = None;
+    // A refresh to run now rather than on the 2s tick: `Some(true)` for `r`
+    // (reloads even an unchanged stamp and reports the outcome), `Some(false)`
+    // for a regained focus. `refresh_manual` marks the one in flight.
+    let mut refresh_now: Option<bool> = None;
+    let mut refresh_manual = false;
     let mut copier: Option<ReleaseCopier> = None;
     let mut identity_pending = false;
     let result = loop {
@@ -2381,6 +2391,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         doc.pending_src = Some(doc.top_src());
                                         doc.wrap = !doc.wrap;
                                     }
+                                    KeyCode::Char('r') => refresh_now = Some(true),
                                     _ => {}
                                 }
                             }
@@ -2483,6 +2494,13 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                         _ => {}
                     },
                 },
+                Event::FocusGained => match &mut mode {
+                    ViewMode::Preview(_) => refresh_now = Some(refresh_now.unwrap_or(false)),
+                    ViewMode::Edit(editor) => {
+                        editor.poll_external(MAX_BYTES, MAX_LINES);
+                        last_external_check = Instant::now();
+                    }
+                },
                 _ => {} // resize etc: redraw
             }
         }
@@ -2527,6 +2545,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                     preview_load = Some(start_preview_load(request));
                     identity_pending = true;
                     notice = None;
+                    refresh_now = None;
                 }
             }
         }
@@ -2568,12 +2587,28 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         if let Some((started, request, refreshed)) = refreshed {
             diff_refresh = None;
             if refresh_is_current(started, &request, load_generation(), current.as_ref())
-                && let (ViewMode::Preview(doc), Some(refreshed)) = (&mut mode, refreshed)
+                && let ViewMode::Preview(doc) = &mut mode
             {
-                apply_diff_refresh(doc, refreshed);
+                let changed = refreshed.is_some_and(|refreshed| apply_diff_refresh(doc, refreshed));
+                if refresh_manual {
+                    notice = Some(if changed { "reloaded" } else { "no changes" }.into());
+                }
             }
         }
-        if last_diff_refresh.elapsed() >= Duration::from_secs(2) {
+        if refresh_now == Some(true)
+            && !matches!(
+                current,
+                Some(Request::Diff { .. } | Request::File { .. }) | None
+            )
+        {
+            // `git show` output is immutable; say so instead of ignoring `r`.
+            refresh_now = None;
+            notice = Some("nothing to reload".into());
+        }
+        let timed = last_diff_refresh.elapsed() >= Duration::from_secs(2);
+        if timed || refresh_now.is_some() {
+            // An on-demand refresh waits for one already in flight, so `r`
+            // is never swallowed by a timer check that started just before.
             if preview_load.is_none()
                 && diff_refresh.is_none()
                 && let ViewMode::Preview(doc) = &mode
@@ -2581,25 +2616,32 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                     current.clone()
                 && let Some(in_flight) = InFlight::claim()
             {
-                let baseline = doc.stamp;
+                refresh_manual = refresh_now.take().unwrap_or(false);
+                // `r` reloads regardless of the stamp: a coarse mtime or a
+                // same-size rewrite can leave it unchanged.
+                let baseline = (!refresh_manual).then_some(doc.stamp);
                 let worker_request = request.clone();
                 let (sender, receiver) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
                     let _in_flight = in_flight;
                     // Files stat first, here on the worker; only a changed
                     // stamp pays for a reload. Diffs always re-run.
-                    let reload = match &worker_request {
-                        Request::File { path, .. } => file_refresh_needed(path, baseline),
+                    let reload = match (&worker_request, baseline) {
+                        (Request::File { path, .. }, Some(baseline)) => {
+                            file_refresh_needed(path, baseline)
+                        }
                         _ => true,
                     };
                     let _ = sender.send(reload.then(|| load(&worker_request)));
                 });
                 diff_refresh = Some((load_generation(), request, receiver, Instant::now()));
             }
-            last_diff_refresh = Instant::now();
+            if timed {
+                last_diff_refresh = Instant::now();
+            }
         }
     };
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, DisableFocusChange);
     ratatui::restore();
     result
 }
@@ -2688,7 +2730,10 @@ fn draw_doc(
             " image preview  q close".into()
         }
     } else if editable {
-        preview_hint(&["e edit", "space/b page", wrap_hint], footer.width)
+        preview_hint(
+            &["e edit", "r reload", "space/b page", wrap_hint],
+            footer.width,
+        )
     } else {
         preview_hint(&["space/b page", "↑↓ scroll", wrap_hint], footer.width)
     };
@@ -4131,12 +4176,34 @@ mod tests {
         let rows_key = doc.rows_key;
 
         let refreshed = doc_of(vec![Line::raw("-old"), Line::raw("+new")], false);
-        apply_diff_refresh(&mut doc, refreshed);
+        assert!(!apply_diff_refresh(&mut doc, refreshed), "nothing changed");
 
         assert_eq!(doc.selection.anchor, selection.anchor);
         assert_eq!(doc.selection.cursor, selection.cursor);
         assert_eq!(doc.rows_key, rows_key);
         assert_eq!(doc.scroll, 1);
+    }
+
+    /// `r` reports "reloaded" only when the content actually changed, and a
+    /// changed reload keeps the reader's wrap mode and place by source line.
+    #[test]
+    fn changed_refresh_reports_and_keeps_wrap_and_position() {
+        let lines = |marker: &str| -> Vec<Line<'static>> {
+            (0..50)
+                .map(|i| Line::raw(format!("{marker} line {i}")))
+                .collect()
+        };
+        let mut doc = doc_of(lines("old"), true);
+        doc.wrap = false;
+        doc.relayout(40, 10);
+        doc.scroll = 20;
+
+        assert!(apply_diff_refresh(&mut doc, doc_of(lines("new"), true)));
+        doc.relayout(40, 10);
+
+        assert!(!doc.wrap, "the reader's wrap toggle survives a reload");
+        assert_eq!(doc.scroll, 20, "same source line stays at the top");
+        assert_eq!(doc.lines[0].to_string(), "new line 0");
     }
 
     /// Astra #3: a change saved before the first poll must still reload. The
