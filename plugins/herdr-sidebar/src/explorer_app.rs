@@ -289,6 +289,7 @@ enum Setting {
     SidebarWidth,
     IconTheme,
     ColorTheme,
+    SyntaxTheme,
     PreviewPlacement,
     CustomEditorCommand,
     CustomEditorClick,
@@ -560,6 +561,8 @@ impl App {
         self.sidebar_state.custom_editor_on_click = shared.custom_editor_on_click;
         let old_git_footer = self.sidebar_state.show_git_footer;
         self.sidebar_state.show_git_footer = shared.show_git_footer;
+        self.sidebar_state.syntax_dark = shared.syntax_dark;
+        self.sidebar_state.syntax_light = shared.syntax_light;
         if shared.color_theme != self.sidebar_state.color_theme {
             self.sidebar_state.color_theme = shared.color_theme;
             set_color_theme(shared.color_theme);
@@ -2458,6 +2461,12 @@ impl App {
                 true,
             ),
             (
+                Setting::SyntaxTheme,
+                "Syntax theme",
+                self.sidebar_state.syntax_theme_label(),
+                true,
+            ),
+            (
                 Setting::PreviewPlacement,
                 "Preview opens in",
                 self.sidebar_state.preview_placement.label().to_string(),
@@ -2607,6 +2616,9 @@ impl App {
                     state.color_theme = state.color_theme.next();
                 });
                 set_color_theme(self.sidebar_state.color_theme);
+            }
+            Setting::SyntaxTheme => {
+                self.sidebar_state = sidebar::update_state(sidebar::State::cycle_syntax_theme);
             }
             Setting::PreviewPlacement => {
                 self.sidebar_state = sidebar::update_state(|state| {

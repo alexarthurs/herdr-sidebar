@@ -344,8 +344,9 @@ through — `ColorTheme::next()` is a rotation, not a toggle):
   `DarkGray`, `Color::Yellow` advisories, and `LightBlue` glyphs. Add new colors to `Palette`,
   never as a module const.
 - `syntect`'s themes are foregrounds only, so a dark grammar theme on white is exactly the
-  washed-out case: `syntax::assets()` loads base16-ocean.dark AND InspiredGitHub and
-  `syntaxes_and_theme()` picks per `ui::is_light()`. An already-highlighted preview keeps its
+  washed-out case: `syntax::assets()` loads every bundled theme and `syntaxes_and_theme()`
+  picks the configured dark or light one per `ui::is_light()` (defaults base16-ocean.dark /
+  InspiredGitHub). An already-highlighted preview keeps its
   colors until it reloads; diffs re-render on their own ~2s refresh.
 - **A named color is the terminal profile's color, so it is not safe on a filled button**:
   `accent_fg: Color::White` emits ANSI 15, which a light profile draws as a pale grey — ✓ Commit
@@ -1108,6 +1109,13 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   (`two_face::syntax::extra_newlines()`), themes still from syntect's `ThemeSet` (theme
   data is grammar-independent). Foreground colors only: the terminal owns the background.
   See `src/syntax.rs`; unknown extensions fall back to plain lines.
+- The ⚙ "Syntax theme" row picks among syntect's BUNDLED themes only (`state::SyntaxTheme`,
+  no `plist-load`), persisted by syntect name as `syntax_dark` / `syntax_light` in
+  `state.json`. It cycles the background the active color theme is drawn for, and each
+  background only offers themes drawn for it — a dark theme on white is the washed-out case.
+  A name saved under the wrong key is ignored on load. Only the viewer highlights, so the
+  choice reaches it like `color_theme`: `syntax::set_themes` at `--preview` startup and on
+  the viewer heartbeat; an open document keeps its colors until it reloads.
 
 ### Experimental in-pane editor (issue #22)
 

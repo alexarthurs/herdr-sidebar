@@ -2505,7 +2505,9 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             // heartbeat is the sidebar's own re-read cadence. Chrome, diff
             // tints and selection follow immediately — an already-highlighted
             // file keeps its syntax colors until it is reloaded.
-            crate::ui::set_color_theme(crate::state::load_state().color_theme);
+            let shared = crate::state::load_state();
+            crate::ui::set_color_theme(shared.color_theme);
+            crate::syntax::set_themes(shared.syntax_dark, shared.syntax_light);
             last_heartbeat = crate::state::unix_now();
         }
         if prompt.is_none() {
