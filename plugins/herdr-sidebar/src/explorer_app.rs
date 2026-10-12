@@ -289,6 +289,8 @@ enum Setting {
     SidebarWidth,
     IconTheme,
     ColorTheme,
+    SyntaxTheme,
+    SyntaxBackground,
     PreviewPlacement,
     CustomEditorCommand,
     CustomEditorClick,
@@ -560,6 +562,9 @@ impl App {
         self.sidebar_state.custom_editor_on_click = shared.custom_editor_on_click;
         let old_git_footer = self.sidebar_state.show_git_footer;
         self.sidebar_state.show_git_footer = shared.show_git_footer;
+        self.sidebar_state.syntax_dark = shared.syntax_dark;
+        self.sidebar_state.syntax_light = shared.syntax_light;
+        self.sidebar_state.syntax_background = shared.syntax_background;
         if shared.color_theme != self.sidebar_state.color_theme {
             self.sidebar_state.color_theme = shared.color_theme;
             set_color_theme(shared.color_theme);
@@ -2457,6 +2462,21 @@ impl App {
                 self.sidebar_state.color_theme.label().to_string(),
                 true,
             ),
+            {
+                let (label, value) = self.sidebar_state.syntax_theme_row();
+                (Setting::SyntaxTheme, label, value, true)
+            },
+            (
+                Setting::SyntaxBackground,
+                "Theme background",
+                if self.sidebar_state.syntax_background {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
             (
                 Setting::PreviewPlacement,
                 "Preview opens in",
@@ -2607,6 +2627,14 @@ impl App {
                     state.color_theme = state.color_theme.next();
                 });
                 set_color_theme(self.sidebar_state.color_theme);
+            }
+            Setting::SyntaxTheme => {
+                self.sidebar_state = sidebar::update_state(sidebar::State::cycle_syntax_theme);
+            }
+            Setting::SyntaxBackground => {
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.syntax_background = !state.syntax_background;
+                });
             }
             Setting::PreviewPlacement => {
                 self.sidebar_state = sidebar::update_state(|state| {

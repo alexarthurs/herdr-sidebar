@@ -344,8 +344,9 @@ through — `ColorTheme::next()` is a rotation, not a toggle):
   `DarkGray`, `Color::Yellow` advisories, and `LightBlue` glyphs. Add new colors to `Palette`,
   never as a module const.
 - `syntect`'s themes are foregrounds only, so a dark grammar theme on white is exactly the
-  washed-out case: `syntax::assets()` loads base16-ocean.dark AND InspiredGitHub and
-  `syntaxes_and_theme()` picks per `ui::is_light()`. An already-highlighted preview keeps its
+  washed-out case: `syntax::assets()` loads every bundled theme and `syntaxes_and_theme()`
+  picks the configured dark or light one per `ui::is_light()` (defaults base16-ocean.dark /
+  InspiredGitHub). An already-highlighted preview keeps its
   colors until it reloads; diffs re-render on their own ~2s refresh.
 - **A named color is the terminal profile's color, so it is not safe on a filled button**:
   `accent_fg: Color::White` emits ANSI 15, which a light profile draws as a pale grey — ✓ Commit
@@ -1108,6 +1109,37 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   (`two_face::syntax::extra_newlines()`), themes still from syntect's `ThemeSet` (theme
   data is grammar-independent). Foreground colors only: the terminal owns the background.
   See `src/syntax.rs`; unknown extensions fall back to plain lines.
+- The ⚙ "Dark syntax" / "Light syntax" row (one row, labelled by the active background — the
+  mode lives in the LABEL because "Syntax theme  intellij (dark)" clipped in a 32-col pane)
+  picks among syntect's BUNDLED themes only (`state::SyntaxTheme`,
+  no `plist-load`), persisted by syntect name as `syntax_dark` / `syntax_light` in
+  `state.json`. It cycles the background the active color theme is drawn for, and each
+  background only offers themes drawn for it — a dark theme on white is the washed-out case.
+  A name saved under the wrong key is ignored on load. Only the viewer highlights, so the
+  choice reaches it like `color_theme`: `syntax::set_themes` at `--preview` startup and on
+  the viewer heartbeat; an open document keeps its colors until it reloads.
+- Darcula and IntelliJ Dark are Rust tables in `src/themes.rs` (`ThemeSpec::build`), NOT
+  `.tmTheme` files: loading tmTheme needs syntect's `plist-load` and its plist dependency chain
+  (maintainer-rejected). The tables were generated once from tmTheme sources and checked rule by
+  rule against syntect's own parse. An empty font style means "not set" (inherit), like a rule
+  without `fontStyle`; `""` would otherwise reset inherited italics. base16-ocean.dark colors the
+  WHOLE `markup.list`/`markup.quote` scope (why Markdown previews looked flat orange); the
+  JetBrains tables color only list/quote markers. Scope names in two-face's Markdown grammar:
+  list marker `punctuation.definition.list_item` (numbered: `markup.list.numbered.bullet`),
+  item text `meta.paragraph.list`, link text `meta.link.inline.description`.
+- Markdown grammar quirks the JetBrains tables work around: a lone `~` ("~50 %") opens a GFM
+  `markup.strikethrough` that never closes, so a gray strikethrough rule greys the REST of the
+  line — the tables keep strikethrough at the plain foreground. `[LABEL]` shortcut references
+  get no scope at all; `syntax::shortcut_references` finds them and restyles only
+  plain-foreground regions with the theme's style for the synthetic scope
+  `herdr-sidebar.shortcut-reference.markdown`. That scope must stay under its OWN top-level
+  name: base16-ocean.dark's generic `meta.link` rule matched a `meta.link.*` variant and
+  silently changed the default theme's output.
+- `syntax_background` (⚙ "Theme background", off by default) paints the viewer
+  (`paint_preview_background`) with the theme's background/foreground and the line numbers
+  with `gutterForeground`. It reaches the viewer through `syntax::apply_settings` with the
+  theme choice. Row layouts are cached per width/wrap, so the gutter color applies on the next
+  relayout or document.
 
 ### Experimental in-pane editor (issue #22)
 

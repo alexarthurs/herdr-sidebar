@@ -224,6 +224,108 @@ impl ColorTheme {
     }
 }
 
+/// The preview's syntax-highlighting theme: one of syntect's bundled themes
+/// or a JetBrains palette compiled in by `crate::themes` (no extra
+/// dependencies). Dark and light color themes each keep their own
+/// choice, and each only cycles through the themes drawn for that background
+/// — syntect colors foregrounds only, so a dark theme on a light terminal is
+/// the washed-out case the light palette exists to avoid.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SyntaxTheme {
+    OceanDark,
+    EightiesDark,
+    MochaDark,
+    SolarizedDark,
+    Darcula,
+    IntelliJDark,
+    InspiredGitHub,
+    OceanLight,
+    SolarizedLight,
+}
+
+impl SyntaxTheme {
+    pub const ALL: [Self; 9] = [
+        Self::OceanDark,
+        Self::EightiesDark,
+        Self::MochaDark,
+        Self::SolarizedDark,
+        Self::Darcula,
+        Self::IntelliJDark,
+        Self::InspiredGitHub,
+        Self::OceanLight,
+        Self::SolarizedLight,
+    ];
+    const DARK: [Self; 6] = [
+        Self::OceanDark,
+        Self::EightiesDark,
+        Self::MochaDark,
+        Self::SolarizedDark,
+        Self::Darcula,
+        Self::IntelliJDark,
+    ];
+    const LIGHT: [Self; 3] = [Self::InspiredGitHub, Self::OceanLight, Self::SolarizedLight];
+
+    /// The historical theme for each background.
+    pub fn default_for(light: bool) -> Self {
+        if light {
+            Self::InspiredGitHub
+        } else {
+            Self::OceanDark
+        }
+    }
+
+    /// The key in syntect's `ThemeSet::load_defaults()` (or the compiled-in
+    /// theme's name); also the persisted value, so `state.json` names a theme
+    /// the user can look up.
+    pub fn syntect_name(self) -> &'static str {
+        match self {
+            Self::OceanDark => "base16-ocean.dark",
+            Self::EightiesDark => "base16-eighties.dark",
+            Self::MochaDark => "base16-mocha.dark",
+            Self::SolarizedDark => "Solarized (dark)",
+            Self::Darcula => "Darcula",
+            Self::IntelliJDark => "IntelliJ Dark",
+            Self::InspiredGitHub => "InspiredGitHub",
+            Self::OceanLight => "base16-ocean.light",
+            Self::SolarizedLight => "Solarized (light)",
+        }
+    }
+
+    /// Short Settings value; the row adds the mode.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OceanDark | Self::OceanLight => "ocean",
+            Self::EightiesDark => "eighties",
+            Self::MochaDark => "mocha",
+            Self::SolarizedDark | Self::SolarizedLight => "solarized",
+            Self::InspiredGitHub => "github",
+            Self::Darcula => "darcula",
+            Self::IntelliJDark => "intellij",
+        }
+    }
+
+    pub fn is_light(self) -> bool {
+        Self::LIGHT.contains(&self)
+    }
+
+    /// The Settings row rotates through this theme's own mode only.
+    pub fn next(self) -> Self {
+        let themes: &[Self] = if self.is_light() {
+            &Self::LIGHT
+        } else {
+            &Self::DARK
+        };
+        let index = themes.iter().position(|t| *t == self).unwrap_or(0);
+        themes[(index + 1) % themes.len()]
+    }
+
+    /// A persisted name, accepted only for the mode it was saved under.
+    fn from_state_name(name: &str, light: bool) -> Option<Self> {
+        let themes: &[Self] = if light { &Self::LIGHT } else { &Self::DARK };
+        themes.iter().copied().find(|t| t.syntect_name() == name)
+    }
+}
+
 /// Where a preview, diff or `git show` opens. `Tab` gives every document its
 /// own herdr tab (VS Code editor-tab semantics, the historical default);
 /// `Pane` splits ONE viewer pane into the tab the sidebar already lives in
@@ -288,6 +390,15 @@ pub struct State {
     /// Accent palette. Terminal mode uses ANSI colors that inherit the
     /// terminal profile; VS Code preserves the original fixed RGB palette.
     pub color_theme: ColorTheme,
+    /// Preview syntax theme while a dark color theme (`vscode`, `terminal`)
+    /// is active.
+    pub syntax_dark: SyntaxTheme,
+    /// Preview syntax theme while the `light` color theme is active.
+    pub syntax_light: SyntaxTheme,
+    /// Paint the preview with its syntax theme's own background, text and
+    /// line-number colors, like an editor. Off leaves the terminal's
+    /// background showing (foreground colors only).
+    pub syntax_background: bool,
     /// The first-run "install a Nerd Font?" prompt was answered (either
     /// way) — never show it again.
     pub font_prompt_done: bool,
@@ -327,6 +438,30 @@ pub struct State {
     pub scm_tree_view: bool,
 }
 
+impl State {
+    /// Advance the syntax theme of the background the active color theme is
+    /// drawn for; the other background keeps its choice.
+    pub fn cycle_syntax_theme(&mut self) {
+        if self.color_theme.is_light() {
+            self.syntax_light = self.syntax_light.next();
+        } else {
+            self.syntax_dark = self.syntax_dark.next();
+        }
+    }
+
+    /// Settings row label and value for the active background's theme. The
+    /// background is named in the LABEL so it is clear the other one keeps
+    /// its own choice; the value stays short so the row fits the default
+    /// sidebar width without clipping.
+    pub fn syntax_theme_row(&self) -> (&'static str, String) {
+        if self.color_theme.is_light() {
+            ("Light syntax", self.syntax_light.label().to_string())
+        } else {
+            ("Dark syntax", self.syntax_dark.label().to_string())
+        }
+    }
+}
+
 impl Default for State {
     fn default() -> Self {
         Self {
@@ -337,6 +472,9 @@ impl Default for State {
             show_git_footer: true,
             icons: None,
             color_theme: ColorTheme::VsCode,
+            syntax_dark: SyntaxTheme::default_for(false),
+            syntax_light: SyntaxTheme::default_for(true),
+            syntax_background: false,
             font_prompt_done: false,
             auto_open: true,
             strict_toggle: false,
@@ -513,7 +651,7 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"syntax_dark\":\"{}\",\"syntax_light\":\"{}\",\"syntax_background\":{},\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.search_active,
@@ -528,6 +666,9 @@ fn write_state(path: &Path, state: State) {
         state.dock_right,
         clamp_sidebar_width(state.sidebar_width),
         state.color_theme.label(),
+        state.syntax_dark.syntect_name(),
+        state.syntax_light.syntect_name(),
+        state.syntax_background,
         state.preview_placement.label(),
         state.custom_editor_on_click,
         state.scm_tree_view
@@ -932,6 +1073,20 @@ pub fn parse_state(json: &str) -> State {
             .and_then(|v| v.as_str())
             .and_then(ColorTheme::from_state_name)
             .unwrap_or(default.color_theme),
+        syntax_dark: value
+            .get("syntax_dark")
+            .and_then(|v| v.as_str())
+            .and_then(|name| SyntaxTheme::from_state_name(name, false))
+            .unwrap_or(default.syntax_dark),
+        syntax_light: value
+            .get("syntax_light")
+            .and_then(|v| v.as_str())
+            .and_then(|name| SyntaxTheme::from_state_name(name, true))
+            .unwrap_or(default.syntax_light),
+        syntax_background: value
+            .get("syntax_background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.syntax_background),
         font_prompt_done: value
             .get("font_prompt")
             .and_then(|v| v.as_bool())
@@ -1104,6 +1259,68 @@ mod tests {
     }
 
     #[test]
+    fn syntax_themes_cycle_within_their_mode_and_persist_by_name() {
+        for light in [false, true] {
+            let first = SyntaxTheme::default_for(light);
+            let mut theme = first;
+            let mut seen = Vec::new();
+            loop {
+                assert_eq!(theme.is_light(), light, "{theme:?} left its mode");
+                assert_eq!(
+                    SyntaxTheme::from_state_name(theme.syntect_name(), light),
+                    Some(theme)
+                );
+                seen.push(theme);
+                theme = theme.next();
+                if theme == first {
+                    break;
+                }
+            }
+            assert_eq!(seen.len(), if light { 3 } else { 6 });
+        }
+        // Files written before the setting existed keep the historical
+        // themes; a name saved under the other mode, or unknown, is ignored.
+        let legacy = parse_state("{\"merged\":true}");
+        assert_eq!(legacy.syntax_dark, SyntaxTheme::OceanDark);
+        assert_eq!(legacy.syntax_light, SyntaxTheme::InspiredGitHub);
+        assert!(!legacy.syntax_background, "the themed background is opt-in");
+        let swapped = parse_state("{\"syntax_dark\":\"InspiredGitHub\",\"syntax_light\":\"nope\"}");
+        assert_eq!(swapped.syntax_dark, SyntaxTheme::OceanDark);
+        assert_eq!(swapped.syntax_light, SyntaxTheme::InspiredGitHub);
+    }
+
+    /// The Settings modal is no wider than the pane (32 columns by default):
+    /// the syntax row must be no longer than the existing "Updates" row, or
+    /// its value is clipped.
+    #[test]
+    fn syntax_theme_row_fits_the_settings_modal() {
+        let longest_existing = "Updates".len() + "local checkout".len();
+        for color_theme in [ColorTheme::VsCode, ColorTheme::Light, ColorTheme::Terminal] {
+            for theme in SyntaxTheme::ALL {
+                let state = State {
+                    color_theme,
+                    syntax_dark: if theme.is_light() {
+                        SyntaxTheme::OceanDark
+                    } else {
+                        theme
+                    },
+                    syntax_light: if theme.is_light() {
+                        theme
+                    } else {
+                        SyntaxTheme::InspiredGitHub
+                    },
+                    ..State::default()
+                };
+                let (label, value) = state.syntax_theme_row();
+                assert!(
+                    label.len() + value.len() <= longest_existing,
+                    "{label} {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn state_roundtrip_and_forgiving_parse() {
         let state = State {
             merged: true,
@@ -1113,6 +1330,9 @@ mod tests {
             show_git_footer: false,
             icons: Some(crate::icons::IconTheme::Emoji),
             color_theme: ColorTheme::Terminal,
+            syntax_dark: SyntaxTheme::MochaDark,
+            syntax_light: SyntaxTheme::SolarizedLight,
+            syntax_background: true,
             font_prompt_done: true,
             auto_open: false,
             strict_toggle: true,
@@ -1125,7 +1345,7 @@ mod tests {
             custom_editor_on_click: true,
             scm_tree_view: true,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"syntax_dark\":\"base16-mocha.dark\",\"syntax_light\":\"Solarized (light)\",\"syntax_background\":true,\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
