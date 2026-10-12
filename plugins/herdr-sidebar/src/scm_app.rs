@@ -2534,12 +2534,10 @@ impl App {
                 self.sidebar_state.color_theme.label().to_string(),
                 true,
             ),
-            (
-                Setting::SyntaxTheme,
-                "Syntax theme",
-                self.sidebar_state.syntax_theme_label(),
-                true,
-            ),
+            {
+                let (label, value) = self.sidebar_state.syntax_theme_row();
+                (Setting::SyntaxTheme, label, value, true)
+            },
             (
                 Setting::PreviewPlacement,
                 "Preview opens in",

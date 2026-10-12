@@ -1109,7 +1109,9 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   (`two_face::syntax::extra_newlines()`), themes still from syntect's `ThemeSet` (theme
   data is grammar-independent). Foreground colors only: the terminal owns the background.
   See `src/syntax.rs`; unknown extensions fall back to plain lines.
-- The ⚙ "Syntax theme" row picks among syntect's BUNDLED themes only (`state::SyntaxTheme`,
+- The ⚙ "Dark syntax" / "Light syntax" row (one row, labelled by the active background — the
+  mode lives in the LABEL because "Syntax theme  intellij (dark)" clipped in a 32-col pane)
+  picks among syntect's BUNDLED themes only (`state::SyntaxTheme`,
   no `plist-load`), persisted by syntect name as `syntax_dark` / `syntax_light` in
   `state.json`. It cycles the background the active color theme is drawn for, and each
   background only offers themes drawn for it — a dark theme on white is the washed-out case.

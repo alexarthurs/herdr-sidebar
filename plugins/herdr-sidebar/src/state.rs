@@ -433,13 +433,15 @@ impl State {
         }
     }
 
-    /// Settings value: the active background's theme, with that background
-    /// named so it is clear the other one keeps its own choice.
-    pub fn syntax_theme_label(&self) -> String {
+    /// Settings row label and value for the active background's theme. The
+    /// background is named in the LABEL so it is clear the other one keeps
+    /// its own choice; the value stays short so the row fits the default
+    /// sidebar width without clipping.
+    pub fn syntax_theme_row(&self) -> (&'static str, String) {
         if self.color_theme.is_light() {
-            format!("{} (light)", self.syntax_light.label())
+            ("Light syntax", self.syntax_light.label().to_string())
         } else {
-            format!("{} (dark)", self.syntax_dark.label())
+            ("Dark syntax", self.syntax_dark.label().to_string())
         }
     }
 }
@@ -1262,6 +1264,37 @@ mod tests {
         let swapped = parse_state("{\"syntax_dark\":\"InspiredGitHub\",\"syntax_light\":\"nope\"}");
         assert_eq!(swapped.syntax_dark, SyntaxTheme::OceanDark);
         assert_eq!(swapped.syntax_light, SyntaxTheme::InspiredGitHub);
+    }
+
+    /// The Settings modal is no wider than the pane (32 columns by default):
+    /// the syntax row must be no longer than the existing "Updates" row, or
+    /// its value is clipped.
+    #[test]
+    fn syntax_theme_row_fits_the_settings_modal() {
+        let longest_existing = "Updates".len() + "local checkout".len();
+        for color_theme in [ColorTheme::VsCode, ColorTheme::Light, ColorTheme::Terminal] {
+            for theme in SyntaxTheme::ALL {
+                let state = State {
+                    color_theme,
+                    syntax_dark: if theme.is_light() {
+                        SyntaxTheme::OceanDark
+                    } else {
+                        theme
+                    },
+                    syntax_light: if theme.is_light() {
+                        theme
+                    } else {
+                        SyntaxTheme::InspiredGitHub
+                    },
+                    ..State::default()
+                };
+                let (label, value) = state.syntax_theme_row();
+                assert!(
+                    label.len() + value.len() <= longest_existing,
+                    "{label} {value}"
+                );
+            }
+        }
     }
 
     #[test]
