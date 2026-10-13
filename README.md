@@ -123,7 +123,8 @@ folder stays put until that pane changes directory again.
 
 Preview: drag to select (releasing copies, following herdr's `copy_on_select`),
 `Ctrl/Cmd+C` to copy, arrows/PageUp/PageDown or
-Space/`b` to scroll, `w` to toggle wrapping, and `q` or Esc to close.
+Space/`b` to scroll, `w` to toggle wrapping, and `q` or Esc to close. Releasing
+a drag in edit mode (`e`) copies the same way.
 
 Host keybindings can invoke the direct `show-explorer`, `show-search`, `show-git`, and
 `quick-open` actions. For example, bind `cmd+p` to:

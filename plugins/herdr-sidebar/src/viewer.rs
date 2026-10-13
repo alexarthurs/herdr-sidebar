@@ -2127,6 +2127,10 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         Instant,
     )> = None;
     let mut copier: Option<ReleaseCopier> = None;
+    // The editor's copies run synchronously on this loop (like its Ctrl+C/X),
+    // so its copy-on-select reads herdr's setting here rather than on the
+    // preview worker: a queued release copy could land after a later Ctrl+C.
+    let mut editor_copy_on_select = None;
     let mut identity_pending = false;
     let result = loop {
         let loaded =
@@ -2479,7 +2483,12 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                 should_close = close_own_pane(control, &current, &mut notice);
                             }
                         }
-                        _ if prompt.is_none() => editor.on_mouse(&mouse, edit_body),
+                        _ if prompt.is_none()
+                            && editor.on_mouse(&mouse, edit_body)
+                            && herdr_copy_on_select(&mut editor_copy_on_select) =>
+                        {
+                            editor.copy_selection();
+                        }
                         _ => {}
                     },
                 },

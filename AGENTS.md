@@ -1139,7 +1139,10 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   under forced color; dropping only ESC exposes the hyperlink metadata as visible preview text.
 - Edit mode accepts terminal mouse input: click moves the caret, drag selects across logical and
   wrapped rows, and Shift+click extends the current selection. Coordinates account for the line
-  number gutter, tabs, wide Unicode cells, and the editor's wrapped-row scroll offset.
+  number gutter, tabs, wide Unicode cells, and the editor's wrapped-row scroll offset. Releasing a
+  drag that selected text copies it under the same `copy_on_select` rule as previews, but
+  SYNCHRONOUSLY on the event loop like the editor's Ctrl+C/X — routing it through the preview's
+  `ReleaseCopier` would let a queued release copy land after a later synchronous Ctrl+C.
 
 ### Verifying a plugin TUI end-to-end
 
