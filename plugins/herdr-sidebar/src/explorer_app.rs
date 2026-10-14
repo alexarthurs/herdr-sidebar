@@ -27,10 +27,11 @@ use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::tree::{Row, Tree};
 use herdr_sidebar::ui::{
     TitleAction, activity_button_style, activity_icons, chrome_button_style, draw_activity_caps,
-    draw_scrollbar, gear_icon, hits, hits_activity_button, hits_collapse_button, hover_style,
-    icon_style as ui_icon_style, input_tail, keep_visible_scroll, palette, selection_style,
-    set_color_theme, sibling_panes_of, status_color, title_action_icon, title_action_spans,
-    title_actions_visible, title_actions_width, truncate_to, wrap_footer_message, wrap_hints,
+    draw_scrollbar, fit_menu_hint, gear_icon, hits, hits_activity_button, hits_collapse_button,
+    hover_style, icon_style as ui_icon_style, input_tail, keep_visible_scroll, palette,
+    selection_style, set_color_theme, sibling_panes_of, status_color, title_action_icon,
+    title_action_spans, title_actions_visible, title_actions_width, truncate_to,
+    wrap_footer_message, wrap_hints,
 };
 
 use herdr_sidebar::state::Exit;
@@ -3317,7 +3318,7 @@ impl App {
         frame.render_widget(Paragraph::new(footer_lines), footer_content);
         if menu_hint {
             frame.render_widget(
-                Paragraph::new("m / ctrl+rclick for menus")
+                Paragraph::new(fit_menu_hint(footer_content.width))
                     .style(Style::default().fg(Color::DarkGray))
                     .alignment(Alignment::Right),
                 footer_content,
@@ -3349,7 +3350,11 @@ impl App {
                 1,
             );
             frame.render_widget(
-                Paragraph::new(" m / ctrl+rclick: menu".dim().italic()),
+                Paragraph::new(
+                    format!(" {}", fit_menu_hint(hint_area.width.saturating_sub(1)))
+                        .dim()
+                        .italic(),
+                ),
                 hint_area,
             );
         }

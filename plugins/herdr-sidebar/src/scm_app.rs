@@ -32,7 +32,7 @@ use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::suggest;
 use herdr_sidebar::ui::{
     TitleAction, activity_button_style, activity_icons, branch_icon, chrome_button_style,
-    draw_activity_caps, draw_scrollbar, gear_icon, hits, hits_activity_button,
+    draw_activity_caps, draw_scrollbar, fit_menu_hint, gear_icon, hits, hits_activity_button,
     hits_collapse_button, hover_style, icon_style as ui_icon_style, keep_visible_scroll, palette,
     selection_style, set_color_theme, sibling_panes_of, sparkle_icon, status_color,
     title_action_spans, title_actions_visible, title_actions_width, truncate_to, within,
@@ -4084,7 +4084,7 @@ impl App {
         frame.render_widget(Paragraph::new(footer_lines), footer_content);
         if menu_hint {
             frame.render_widget(
-                Paragraph::new(action_hint.unwrap_or("m / ctrl+rclick for menus"))
+                Paragraph::new(action_hint.unwrap_or(fit_menu_hint(footer_content.width)))
                     .style(Style::default().fg(Color::DarkGray))
                     .alignment(Alignment::Right),
                 footer_content,
@@ -4114,7 +4114,7 @@ impl App {
             }
         } else if footer_empty {
             frame.render_widget(
-                Paragraph::new(action_hint.unwrap_or("m / ctrl+rclick for menus"))
+                Paragraph::new(action_hint.unwrap_or(fit_menu_hint(footer_status.width)))
                     .style(Style::default().fg(Color::DarkGray))
                     .alignment(Alignment::Right),
                 footer_status,
