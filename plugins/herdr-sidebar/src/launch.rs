@@ -161,6 +161,16 @@ impl Pane {
             || self.label.as_deref() == Some(SIDEBAR_LABEL)
     }
 
+    /// Any pane this plugin owns — a sidebar view or a viewer — as opposed to
+    /// the user's own work (shells, agents, editors).
+    fn is_plugin_pane(&self) -> bool {
+        self.is_explorer()
+            || self.tokens.contains_key(SC_METADATA_SOURCE)
+            || self.tokens.contains_key(PREVIEW_METADATA_SOURCE)
+            || self.label.as_deref() == Some(SC_PANE_LABEL)
+            || self.label.as_deref().is_some_and(is_preview_label)
+    }
+
     /// One of OUR labels with NO heartbeat token is a corpse. The main way
     /// this happens: herdr resumes a restarted server's panes with their
     /// labels and scrollback, but the process inside is a fresh shell and
@@ -430,11 +440,7 @@ fn sibling_cwds(pane_list_json: &str, my_pane_id: &str) -> Vec<SiblingCwd> {
         .filter(|p| {
             p.tab_id.as_deref() == me.tab_id.as_deref()
                 && p.pane_id.as_deref() != Some(my_pane_id)
-                && !p.is_explorer()
-                && !p.tokens.contains_key(SC_METADATA_SOURCE)
-                && !p.tokens.contains_key(PREVIEW_METADATA_SOURCE)
-                && p.label.as_deref() != Some(SC_PANE_LABEL)
-                && !p.label.as_deref().is_some_and(is_preview_label)
+                && !p.is_plugin_pane()
         })
         .filter_map(|p| {
             let pane_id = p.pane_id.as_deref().filter(|id| is_flag_safe(id))?;
@@ -721,6 +727,21 @@ pub fn pane_in_tab(pane_list_json: &str, tab_id: &str) -> String {
         .find(|p| p.tab_id.as_deref() == Some(tab_id))
         .and_then(|p| p.pane_id.clone())
         .unwrap_or_default()
+}
+
+/// The user's own panes in `tab_id` — everything except this plugin's
+/// sidebar views and viewers. `above` preview placement splits the largest
+/// of these, so a sidebar or an existing viewer is never the one cut in half.
+pub fn work_panes_in_tab(pane_list_json: &str, tab_id: &str) -> Vec<String> {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return Vec::new();
+    };
+    msg.result
+        .panes
+        .iter()
+        .filter(|p| p.tab_id.as_deref() == Some(tab_id) && !p.is_plugin_pane())
+        .filter_map(|p| p.pane_id.clone())
+        .collect()
 }
 
 /// The pane id the SERVER currently records as focused ("" when none) —
@@ -1213,6 +1234,27 @@ mod tests {
 
     fn pane_list(panes: &str) -> String {
         format!(r#"{{"id":"cli:pane:list","result":{{"panes":[{panes}]}}}}"#)
+    }
+
+    /// Every kind of pane this plugin owns is excluded — by token when the
+    /// process is live, by label when herdr restored the pane without its
+    /// metadata — and so is every pane in another tab.
+    #[test]
+    fn work_panes_are_the_users_own_panes_in_the_tab() {
+        let json = pane_list(
+            r#"{"pane_id":"w1:p1","tab_id":"w1:t1","label":"Sidebar","tokens":{"herdr-sidebar-explorer":"1"}},
+               {"pane_id":"w1:p2","tab_id":"w1:t1","label":"claude"},
+               {"pane_id":"w1:p3","tab_id":"w1:t1","tokens":{"herdr-sidebar-git":"1"}},
+               {"pane_id":"w1:p4","tab_id":"w1:t1","tokens":{"herdr-sidebar-preview":"1"}},
+               {"pane_id":"w1:p5","tab_id":"w1:t1","label":"Preview"},
+               {"pane_id":"w1:p6","tab_id":"w1:t1","label":"Source Control"},
+               {"pane_id":"w1:p7","tab_id":"w1:t1"},
+               {"pane_id":"w1:p8","tab_id":"w1:t2","label":"shell"}"#,
+        );
+        assert_eq!(work_panes_in_tab(&json, "w1:t1"), vec!["w1:p2", "w1:p7"]);
+        assert_eq!(work_panes_in_tab(&json, "w1:t2"), vec!["w1:p8"]);
+        assert!(work_panes_in_tab(&json, "w1:t9").is_empty());
+        assert!(work_panes_in_tab("garbage", "w1:t1").is_empty());
     }
 
     #[test]

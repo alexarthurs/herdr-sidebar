@@ -809,7 +809,7 @@ HACKING.md — budget time for that before promising a patched build.
 
 ### Preview placement and tabs
 
-`Preview opens in` now cycles `tab` (unchanged default), `pane`, and `replace`.
+`Preview opens in` now cycles `tab` (unchanged default), `pane`, `replace`, and `above`.
 `replace` is temporary takeover (#64): `takeover.rs` journals the original split
 tree and terminal identities under a private, session-and-tab-keyed path BEFORE
 moving working panes to a snoozed background tab, then opens one inline viewer.
@@ -896,6 +896,33 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   Inline placement never parks or moves the user's panes to another tab, never claims
   `hs-preview-dedicated`, and `q`/Esc closes only the viewer pane. Placement is stamped
   on the viewer with `hs-preview-inline`; do not infer it later from mutable settings.
+- `Preview opens in: above` is the same inline viewer, differing ONLY at spawn: it
+  splits the tab's largest non-plugin pane (`launch::work_panes_in_tab`) DOWN and swaps,
+  so the viewer sits on top and that pane (usually the agent) keeps its full width. It
+  stamps the same `hs-preview-inline`, so `pane` and `above` reuse each other's viewer
+  and flipping between them never spawns a second one. A live `replace` takeover viewer
+  is reused the same way: an `above` click during a takeover loads into it rather than
+  stacking a second viewer. With no usable work pane in the
+  tab it falls back to the `pane` geometry. The viewer's share is the `above_percent`
+  setting (⚙ `Above preview height`, ←/→ like `sidebar_width`, 20–80% in 5s, default
+  60), clamped on read so a hand-edited `state.json` cannot ask for 0% or 300%; the row
+  is dimmed under the other placements, where the value is not used.
+- **Judge a target's SIZE while planning, not after the split is refused.** herdr
+  refuses a split landing under a pane minimum, and it ANSWERS that refusal — which is
+  indistinguishable from the refusal you get when the target has since been closed. So
+  `above_split_plan` declines a pane under 12 rows (8 for the pane below, 4 for the
+  viewer) instead of asking and reacting; a decline routes the spawn through the
+  ordinary beside-the-sidebar geometry, where the split fits. There is deliberately no
+  retry: an earlier version retried the sidebar itself on any refusal, which on the
+  too-small cause split the SIDEBAR to 30% and left a ~10-column column the width logic
+  reads as a deliberate divider drag and never snaps back.
+- **`down` split + `pane swap` keeps the SLOT sizes, like `right` does.** The ratio is
+  the original pane's share, so after the swap the viewer owns exactly that share.
+  Measured on Linux 0.9.1 and macOS 0.9.1 with `pane layout`: a 40-row tab at ratio 0.6
+  gives viewer 24 rows over work pane 16, and the work pane keeps its full width.
+- Spawned in place rather than restacked afterwards because of the same-tab
+  `pane.move` no-op recorded above. What that bounce costs HERE: the temporary tab's
+  `tab.created` fires our own `--ensure`, which docks a stray sidebar into it.
 - Why the inversion: full-size mode evacuated the CURRENT tab (parking the user's
   terminals into a background "· preview" tab), and the park plan was keyed by the
   SIDEBAR's pane id — which churns on every redeploy and every ensure-hook heal. The
