@@ -49,6 +49,7 @@ fn main() -> std::io::Result<()> {
             return herdr_sidebar::updates::run().map_err(std::io::Error::other);
         }
         Some("--refresh-sidebars") => return herdr_sidebar::updates::refresh(),
+        Some("--toggle-collapse") => return toggle_collapse(),
         Some("--run-custom-editor") => return herdr_sidebar::actions::run_configured_editor(),
         Some("--launch-decision") => {
             // Optional second arg picks the source-control decision; default
@@ -171,7 +172,7 @@ fn main() -> std::io::Result<()> {
         Some(other) => {
             eprintln!("herdr-sidebar: unknown argument `{other}`");
             eprintln!(
-                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--run-custom-editor|--ensure|--toggle|--toggle-git|--show-explorer|--show-search|--show-git|--quick-open|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--auto-open|--focus-on-open|--dock-right]"
+                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--run-custom-editor|--ensure|--toggle|--toggle-git|--show-explorer|--show-search|--show-git|--toggle-collapse|--quick-open|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--auto-open|--focus-on-open|--dock-right]"
             );
             std::process::exit(2);
         }
@@ -499,6 +500,23 @@ fn resolve_root(
     };
     herdr_sidebar::state::save_root(root_key, &root);
     Ok(root)
+}
+
+/// `toggle-collapse` action: inject the rail toggle key into the focused
+/// tab's sidebar pane(s). No sidebar in the tab → nothing to collapse.
+fn toggle_collapse() -> std::io::Result<()> {
+    let panes = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({}))?;
+    for pane in herdr_sidebar::launch::sidebars_in_focused_tab(&panes) {
+        herdr_sidebar::ipc::call_text(
+            "pane.send_input",
+            serde_json::json!({
+                "pane_id": pane,
+                "text": "",
+                "keys": [herdr_sidebar::rail::TOGGLE_KEY],
+            }),
+        )?;
+    }
+    Ok(())
 }
 
 /// The explorer's event loop: short poll so the liveness heartbeat keeps

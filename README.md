@@ -119,6 +119,7 @@ folder stays put until that pane changes directory again.
 | `m` | context menu | `m` | context menu |
 | `s` | settings | `s` | settings |
 | `b` | hide | `b` | hide |
+| `e` | collapse to icon rail | `e` | collapse to icon rail |
 | `1` / `2` / `3` | change view | `1` / `2` / `3` | change view |
 
 Preview: drag to select (releasing copies, following herdr's `copy_on_select`),
@@ -134,6 +135,14 @@ key = "cmd+p"
 type = "shell"
 command = "herdr plugin action invoke quick-open --plugin herdr-sidebar"
 ```
+
+The `toggle-collapse` action shrinks the sidebar to a slim icon rail (herdr's
+minimum pane width) and restores it; `»` at the bottom of the rail, `e`, or
+clicking an icon expands it again. The state is shared: collapsing in one tab
+collapses the sidebar in every tab, and new tabs open collapsed too.
+The `«` button keeps hiding the sidebar; turn on ⚙ **Collapse on «** to make it
+collapse instead.
+The rail also has quick-open and settings buttons.
 
 ## Install & Develop
 
