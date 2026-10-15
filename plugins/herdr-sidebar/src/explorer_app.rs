@@ -23,6 +23,7 @@ use herdr_sidebar::git::{Git, Status};
 use herdr_sidebar::gitdeco::{Decorations, RepoStatus};
 use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::ipc;
+use herdr_sidebar::rail::{Rail, RailHit};
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::tree::{Row, Tree};
 use herdr_sidebar::ui::{
@@ -287,6 +288,7 @@ enum Setting {
     UnifiedSidebar,
     DockRight,
     SidebarWidth,
+    CollapseToRail,
     IconTheme,
     ColorTheme,
     PreviewPlacement,
@@ -320,6 +322,8 @@ pub struct App {
     snap: bool,
     theme: IconTheme,
     pane_ctl: Option<PaneCtl>,
+    /// Collapsed icon-rail mode (per tab, survives respawns).
+    rail: Rail,
     /// Pane size from the last draw; sizing decisions and PageUp/PageDown
     /// strides are based on what was actually rendered.
     last_width: u16,
@@ -460,6 +464,7 @@ impl App {
             sidebar::load_state().icons,
         );
         let pane_ctl = PaneCtl::from_env();
+        let rail = Rail::load(pane_ctl.as_ref().map(|ctl| ctl.pane_id.as_str()));
         let last_layout_width = pane_ctl.as_ref().and_then(PaneCtl::layout_width);
         // The other view ships in this same binary — always available.
         let other_exe = std::env::current_exe().ok();
@@ -478,6 +483,7 @@ impl App {
             snap: restored_selection.is_some(),
             theme,
             pane_ctl,
+            rail,
             last_width: sidebar_state.sidebar_width,
             last_layout_width,
             last_height: 24,
@@ -534,6 +540,14 @@ impl App {
     pub fn tick(&mut self) {
         self.sync_shared_settings();
         self.sync_shared_tree();
+        if let Some(ctl) = &self.pane_ctl {
+            self.rail.sync(
+                &ctl.pane_id,
+                self.last_width,
+                self.sidebar_state.sidebar_width,
+                self.sidebar_state.dock_right,
+            );
+        }
         self.collect_quick_index();
         self.collect_content_search();
         self.collect_git_sync();
@@ -556,6 +570,7 @@ impl App {
         let shared = sidebar::load_state();
         self.sidebar_state.dock_right = shared.dock_right;
         self.sidebar_state.strict_toggle = shared.strict_toggle;
+        self.sidebar_state.collapse_to_rail = shared.collapse_to_rail;
         self.sidebar_state.focus_on_open = shared.focus_on_open;
         self.sidebar_state.custom_editor_on_click = shared.custom_editor_on_click;
         let old_git_footer = self.sidebar_state.show_git_footer;
@@ -566,7 +581,7 @@ impl App {
         }
         if shared.sidebar_width != self.sidebar_state.sidebar_width {
             self.sidebar_state.sidebar_width = shared.sidebar_width;
-            if let Some(ctl) = &self.pane_ctl {
+            if let Some(ctl) = self.pane_ctl.as_ref().filter(|_| !self.rail.collapsed) {
                 ctl.resize_preferred(self.last_width, shared.sidebar_width, shared.dock_right);
             }
         }
@@ -602,6 +617,10 @@ impl App {
 
     pub fn on_resize(&mut self, width: u16) {
         self.last_width = width;
+        if let Some(ctl) = &self.pane_ctl {
+            self.rail
+                .settle(&ctl.pane_id, width, self.sidebar_state.dock_right);
+        }
         let unified_close_completed = self.poll_unified_close();
         if let Some(ctl) = &self.pane_ctl {
             let layout_width = ctl.layout_width();
@@ -610,7 +629,7 @@ impl App {
                 .zip(layout_width)
                 .is_some_and(|(before, now)| before != now);
             self.last_layout_width = layout_width.or(self.last_layout_width);
-            if !unified_close_completed && surrounding_changed {
+            if !unified_close_completed && surrounding_changed && !self.rail.collapsed {
                 ctl.resize_preferred(
                     width,
                     self.sidebar_state.sidebar_width,
@@ -867,6 +886,29 @@ impl App {
         self.close(true);
     }
 
+    /// The « button: upstream's hide, or the rail when the setting asks.
+    fn collapse_button(&mut self) {
+        if self.sidebar_state.collapse_to_rail {
+            self.set_rail(true);
+        } else {
+            self.hide();
+        }
+    }
+
+    /// Collapse to the icon rail (`on`) or restore the preferred width.
+    fn set_rail(&mut self, on: bool) {
+        let Some(ctl) = &self.pane_ctl else { return };
+        if let Err(e) = self.rail.set(
+            &ctl.pane_id,
+            on,
+            self.last_width,
+            self.sidebar_state.sidebar_width,
+            self.sidebar_state.dock_right,
+        ) {
+            self.notice = Some(format!("collapse failed: {e}"));
+        }
+    }
+
     fn close(&mut self, snooze: bool) {
         // Closing our own pane kills this process: save a pending remembered
         // root first (the outer loop's flush never runs on this path).
@@ -1040,6 +1082,28 @@ impl App {
             self.close(false);
             return None;
         }
+        if key.code == KeyCode::F(8) {
+            self.set_rail(!self.rail.collapsed);
+            return None;
+        }
+        if self.rail.collapsed {
+            match key.code {
+                KeyCode::Char('e') | KeyCode::Enter => {
+                    self.set_rail(false);
+                    return None;
+                }
+                KeyCode::Char('b') => {
+                    self.hide();
+                    return None;
+                }
+                // Activities (keys or the show-* actions) expand, then act.
+                KeyCode::F(9..=12) | KeyCode::Char('1' | '2' | '3') => self.set_rail(false),
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.set_rail(false);
+                }
+                _ => return None,
+            }
+        }
         if (key.code == KeyCode::Char('p')
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT))
@@ -1146,6 +1210,7 @@ impl App {
             }
             KeyCode::Char('i') => self.set_theme(self.theme.toggled()),
             KeyCode::Char('b') => self.hide(),
+            KeyCode::Char('e') => self.set_rail(true),
             KeyCode::Char('c') => self.change_folder_dialog(),
             KeyCode::Char('m') => self.open_menu_for_selection(),
             KeyCode::Char('s') => self.open_settings(),
@@ -1163,6 +1228,37 @@ impl App {
         // hover title-bar buttons until the linger expires.
         self.last_mouse = Some(std::time::Instant::now());
         self.mouse_pos = Some((mouse.column, mouse.row));
+        if self.rail.collapsed {
+            if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+                return None;
+            }
+            let hit = self.rail.hit(mouse.column, mouse.row)?;
+            self.set_rail(false);
+            return match hit {
+                RailHit::Explorer => {
+                    self.overlay = None;
+                    if self.merged() {
+                        self.sidebar_state =
+                            sidebar::update_state(|state| state.search_active = false);
+                    }
+                    None
+                }
+                RailHit::Search => {
+                    self.open_content_search(false);
+                    None
+                }
+                RailHit::SourceControl => self.switch_to(View::SourceControl),
+                RailHit::QuickOpen => {
+                    self.open_quick_open();
+                    None
+                }
+                RailHit::Settings => {
+                    self.open_settings();
+                    None
+                }
+                RailHit::Expand => None,
+            };
+        }
         if self.overlay.is_some() && !matches!(self.overlay, Some(Overlay::ContentSearch { .. })) {
             self.overlay_mouse(mouse);
             return None;
@@ -1207,7 +1303,7 @@ impl App {
             if mouse.kind == MouseEventKind::Down(MouseButton::Left)
                 && hits_collapse_button(mouse.column, mouse.row, self.last_width, self.last_height)
             {
-                self.hide();
+                self.collapse_button();
                 return None;
             }
             self.search_mouse(mouse);
@@ -1230,7 +1326,7 @@ impl App {
                 }
                 if hits_collapse_button(mouse.column, mouse.row, self.last_width, self.last_height)
                 {
-                    self.hide();
+                    self.collapse_button();
                     return None;
                 }
                 let Some(index) = self.row_at(mouse.row) else {
@@ -2442,6 +2538,17 @@ impl App {
                 true,
             ),
             (
+                Setting::CollapseToRail,
+                "Collapse on «",
+                if self.sidebar_state.collapse_to_rail {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
                 Setting::IconTheme,
                 "Icon theme",
                 match self.theme {
@@ -2601,6 +2708,11 @@ impl App {
                     sidebar::update_state(|state| state.dock_right = !state.dock_right);
             }
             Setting::SidebarWidth => self.adjust_sidebar_width(true),
+            Setting::CollapseToRail => {
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.collapse_to_rail = !state.collapse_to_rail;
+                });
+            }
             Setting::IconTheme => self.set_theme(self.theme.toggled()),
             Setting::ColorTheme => {
                 self.sidebar_state = sidebar::update_state(|state| {
@@ -3155,6 +3267,17 @@ impl App {
     pub fn draw(&mut self, frame: &mut Frame) {
         self.last_width = frame.area().width;
         self.last_height = frame.area().height;
+        if self.rail.collapsed {
+            let active = if matches!(self.overlay, Some(Overlay::ContentSearch { .. })) {
+                RailHit::Search
+            } else {
+                RailHit::Explorer
+            };
+            let merged = self.merged();
+            self.rail
+                .draw(frame, self.theme, active, merged, self.mouse_pos);
+            return;
+        }
         // No own border/title: herdr already frames the pane and titles it with
         // the pane label ("Explorer"/"Sidebar") — a second border read as a
         // double frame.

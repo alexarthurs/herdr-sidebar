@@ -708,6 +708,24 @@ pub fn tab_of(pane_list_json: &str, pane_id: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Sidebar panes (unified or standalone Explorer / Source Control) in the
+/// focused tab — the `toggle-collapse` action's targets.
+pub fn sidebars_in_focused_tab(pane_list_json: &str) -> Vec<String> {
+    let tab = focused_tab(pane_list_json);
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return Vec::new();
+    };
+    msg.result
+        .panes
+        .iter()
+        .filter(|p| !tab.is_empty() && p.tab_id.as_deref() == Some(tab.as_str()))
+        .filter(|p| {
+            p.tokens.contains_key(METADATA_SOURCE) || p.tokens.contains_key(SC_METADATA_SOURCE)
+        })
+        .filter_map(|p| p.pane_id.clone())
+        .collect()
+}
+
 /// Any pane living in `tab_id` ("" when the tab is empty or unknown). The
 /// preview flow needs one because herdr 0.9 moves the VIEWING client only on
 /// `pane.focus`; `tab.focus` updates the session-wide record and nothing else.
@@ -1043,6 +1061,18 @@ mod tests {
 
     /// Strict toggle rewrites only the FOCUS decision; OPEN, CLOSE, and
     /// REPLACE (and garbage) must reach the launchers untouched.
+    #[test]
+    fn toggle_collapse_targets_only_sidebars_in_the_focused_tab() {
+        let json = r#"{"result":{"panes":[
+            {"pane_id":"w1:p1","tab_id":"w1:t1","focused":true},
+            {"pane_id":"w1:p2","tab_id":"w1:t1","tokens":{"herdr-sidebar-explorer":"1"}},
+            {"pane_id":"w1:p3","tab_id":"w1:t1","tokens":{"herdr-sidebar-git":"1"}},
+            {"pane_id":"w1:p4","tab_id":"w1:t2","tokens":{"herdr-sidebar-explorer":"1"}}
+        ]}}"#;
+        assert_eq!(sidebars_in_focused_tab(json), ["w1:p2", "w1:p3"]);
+        assert!(sidebars_in_focused_tab(r#"{"result":{"panes":[]}}"#).is_empty());
+    }
+
     #[test]
     fn strict_toggle_maps_focus_to_close_and_nothing_else() {
         assert_eq!(focus_as_close("FOCUS w4:p2"), "CLOSE w4:p2");

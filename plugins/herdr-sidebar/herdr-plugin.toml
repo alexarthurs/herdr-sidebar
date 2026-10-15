@@ -50,6 +50,14 @@ placement = "split"
 command = ["./target/release/herdr-sidebar", "--view", "git"]
 platforms = ["linux", "macos"]
 
+# Collapse every sidebar to a slim icon rail, or expand them again.
+[[actions]]
+id = "toggle-collapse"
+platforms = ["linux", "macos"]
+title = "Collapse/expand sidebar"
+description = "Shrink the sidebar to an icon rail (or restore its width)."
+command = ["./target/release/herdr-sidebar", "--toggle-collapse"]
+
 # Toggle the sidebar: open at the configured dock edge / focus / close.
 [[actions]]
 id = "open-sidebar"
