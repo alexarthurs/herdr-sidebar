@@ -67,6 +67,39 @@ struct SiblingCwd {
     focused: bool,
 }
 
+/// How often a sidebar in the focused tab polls `pane.list` for its sibling's
+/// cwd. herdr reports a `cd` within milliseconds, so this alone bounds how
+/// long the tree lags behind the terminal; the 5 s heartbeat made it feel
+/// stuck.
+pub const FOLLOW_CWD_EVERY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Background tabs poll slower: every sidebar is a `pane.list` client, and
+/// nobody watches a tab that is not on screen.
+pub const FOLLOW_CWD_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The next cwd-poll interval: fast while any pane in this sidebar's tab has
+/// focus, slow otherwise (including on unparsable input).
+pub fn follow_cwd_interval(pane_list_json: &str, my_pane_id: &str) -> std::time::Duration {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return FOLLOW_CWD_IDLE;
+    };
+    let panes = &msg.result.panes;
+    let my_tab = panes
+        .iter()
+        .find(|p| p.pane_id.as_deref() == Some(my_pane_id))
+        .and_then(|p| p.tab_id.as_deref());
+    let tab_focused = my_tab.is_some_and(|tab| {
+        panes
+            .iter()
+            .any(|p| p.focused && p.tab_id.as_deref() == Some(tab))
+    });
+    if tab_focused {
+        FOLLOW_CWD_EVERY
+    } else {
+        FOLLOW_CWD_IDLE
+    }
+}
+
 /// Process-local state shared by the Explorer and Source Control views.
 ///
 /// `pane.list` order is not an API guarantee, so candidates are sorted by id.
@@ -1306,6 +1339,36 @@ mod tests {
                {"pane_id":"w1:p4","tab_id":"w1:t2","foreground_cwd":"/other"}"#,
         );
         assert_eq!(CwdFollower::default().next_cwd(&json, "w1:p3"), None);
+    }
+
+    #[test]
+    fn follow_cwd_polls_fast_only_in_the_focused_tab() {
+        let terminal_focused = pane_list(
+            r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"},
+               {"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"/one","focused":true}"#,
+        );
+        assert_eq!(
+            follow_cwd_interval(&terminal_focused, "w1:p3"),
+            FOLLOW_CWD_EVERY
+        );
+        let sidebar_focused = pane_list(
+            r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar","focused":true},
+               {"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"/one"}"#,
+        );
+        assert_eq!(
+            follow_cwd_interval(&sidebar_focused, "w1:p3"),
+            FOLLOW_CWD_EVERY
+        );
+        let other_tab_focused = pane_list(
+            r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"},
+               {"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"/one"},
+               {"pane_id":"w1:p4","tab_id":"w1:t2","foreground_cwd":"/other","focused":true}"#,
+        );
+        assert_eq!(
+            follow_cwd_interval(&other_tab_focused, "w1:p3"),
+            FOLLOW_CWD_IDLE
+        );
+        assert_eq!(follow_cwd_interval("garbage", "w1:p3"), FOLLOW_CWD_IDLE);
     }
 
     const FOCUSED: &str =
