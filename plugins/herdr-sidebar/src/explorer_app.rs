@@ -361,6 +361,10 @@ pub struct App {
     last_preview: Option<(String, herdr_sidebar::viewer::PreviewTarget)>,
     /// Last heartbeat stamp, throttling the token refresh.
     last_beat: std::time::Instant,
+    /// Last sibling-cwd poll and the gap until the next one (fast in the
+    /// focused tab, see `launch::follow_cwd_interval`).
+    last_follow: std::time::Instant,
+    follow_every: std::time::Duration,
     /// A native folder picker running on a background thread; its result
     /// arrives here (None = cancelled).
     picking: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
@@ -497,6 +501,8 @@ impl App {
             last_click: None,
             last_preview: None,
             last_beat: std::time::Instant::now(),
+            last_follow: std::time::Instant::now(),
+            follow_every: herdr_sidebar::launch::FOLLOW_CWD_EVERY,
             picking: None,
             cwd_follower,
             repos,
@@ -745,6 +751,10 @@ impl App {
     /// seconds.
     pub fn heartbeat(&mut self) {
         self.poll_unified_close();
+        if self.last_follow.elapsed() >= self.follow_every {
+            self.last_follow = std::time::Instant::now();
+            self.follow_sibling_cwd();
+        }
         if self.last_beat.elapsed() < std::time::Duration::from_secs(5) {
             return;
         }
@@ -752,7 +762,6 @@ impl App {
         if let Some(ctl) = &self.pane_ctl {
             ctl.report_tokens(MY_VIEW, self.merged());
         }
-        self.follow_sibling_cwd();
     }
 
     fn poll_unified_close(&mut self) -> bool {
@@ -793,6 +802,7 @@ impl App {
         let Ok(panes) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) else {
             return;
         };
+        self.follow_every = herdr_sidebar::launch::follow_cwd_interval(&panes, &ctl.pane_id);
         let target = self
             .cwd_follower
             .borrow_mut()

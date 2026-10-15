@@ -519,12 +519,12 @@ fn run_explorer(
     }
     loop {
         terminal.draw(|frame| app.draw(frame))?;
-        // 500ms: quick enough that a finished folder pick lands promptly,
-        // still cheap for the heartbeat.
+        // Wake at the cwd-follow cadence so a `cd` in the sibling pane lands
+        // promptly; a finished folder pick rides the same wakeup.
         let timeout = if app.is_syncing() {
             ANIMATION_FRAME
         } else {
-            Duration::from_millis(500)
+            launch::FOLLOW_CWD_EVERY
         };
         if event::poll(timeout)? {
             let exit = match event::read()? {
@@ -561,7 +561,9 @@ fn run_scm(
     let mut last_tick = std::time::Instant::now();
     loop {
         terminal.draw(|frame| app.draw(frame))?;
-        let mut timeout = REFRESH_EVERY.saturating_sub(last_tick.elapsed());
+        let mut timeout = REFRESH_EVERY
+            .saturating_sub(last_tick.elapsed())
+            .min(launch::FOLLOW_CWD_EVERY);
         if app.is_syncing() {
             timeout = timeout.min(ANIMATION_FRAME);
         }
