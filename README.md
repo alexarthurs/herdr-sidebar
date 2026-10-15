@@ -117,6 +117,7 @@ folder stays put until that pane changes directory again.
 | `.` | hidden files | `o` | open diff |
 | `r` | refresh | `r` | refresh |
 | `m` | context menu | `m` | context menu |
+| `t` | open folder in new tab | `t` | tree / list |
 | `s` | settings | `s` | settings |
 | `b` | hide | `b` | hide |
 | `1` / `2` / `3` | change view | `1` / `2` / `3` | change view |

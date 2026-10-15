@@ -16,6 +16,9 @@ pub enum MenuAction {
     /// `git add` the target — the Explorer's staging entry (issue #20).
     Stage,
     OpenExternal,
+    /// A new herdr tab whose shell starts in the target folder (a file's
+    /// parent; the workspace root for empty space).
+    OpenInNewTab,
     Reveal,
     ChangeFolder,
     ChangeFolderTyped,
@@ -64,6 +67,7 @@ pub fn menu_entries(target: Option<bool>, in_repo: bool) -> Vec<MenuEntry> {
     }
     entries.extend([
         MenuEntry::Separator,
+        MenuEntry::Action(MenuAction::OpenInNewTab, "Open in New Tab"),
         MenuEntry::Action(MenuAction::Reveal, "Reveal in File Explorer"),
         MenuEntry::Separator,
         MenuEntry::Action(MenuAction::ChangeFolder, "Change Folder…"),
@@ -701,6 +705,41 @@ pub fn open_in_editor_tab(my_pane_id: &str, root: &Path, file: &Path) -> io::Res
     Ok(())
 }
 
+/// Open a plain shell tab in the sidebar's workspace with `dir` as its cwd
+/// and focus it. Returns the new tab's label.
+pub fn open_in_new_tab(my_pane_id: &str, dir: &Path) -> io::Result<String> {
+    let panes = crate::ipc::call_text("pane.list", serde_json::json!({}))?;
+    let workspace_id = crate::launch::workspace_of(&panes, my_pane_id);
+    if workspace_id.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "could not find the current workspace",
+        ));
+    }
+    let label = dir
+        .file_name()
+        .unwrap_or(dir.as_os_str())
+        .to_string_lossy()
+        .into_owned();
+    let response = crate::ipc::call_text(
+        "tab.create",
+        serde_json::json!({
+            "workspace_id": workspace_id,
+            "label": label,
+            "cwd": dir.display().to_string(),
+            "focus": false,
+        }),
+    )?;
+    let (tab_id, pane_id) = tab_create_ids(&response).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tab opened without pane metadata",
+        )
+    })?;
+    crate::viewer::focus_tab_for_client(&tab_id, Some(&pane_id));
+    Ok(label)
+}
+
 fn editor_file_token(file: &Path) -> String {
     let path = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
     let key = path.display().to_string();
@@ -910,6 +949,19 @@ mod tests {
             "outside a repo"
         );
         assert!(!has(&menu_entries(Some(true), false), MenuAction::Stage));
+    }
+
+    #[test]
+    fn open_in_new_tab_is_offered_everywhere() {
+        assert!(has(
+            &menu_entries(Some(false), false),
+            MenuAction::OpenInNewTab
+        ));
+        assert!(has(
+            &menu_entries(Some(true), false),
+            MenuAction::OpenInNewTab
+        ));
+        assert!(has(&menu_entries(None, false), MenuAction::OpenInNewTab));
     }
 
     #[test]

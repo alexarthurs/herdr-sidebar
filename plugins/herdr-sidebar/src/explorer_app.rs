@@ -1148,6 +1148,18 @@ impl App {
             KeyCode::Char('b') => self.hide(),
             KeyCode::Char('c') => self.change_folder_dialog(),
             KeyCode::Char('m') => self.open_menu_for_selection(),
+            KeyCode::Char('t') => {
+                let dir = match self.selected_row() {
+                    Some(row) if row.is_dir => row.path.clone(),
+                    Some(row) => row
+                        .path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| self.tree.root_path()),
+                    None => self.tree.root_path(),
+                };
+                self.open_in_new_tab(&dir);
+            }
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => self.open_content_search(false),
@@ -2407,6 +2419,22 @@ impl App {
         );
     }
 
+    /// `t` / the context menu: a new herdr tab with a shell in `dir`.
+    fn open_in_new_tab(&mut self, dir: &Path) {
+        let Some(pane_id) = self
+            .pane_ctl
+            .as_ref()
+            .map(|control| control.pane_id.clone())
+        else {
+            self.notice = Some("new tab needs a herdr pane".into());
+            return;
+        };
+        self.notice = Some(match actions::open_in_new_tab(&pane_id, dir) {
+            Ok(label) => format!("opened tab: {label}"),
+            Err(error) => format!("new tab failed: {error}"),
+        });
+    }
+
     /// The modal's rows for the current state.
     fn settings_rows(&self) -> Vec<SettingRow> {
         let update = herdr_sidebar::updates::row();
@@ -2836,6 +2864,7 @@ impl App {
                 let Some((path, _)) = target else { return };
                 self.stage(&path);
             }
+            MenuAction::OpenInNewTab => self.open_in_new_tab(&create_dir),
             MenuAction::Reveal => {
                 let (path, directory) = target.unwrap_or_else(|| (self.tree.root_path(), true));
                 actions::reveal(&path, directory);
