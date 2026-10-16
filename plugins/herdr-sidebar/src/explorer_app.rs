@@ -287,6 +287,7 @@ enum Setting {
     UnifiedSidebar,
     DockRight,
     SidebarWidth,
+    AutoHideBelow,
     IconTheme,
     ColorTheme,
     PreviewPlacement,
@@ -326,6 +327,9 @@ pub struct App {
     /// Whole tab area width from the last layout snapshot. A divider drag
     /// changes only this pane; surrounding terminal chrome changes this too.
     last_layout_width: Option<i64>,
+    /// Auto-hide in narrow tabs (⚙ Settings); disarmed while the user keeps
+    /// a sidebar they opened in an already-narrow tab.
+    auto_hide: herdr_sidebar::autohide::Latch,
     last_height: u16,
     page: usize,
     /// Row index under the mouse cursor, for the hover highlight.
@@ -480,6 +484,10 @@ impl App {
             pane_ctl,
             last_width: sidebar_state.sidebar_width,
             last_layout_width,
+            auto_hide: herdr_sidebar::autohide::Latch::new(
+                sidebar_state.auto_hide_below,
+                last_layout_width,
+            ),
             last_height: 24,
             page: 20,
             hovered: None,
@@ -558,6 +566,7 @@ impl App {
         self.sidebar_state.strict_toggle = shared.strict_toggle;
         self.sidebar_state.focus_on_open = shared.focus_on_open;
         self.sidebar_state.custom_editor_on_click = shared.custom_editor_on_click;
+        self.sidebar_state.auto_hide_below = shared.auto_hide_below;
         let old_git_footer = self.sidebar_state.show_git_footer;
         self.sidebar_state.show_git_footer = shared.show_git_footer;
         if shared.color_theme != self.sidebar_state.color_theme {
@@ -610,7 +619,13 @@ impl App {
                 .zip(layout_width)
                 .is_some_and(|(before, now)| before != now);
             self.last_layout_width = layout_width.or(self.last_layout_width);
-            if !unified_close_completed && surrounding_changed {
+            let auto_hide = layout_width.is_some_and(|width| {
+                self.auto_hide
+                    .observe(self.sidebar_state.auto_hide_below, width)
+            });
+            if !unified_close_completed && auto_hide {
+                self.auto_hide_now();
+            } else if !unified_close_completed && surrounding_changed {
                 ctl.resize_preferred(
                     width,
                     self.sidebar_state.sidebar_width,
@@ -865,6 +880,17 @@ impl App {
     /// prefix+b keybinding (→ the toggle action) brings it back.
     fn hide(&mut self) {
         self.close(true);
+    }
+
+    /// The tab became too narrow (⚙ Auto-hide): close our pane under the
+    /// tab's auto-hide marker, which the quiet ensure hook clears once the
+    /// tab is wide again.
+    fn auto_hide_now(&mut self) {
+        crate::flush_pending_root();
+        let Some(ctl) = &self.pane_ctl else { return };
+        if let Err(e) = herdr_sidebar::autohide::hide_pane(&ctl.pane_id) {
+            self.notice = Some(format!("auto-hide failed: {e}"));
+        }
     }
 
     fn close(&mut self, snooze: bool) {
@@ -1393,6 +1419,7 @@ impl App {
             OpenContent(PathBuf, usize),
             ToggleSetting(usize),
             AdjustWidth(bool),
+            AdjustAutoHide(bool),
             DeleteConfirmed(PathBuf, bool),
             Picker(PickerAction),
         }
@@ -1418,6 +1445,16 @@ impl App {
                     if settings.get(*selected).map(|row| row.0) == Some(Setting::SidebarWidth) =>
                 {
                     Cmd::AdjustWidth(true)
+                }
+                KeyCode::Left | KeyCode::Char('h')
+                    if settings.get(*selected).map(|row| row.0) == Some(Setting::AutoHideBelow) =>
+                {
+                    Cmd::AdjustAutoHide(false)
+                }
+                KeyCode::Right | KeyCode::Char('l')
+                    if settings.get(*selected).map(|row| row.0) == Some(Setting::AutoHideBelow) =>
+                {
+                    Cmd::AdjustAutoHide(true)
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => Cmd::ToggleSetting(*selected),
                 _ => Cmd::Nothing,
@@ -1738,6 +1775,7 @@ impl App {
             }
             Cmd::ToggleSetting(index) => self.toggle_setting(index),
             Cmd::AdjustWidth(wider) => self.adjust_sidebar_width(wider),
+            Cmd::AdjustAutoHide(wider) => self.adjust_auto_hide_below(wider),
             Cmd::DeleteConfirmed(path, is_dir) => {
                 self.overlay = None;
                 match actions::delete(&path, is_dir) {
@@ -2442,6 +2480,12 @@ impl App {
                 true,
             ),
             (
+                Setting::AutoHideBelow,
+                "Auto-hide below",
+                sidebar::auto_hide_below_label(self.sidebar_state.auto_hide_below),
+                true,
+            ),
+            (
                 Setting::IconTheme,
                 "Icon theme",
                 match self.theme {
@@ -2601,6 +2645,7 @@ impl App {
                     sidebar::update_state(|state| state.dock_right = !state.dock_right);
             }
             Setting::SidebarWidth => self.adjust_sidebar_width(true),
+            Setting::AutoHideBelow => self.adjust_auto_hide_below(true),
             Setting::IconTheme => self.set_theme(self.theme.toggled()),
             Setting::ColorTheme => {
                 self.sidebar_state = sidebar::update_state(|state| {
@@ -2671,6 +2716,12 @@ impl App {
         }
     }
 
+    fn adjust_auto_hide_below(&mut self, wider: bool) {
+        self.sidebar_state = sidebar::update_state(|state| {
+            state.auto_hide_below = sidebar::step_auto_hide_below(state.auto_hide_below, wider);
+        });
+    }
+
     fn adjust_sidebar_width(&mut self, wider: bool) {
         self.sidebar_state = sidebar::update_state(|state| {
             state.sidebar_width = sidebar::step_sidebar_width(state.sidebar_width, wider);
@@ -2737,7 +2788,7 @@ impl App {
             Style::default().bold(),
         )));
         lines.extend(hint_lines);
-        lines.push(Line::from(" click/⏎ · ←/→ width · esc".dim()));
+        lines.push(Line::from(" click/⏎ · ←/→ adjust · esc".dim()));
 
         frame.render_widget(Clear, popup);
         frame.render_widget(

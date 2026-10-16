@@ -554,6 +554,28 @@ HACKING.md — budget time for that before promising a patched build.
   a frozen split ratio. A change to the whole tab area re-applies it through the ratio-aware
   resize path; a pane-only divider resize is respected for the current layout instead of
   snapping back. The existing 15%–50% share bounds still win at extreme tab widths.
+- Auto-hide below N columns (`auto_hide_below`, 0 = off, 64–200 in 8-column steps;
+  `src/autohide.rs`). The sidebar TUI hides itself from `on_resize` when the tab
+  `area.width` is ≤ N: it writes a per-tab marker in `rundir("autohide")` (same
+  helpers as snooze, separate dir) and then closes its pane. Only the quiet ensure hook
+  brings it back, and only once `area.width` > N, clearing the marker. No hysteresis:
+  `area.width` is the whole tab, which the sidebar opening or closing does not change.
+  herdr does NOT let plugins hook `layout.updated` (excluded as high-volume; socket subscriptions
+  only cover output_matched / agent_status_changed / scroll_changed), and a closed pane
+  receives no resizes. So on unix, hiding also spawns `--autohide-watch <tab>`. It polls
+  the tab width every second and runs `--ensure` (with `HERDR_TAB_ID=<tab>`) once the
+  tab is wide, but only while that tab is focused, so a background dock cannot move
+  focus. It exits when the marker is gone, the tab is snoozed or closed, or the socket
+  stops answering. It MUST `setsid`: herdr hangs up the whole session of a closed pane,
+  and a plain new process group died with it (verified live). Background tabs and
+  Windows reopen at the next focus event. Panes in background tabs DO get the PTY
+  resize and hide too (verified live, herdr 0.9.3). A user snooze
+  always wins. A pane that starts in an already-narrow tab (an explicit toggle) starts
+  disarmed (`autohide::Latch`) and only auto-hides after the tab has been > N.
+  A standalone Source Control pane never auto-hides, because ensure never reopens one.
+  herdr's own `ui.mobile_width_threshold` compares the CLIENT terminal width and swaps
+  to a single-column layout; it does not collapse anything, so the two thresholds
+  don't line up exactly.
 - Every Settings action uses `state::update_state`, a lock-protected read-modify-write.
   State/tree/SCM/root writers use persistent sibling `.lock` files with OS-backed locks; the
   kernel releases ownership on process death, so do not poll, age, or delete those files.
