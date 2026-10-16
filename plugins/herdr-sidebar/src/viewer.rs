@@ -388,8 +388,14 @@ struct Doc {
     /// `lines` laid out for the pane, rebuilt only when the width or the
     /// wrap toggle changes (see [`Doc::relayout`]).
     rows: Vec<Row>,
-    /// The (width, height, wrap) `rows` was built for; `None` until first draw.
-    rows_key: Option<(u16, u16, bool)>,
+    /// The (width, height, wrap, side by side) `rows` was built for; `None`
+    /// until first draw.
+    rows_key: Option<(u16, u16, bool, bool)>,
+    /// A diff's raw `git diff` text, kept so it can be laid out side by side
+    /// at the pane's width. `None` for everything that is not a diff.
+    diff: Option<DiffSource>,
+    /// Show this diff side by side (`v`); starts from the saved setting.
+    split: bool,
     /// Source line to scroll back to once `rows` is rebuilt — how a wrap
     /// toggle and a diff refresh keep the reader's place even though the
     /// row index underneath them changed.
@@ -399,6 +405,16 @@ struct Doc {
     /// BEFORE the content was read: the baseline later polls compare against.
     stamp: Option<FileStamp>,
 }
+
+#[derive(Clone, PartialEq, Eq)]
+struct DiffSource {
+    rel: String,
+    text: String,
+}
+
+/// Narrower than this, a side-by-side diff leaves too little room per
+/// column, so the pane falls back to the unified layout.
+const MIN_SPLIT_WIDTH: u16 = 60;
 
 struct MediaPreview {
     pixels: image::RgbaImage,
@@ -431,13 +447,19 @@ impl Doc {
     /// Rebuild [`Doc::rows`] for the viewport when the layout inputs changed,
     /// then honour any pending source-line scroll request.
     fn relayout(&mut self, width: u16, height: u16) {
-        if self.rows_key != Some((width, height, self.wrap)) {
+        let split = self.side_by_side(width);
+        if self.rows_key != Some((width, height, self.wrap, split)) {
             self.rows = if let Some(media) = &self.media {
                 render_media_rows(media, width, height)
+            } else if let (true, Some(diff)) = (split, &self.diff) {
+                crate::diffview::render_split(&diff.rel, &diff.text, usize::from(width), self.wrap)
+                    .into_iter()
+                    .map(|(src, line)| Row { src, line })
+                    .collect()
             } else {
                 build_rows(&self.lines, self.numbered, self.wrap, width)
             };
-            self.rows_key = Some((width, height, self.wrap));
+            self.rows_key = Some((width, height, self.wrap, split));
             self.selection = PreviewSelection::default();
         }
         if let Some(src) = self.pending_src.take() {
@@ -447,6 +469,12 @@ impl Doc {
                 .position(|r| r.src >= src)
                 .unwrap_or(self.rows.len().saturating_sub(1));
         }
+    }
+
+    /// Whether this document is laid out side by side at `width`: a diff,
+    /// with the toggle on, in a pane wide enough for two columns.
+    fn side_by_side(&self, width: u16) -> bool {
+        self.split && self.diff.is_some() && width >= MIN_SPLIT_WIDTH
     }
 
     /// The source line at the top of the body — the anchor a relayout
@@ -772,6 +800,8 @@ fn load(request: &Request) -> Doc {
             glow_width: None,
             rows: Vec::new(),
             rows_key: None,
+            diff: None,
+            split: false,
             pending_src: None,
             selection: PreviewSelection::default(),
             stamp: None,
@@ -818,6 +848,8 @@ fn loading_doc(request: &Request) -> Doc {
         glow_width: None,
         rows: Vec::new(),
         rows_key: None,
+        diff: None,
+        split: false,
         pending_src: None,
         selection: PreviewSelection::default(),
         stamp: None,
@@ -1151,6 +1183,7 @@ fn apply_diff_refresh(doc: &mut Doc, mut refreshed: Doc) {
         return;
     }
     refreshed.wrap = doc.wrap;
+    refreshed.split = doc.split;
     refreshed.pending_src = Some(doc.top_src());
     *doc = refreshed;
 }
@@ -1279,6 +1312,8 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
         glow_width: None,
         rows: Vec::new(),
         rows_key: None,
+        diff: None,
+        split: false,
         pending_src: None,
         selection: PreviewSelection::default(),
         stamp: None,
@@ -1597,6 +1632,8 @@ fn load_media_file(target: &Path, name: String, video_poster: bool) -> Doc {
         glow_width: None,
         rows: Vec::new(),
         rows_key: None,
+        diff: None,
+        split: false,
         pending_src: None,
         selection: PreviewSelection::default(),
         stamp: None,
@@ -1667,6 +1704,8 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
         glow_width,
         rows: Vec::new(),
         rows_key: None,
+        diff: None,
+        split: false,
         pending_src: target_line.map(|line| line.saturating_sub(1)),
         selection: PreviewSelection::default(),
         stamp: None,
@@ -1704,6 +1743,7 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         .args(&args)
         .current_dir(root)
         .output();
+    let mut diff = None;
     let lines = match output {
         Err(e) => vec![Line::raw(format!("(git failed: {e})"))],
         Ok(out) => {
@@ -1717,6 +1757,10 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
                     vec![Line::raw(format!("({})", err.trim()))]
                 }
             } else {
+                diff = Some(DiffSource {
+                    rel: rel.to_string(),
+                    text: text.to_string(),
+                });
                 crate::diffview::render(rel, &text)
             }
         }
@@ -1737,6 +1781,8 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         glow_width: None,
         rows: Vec::new(),
         rows_key: None,
+        diff,
+        split: crate::state::load_state().diff_side_by_side,
         pending_src: None,
         selection: PreviewSelection::default(),
         stamp: None,
@@ -2090,6 +2136,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         glow_width: None,
         rows: Vec::new(),
         rows_key: None,
+        diff: None,
+        split: false,
         pending_src: None,
         selection: PreviewSelection::default(),
         stamp: None,
@@ -2380,6 +2428,14 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     KeyCode::Char('w') if doc.media.is_none() => {
                                         doc.pending_src = Some(doc.top_src());
                                         doc.wrap = !doc.wrap;
+                                    }
+                                    // Side by side is remembered for every
+                                    // later diff, in every sidebar.
+                                    KeyCode::Char('v') if doc.diff.is_some() => {
+                                        doc.pending_src = Some(doc.top_src());
+                                        doc.split = !doc.split;
+                                        let split = doc.split;
+                                        crate::state::update_state(|s| s.diff_side_by_side = split);
                                     }
                                     _ => {}
                                 }
@@ -2689,6 +2745,15 @@ fn draw_doc(
         }
     } else if editable {
         preview_hint(&["e edit", "space/b page", wrap_hint], footer.width)
+    } else if doc.diff.is_some() {
+        let layout_hint = if doc.side_by_side(body.width) {
+            "v: side by side"
+        } else if doc.split {
+            "v: side by side (too narrow)"
+        } else {
+            "v: unified"
+        };
+        preview_hint(&["space/b page", layout_hint, wrap_hint], footer.width)
     } else {
         preview_hint(&["space/b page", "↑↓ scroll", wrap_hint], footer.width)
     };
@@ -3794,10 +3859,42 @@ mod tests {
             glow_width: None,
             rows: Vec::new(),
             rows_key: None,
+            diff: None,
+            split: false,
             pending_src: None,
             selection: PreviewSelection::default(),
             stamp: None,
         }
+    }
+
+    #[test]
+    fn diff_lays_out_side_by_side_when_toggled_and_wide_enough() {
+        let text = "@@ -1,2 +1,2 @@\n keep\n-old line\n+new line\n";
+        let mut doc = doc_of(crate::diffview::render("a.txt", text), false);
+        doc.diff = Some(DiffSource {
+            rel: "a.txt".into(),
+            text: text.into(),
+        });
+
+        doc.relayout(80, 20);
+        assert_eq!(doc.rows.len(), 3, "unified: one row per diff line");
+        assert!(!row_texts(&doc.rows)[1].contains('│'));
+
+        // `v` keeps the reader's place by source line, like `w`.
+        doc.scroll = 2;
+        doc.pending_src = Some(doc.top_src());
+        doc.split = true;
+        doc.relayout(80, 20);
+        let texts = row_texts(&doc.rows);
+        assert_eq!(doc.rows.len(), 2, "side by side: the -/+ pair shares a row");
+        assert!(texts[1].contains("old line") && texts[1].contains("new line"));
+        assert!(texts[1].contains('│'));
+        assert_eq!(doc.scroll, 1, "still looking at the changed pair");
+
+        // Too narrow for two columns: back to unified, toggle kept.
+        doc.relayout(MIN_SPLIT_WIDTH - 1, 20);
+        assert_eq!(doc.rows.len(), 3);
+        assert!(doc.split);
     }
 
     fn row_texts(rows: &[Row]) -> Vec<String> {
@@ -5241,6 +5338,8 @@ mod tests {
             glow_width,
             rows: Vec::new(),
             rows_key: None,
+            diff: None,
+            split: false,
             pending_src: None,
             selection: PreviewSelection::default(),
             stamp: None,

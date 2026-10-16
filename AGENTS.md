@@ -571,6 +571,8 @@ HACKING.md — budget time for that before promising a patched build.
   Explorer gets its branch/ahead/behind state
   from the same one-at-a-time background status worker as decorations, but status polling stays
   available when decorations are disabled; ignored-path scans do not.
+- `diff_side_by_side` in the same state file (default false) is the diff preview's
+  layout; `v` writes it through `update_state`, and each new diff reads it on load.
 - `dock_right` in the same state file (default false) drives the “Dock on the right” Settings
   row. Launch target/ratio/swap, resize direction, and full-height repair all mirror from that
   one persisted choice. Preview tabs inherit it when the `tab.created` hook docks their sidebar.
@@ -1018,6 +1020,21 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   receiver cannot cancel a thread blocked in the kernel, so at most `MAX_REFRESH_IN_FLIGHT` (2)
   refresh workers may exist; new refreshes pause while both are stuck, and a refresh unanswered
   for 30s is abandoned so the same document can retry within that cap.
+
+- **Side-by-side diffs** (`v`, persisted as `diff_side_by_side`, default off):
+  `diffview::render_split` lays the same parsed, highlighted events out in two columns —
+  old left, new right, `│` between — pairing each run of deletions with the additions
+  that follow it (leftovers get an empty other side, no tint). It needs the pane width,
+  so a diff `Doc` keeps its raw `git diff` text (`Doc::diff`) and `relayout` calls
+  `render_split` instead of `build_rows`; `rows_key` includes the layout so a toggle or a
+  resize rebuilds. Each column wraps on its own (`wrap::wrap_line` per side, continuations
+  get a blank gutter, the shorter side is padded with its tint), and `w` off clips each
+  column instead. Every row comes back exactly `width` wide with per-side tints on the
+  spans, so `build_rows`' full-width padding is not involved. Rows are tagged with the
+  unified line index they start at (one unified line per parsed event), which is what
+  lets `v` re-anchor via `pending_src` like `w`. Below `MIN_SPLIT_WIDTH` (60 columns)
+  the pane silently renders unified and the footer says `side by side (too narrow)`.
+  `git show` previews stay unified (they go through `ansi.rs`, not `diffview`).
 
 ### Long-line wrapping in the preview (`src/wrap.rs`)
 
