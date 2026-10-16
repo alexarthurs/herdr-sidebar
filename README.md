@@ -96,11 +96,20 @@ Settings persist across tabs and restarts. Configure:
 
 - Unified or separate Explorer and Source Control panes
 - Left/right docking and preferred width
+- Auto-hide in narrow tabs (off by default; see below)
 - Material/emoji icons and VS Code/light/terminal colors
 - Tab (default), split-pane, or temporary takeover previews and optional custom editor
 - Source Control list/tree view (shared across sidebars)
 - Hidden files, Git decorations, Git footer, and footer hotkeys
 - Auto-open, strict open/close toggle, focus-on-open, and live folder following
+
+**Auto-hide below** hides the sidebar while the tab is at most that many columns wide
+(64–200, or off), like herdr's own `ui.mobile_width_threshold`. The width is the tab area,
+which excludes herdr's own sidebar. Once the tab is wider than the setting again, the
+sidebar comes back within about a second on Linux and macOS. Tabs in the background, and
+Windows, get it back at the next pane, tab or workspace focus. A sidebar you hid with `b`
+stays hidden, and one you open yourself in a narrow tab stays open until the tab has been
+wide again. With separate panes, only Explorer auto-hides.
 
 The sidebar follows a neighbouring pane's working directory by default. A manually chosen
 folder stays put until that pane changes directory again.

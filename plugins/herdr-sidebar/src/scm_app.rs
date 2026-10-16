@@ -758,6 +758,7 @@ enum Setting {
     UnifiedSidebar,
     DockRight,
     SidebarWidth,
+    AutoHideBelow,
     IconTheme,
     ColorTheme,
     PreviewPlacement,
@@ -964,6 +965,8 @@ pub struct App {
     /// Whole tab area width from the last layout snapshot. Divider-only
     /// resizes leave this unchanged and are therefore respected.
     last_layout_width: Option<i64>,
+    /// Auto-hide in narrow tabs (⚙ Settings), as in the Explorer.
+    auto_hide: herdr_sidebar::autohide::Latch,
     last_height: u16,
     // Merged-sidebar state.
     sidebar_state: sidebar::State,
@@ -1091,6 +1094,10 @@ impl App {
             page: 20,
             last_width: sidebar_state.sidebar_width,
             last_layout_width,
+            auto_hide: herdr_sidebar::autohide::Latch::new(
+                sidebar_state.auto_hide_below,
+                last_layout_width,
+            ),
             last_height: 24,
             sidebar_state,
             other_exe,
@@ -1166,6 +1173,20 @@ impl App {
     /// prefix+b keybinding (→ the toggle action) brings it back.
     fn hide(&mut self) {
         self.close(true);
+    }
+
+    /// The tab became too narrow (⚙ Auto-hide): close our pane under the
+    /// tab's auto-hide marker, which the quiet ensure hook clears once the
+    /// tab is wide again.
+    fn auto_hide_now(&mut self) {
+        crate::flush_pending_root();
+        if !self.persist_scm() {
+            return;
+        }
+        let Some(ctl) = &self.pane_ctl else { return };
+        if let Err(e) = herdr_sidebar::autohide::hide_pane(&ctl.pane_id) {
+            self.flash = Some((format!("auto-hide failed: {e}"), true));
+        }
     }
 
     fn close(&mut self, snooze: bool) {
@@ -1312,6 +1333,7 @@ impl App {
         self.sidebar_state.dock_right = shared.dock_right;
         self.sidebar_state.strict_toggle = shared.strict_toggle;
         self.sidebar_state.focus_on_open = shared.focus_on_open;
+        self.sidebar_state.auto_hide_below = shared.auto_hide_below;
         if shared.scm_tree_view != self.tree_view {
             // Toggled from another pane (separated view, a preview tab).
             self.tree_view = shared.scm_tree_view;
@@ -1391,7 +1413,16 @@ impl App {
                 .zip(layout_width)
                 .is_some_and(|(before, now)| before != now);
             self.last_layout_width = layout_width.or(self.last_layout_width);
-            if !unified_close_completed && surrounding_changed {
+            // A standalone Source Control pane is never docked by the ensure
+            // hook, so only the unified sidebar hides for width.
+            let auto_hide = self.merged()
+                && layout_width.is_some_and(|width| {
+                    self.auto_hide
+                        .observe(self.sidebar_state.auto_hide_below, width)
+                });
+            if !unified_close_completed && auto_hide {
+                self.auto_hide_now();
+            } else if !unified_close_completed && surrounding_changed {
                 ctl.resize_preferred(
                     width,
                     self.sidebar_state.sidebar_width,
@@ -2223,6 +2254,7 @@ impl App {
             Activate,
             ToggleSetting(usize),
             AdjustWidth(bool),
+            AdjustAutoHide(bool),
             DiscardConfirmed(usize, FileEntry),
             DiscardAllConfirmed(usize),
             GitConfirmed(usize, Vec<String>),
@@ -2266,6 +2298,16 @@ impl App {
                 {
                     Cmd::AdjustWidth(true)
                 }
+                KeyCode::Left | KeyCode::Char('h')
+                    if settings.get(*selected).map(|row| row.0) == Some(Setting::AutoHideBelow) =>
+                {
+                    Cmd::AdjustAutoHide(false)
+                }
+                KeyCode::Right | KeyCode::Char('l')
+                    if settings.get(*selected).map(|row| row.0) == Some(Setting::AutoHideBelow) =>
+                {
+                    Cmd::AdjustAutoHide(true)
+                }
                 KeyCode::Enter | KeyCode::Char(' ') => Cmd::ToggleSetting(*selected),
                 _ => Cmd::Nothing,
             },
@@ -2292,6 +2334,7 @@ impl App {
             Cmd::Activate => self.activate_menu_entry(),
             Cmd::ToggleSetting(index) => self.toggle_setting(index),
             Cmd::AdjustWidth(wider) => self.adjust_sidebar_width(wider),
+            Cmd::AdjustAutoHide(wider) => self.adjust_auto_hide_below(wider),
             Cmd::GitConfirmed(repo, args) => {
                 self.overlay = None;
                 match safe_branch_delete(&args) {
@@ -2516,6 +2559,12 @@ impl App {
                 true,
             ),
             (
+                Setting::AutoHideBelow,
+                "Auto-hide below",
+                sidebar::auto_hide_below_label(self.sidebar_state.auto_hide_below),
+                true,
+            ),
+            (
                 Setting::IconTheme,
                 "Icon theme",
                 match self.theme {
@@ -2654,6 +2703,7 @@ impl App {
                     sidebar::update_state(|state| state.dock_right = !state.dock_right);
             }
             Setting::SidebarWidth => self.adjust_sidebar_width(true),
+            Setting::AutoHideBelow => self.adjust_auto_hide_below(true),
             Setting::IconTheme => self.set_theme(self.theme.toggled()),
             Setting::ColorTheme => {
                 self.sidebar_state = sidebar::update_state(|state| {
@@ -2701,6 +2751,12 @@ impl App {
                 self.change_folder_dialog();
             }
         }
+    }
+
+    fn adjust_auto_hide_below(&mut self, wider: bool) {
+        self.sidebar_state = sidebar::update_state(|state| {
+            state.auto_hide_below = sidebar::step_auto_hide_below(state.auto_hide_below, wider);
+        });
     }
 
     fn adjust_sidebar_width(&mut self, wider: bool) {
@@ -2822,7 +2878,7 @@ impl App {
             Style::default().bold(),
         )));
         lines.extend(hint_lines);
-        lines.push(Line::from(" click/⏎ · ←/→ width · esc".dim()));
+        lines.push(Line::from(" click/⏎ · ←/→ adjust · esc".dim()));
 
         frame.render_widget(Clear, popup);
         frame.render_widget(

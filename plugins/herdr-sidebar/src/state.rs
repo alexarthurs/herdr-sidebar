@@ -9,6 +9,8 @@
 //! - `follow_cwd`: follow the live cwd of the neighbouring pane.
 //! - `dock_right`: dock at the right edge instead of the default left edge.
 //! - `sidebar_width`: preferred sidebar width in terminal columns.
+//! - `auto_hide_below`: hide the sidebar while the tab is at most this many
+//!   columns wide (0 = off).
 //!
 //! Both views live in ONE binary; switching is an in-process re-render, and
 //! separated panes are the same binary pinned to a starting view with
@@ -27,6 +29,40 @@ pub const SIDEBAR_WIDTH_STEP: u16 = 4;
 
 pub fn clamp_sidebar_width(width: u16) -> u16 {
     width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH)
+}
+
+/// The auto-hide threshold starts at herdr's own `ui.mobile_width_threshold`
+/// default; 0 is off and sits one step below the minimum.
+pub const MIN_AUTO_HIDE_BELOW: u16 = 64;
+pub const MAX_AUTO_HIDE_BELOW: u16 = 200;
+pub const AUTO_HIDE_BELOW_STEP: u16 = 8;
+
+pub fn clamp_auto_hide_below(columns: u16) -> u16 {
+    if columns == 0 {
+        0
+    } else {
+        columns.clamp(MIN_AUTO_HIDE_BELOW, MAX_AUTO_HIDE_BELOW)
+    }
+}
+
+pub fn step_auto_hide_below(columns: u16, wider: bool) -> u16 {
+    let columns = clamp_auto_hide_below(columns);
+    match (columns, wider) {
+        (0, true) => MIN_AUTO_HIDE_BELOW,
+        (0, false) => 0,
+        (MIN_AUTO_HIDE_BELOW, false) => 0,
+        (_, true) => (columns + AUTO_HIDE_BELOW_STEP).min(MAX_AUTO_HIDE_BELOW),
+        (_, false) => columns
+            .saturating_sub(AUTO_HIDE_BELOW_STEP)
+            .max(MIN_AUTO_HIDE_BELOW),
+    }
+}
+
+pub fn auto_hide_below_label(columns: u16) -> String {
+    match clamp_auto_hide_below(columns) {
+        0 => "off".to_string(),
+        columns => format!("{columns} cols"),
+    }
 }
 
 pub fn step_sidebar_width(width: u16, wider: bool) -> u16 {
@@ -317,6 +353,10 @@ pub struct State {
     /// column target in the normal range and yields proportionally when the
     /// tab becomes unusually narrow.
     pub sidebar_width: u16,
+    /// Hide the sidebar while the whole tab area is at most this many
+    /// columns wide; the quiet ensure hook docks it again once the tab is
+    /// wider. 0 = off.
+    pub auto_hide_below: u16,
     /// Whether a clicked file opens in its own tab or in a viewer pane beside
     /// the sidebar, inside the tab the click came from.
     pub preview_placement: PreviewPlacement,
@@ -345,6 +385,7 @@ impl Default for State {
             git_deco: true,
             dock_right: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            auto_hide_below: 0,
             preview_placement: PreviewPlacement::Tab,
             custom_editor_on_click: false,
             scm_tree_view: false,
@@ -513,7 +554,7 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"auto_hide_below\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.search_active,
@@ -527,6 +568,7 @@ fn write_state(path: &Path, state: State) {
         state.git_deco,
         state.dock_right,
         clamp_sidebar_width(state.sidebar_width),
+        clamp_auto_hide_below(state.auto_hide_below),
         state.color_theme.label(),
         state.preview_placement.label(),
         state.custom_editor_on_click,
@@ -966,6 +1008,11 @@ pub fn parse_state(json: &str) -> State {
             .and_then(|v| u16::try_from(v).ok())
             .map(clamp_sidebar_width)
             .unwrap_or(default.sidebar_width),
+        auto_hide_below: value
+            .get("auto_hide_below")
+            .and_then(|v| v.as_u64())
+            .map(|v| clamp_auto_hide_below(u16::try_from(v).unwrap_or(u16::MAX)))
+            .unwrap_or(default.auto_hide_below),
         preview_placement: value
             .get("preview_placement")
             .and_then(|v| v.as_str())
@@ -1121,11 +1168,12 @@ mod tests {
             git_deco: false,
             dock_right: true,
             sidebar_width: 44,
+            auto_hide_below: 96,
             preview_placement: PreviewPlacement::Pane,
             custom_editor_on_click: true,
             scm_tree_view: true,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"auto_hide_below\":96,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
@@ -1166,6 +1214,15 @@ mod tests {
         assert_eq!(parse_state("{\"merged\":true}").sidebar_width, 32);
         assert_eq!(parse_state("{\"sidebar_width\":1}").sidebar_width, 24);
         assert_eq!(parse_state("{\"sidebar_width\":999}").sidebar_width, 80);
+        // Files written before auto-hide existed keep the sidebar in narrow
+        // tabs; out-of-range values clamp, 0 stays off.
+        assert_eq!(parse_state("{\"merged\":true}").auto_hide_below, 0);
+        assert_eq!(parse_state("{\"auto_hide_below\":0}").auto_hide_below, 0);
+        assert_eq!(parse_state("{\"auto_hide_below\":1}").auto_hide_below, 64);
+        assert_eq!(
+            parse_state("{\"auto_hide_below\":99999}").auto_hide_below,
+            200
+        );
         // Files written before the preview setting existed keep the
         // historical behavior: a tab per document.
         assert_eq!(
@@ -1205,6 +1262,19 @@ mod tests {
             PreviewPlacement::Replace
         );
         assert!(PreviewPlacement::Replace.is_inline());
+    }
+
+    #[test]
+    fn auto_hide_below_steps_between_off_and_the_supported_bounds() {
+        assert_eq!(step_auto_hide_below(0, true), 64);
+        assert_eq!(step_auto_hide_below(0, false), 0);
+        assert_eq!(step_auto_hide_below(64, false), 0);
+        assert_eq!(step_auto_hide_below(64, true), 72);
+        assert_eq!(step_auto_hide_below(80, false), 72);
+        assert_eq!(step_auto_hide_below(200, true), 200);
+        assert_eq!(step_auto_hide_below(u16::MAX, false), 192);
+        assert_eq!(auto_hide_below_label(0), "off");
+        assert_eq!(auto_hide_below_label(96), "96 cols");
     }
 
     #[test]
