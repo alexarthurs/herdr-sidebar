@@ -16,6 +16,7 @@ use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
 };
+use html2text::render::{RichAnnotation, TaggedLine};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
@@ -43,9 +44,10 @@ const LOAD_POLL: Duration = Duration::from_millis(16);
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_LINES: usize = 5000;
 
-/// Body width from the most recent `draw_doc` call. Markdown loads happen on
-/// a worker before layout is available, so glow uses this snapshot and the
-/// event loop reloads a glow document if its actual body width differs.
+/// Body width from the most recent `draw_doc` call. Markdown and HTML loads
+/// happen on a worker before layout is available, so glow and html2text use
+/// this snapshot and the event loop reloads the document if its actual body
+/// width differs.
 static LAST_BODY_WIDTH: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(80);
 
 /// Directory for the sidebar's private scratch files (viewer control files).
@@ -382,8 +384,9 @@ struct Doc {
     /// Long lines wrap unless the user toggles them off (`w`). Per document:
     /// a newly loaded one starts wrapped again.
     wrap: bool,
-    /// Width glow formatted this markdown document for. A mismatch with the
-    /// live body triggers one background reload instead of generic rewrap.
+    /// Width glow (markdown) or html2text (HTML) laid this document out for.
+    /// A mismatch with the live body triggers one background reload instead
+    /// of generic rewrap.
     glow_width: Option<u16>,
     /// `lines` laid out for the pane, rebuilt only when the width or the
     /// wrap toggle changes (see [`Doc::relayout`]).
@@ -1334,6 +1337,89 @@ fn glow_args(width: u16, light: bool) -> Vec<String> {
     ]
 }
 
+/// Render an HTML document the way a text browser would, laid out for
+/// `width` columns. Returns `None` when nothing visible remains (a page that
+/// scripts fill in) or layout fails; the caller falls back to syntax
+/// highlight.
+///
+/// html2text only parses: scripts never run and nothing is fetched. Link
+/// targets are listed as numbered footnotes, since the preview cannot follow
+/// a link.
+fn html_document(text: &str, width: u16) -> Option<Vec<Line<'static>>> {
+    let rendered = html2text::config::rich()
+        .allow_width_overflow()
+        .link_footnotes(true)
+        // `<del>` gets the terminal's crossed-out style instead; combining
+        // U+0336 marks would also land in copied text.
+        .unicode_strikeout(false)
+        .lines_from_read(text.as_bytes(), usize::from(width))
+        .ok()?;
+    let colors = palette();
+    let lines: Vec<Line<'static>> = rendered
+        .iter()
+        .take(MAX_LINES)
+        .map(|line| html_line(line, &colors))
+        .collect();
+    lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .any(|span| !span.content.trim().is_empty())
+        .then_some(lines)
+}
+
+/// One rendered HTML line as styled spans. html2text marks a heading only by
+/// its `#` prefix, so a line opening with one (outside `<pre>` and `<code>`)
+/// takes the heading style. The prefix stays, keeping the level visible the
+/// way glow's default style does for markdown.
+fn html_line(line: &TaggedLine<Vec<RichAnnotation>>, colors: &crate::ui::Palette) -> Line<'static> {
+    let mut heading = false;
+    let mut spans = Vec::new();
+    for (index, piece) in line.tagged_strings().enumerate() {
+        let code = piece
+            .tag
+            .iter()
+            .any(|tag| matches!(tag, RichAnnotation::Code | RichAnnotation::Preformat(_)));
+        if index == 0 && !code && is_html_heading(&piece.s) {
+            heading = true;
+        }
+        let base = if heading {
+            Style::default().fg(colors.header_accent).bold()
+        } else {
+            Style::default()
+        };
+        if !piece.s.is_empty() {
+            spans.push(Span::styled(
+                piece.s.clone(),
+                html_style(base, &piece.tag, colors),
+            ));
+        }
+    }
+    Line::from(spans)
+}
+
+/// Whether `text` opens with a `# ` … `###### ` heading prefix.
+fn is_html_heading(text: &str) -> bool {
+    let rest = text.trim_start_matches('#');
+    let level = text.len() - rest.len();
+    (1..=6).contains(&level) && rest.starts_with(' ')
+}
+
+/// Annotations arrive outermost first, so `<code>` inside a link keeps its
+/// own chip colors.
+fn html_style(base: Style, tags: &[RichAnnotation], colors: &crate::ui::Palette) -> Style {
+    tags.iter().fold(base, |style, tag| match tag {
+        RichAnnotation::Strong => style.bold(),
+        RichAnnotation::Emphasis => style.italic(),
+        RichAnnotation::Strikeout => style.crossed_out(),
+        RichAnnotation::Link(_) => style.fg(colors.accent_focus).underlined(),
+        RichAnnotation::Image(_) => style.fg(colors.ignored).italic(),
+        RichAnnotation::Code => style.fg(colors.keycap_fg).bg(colors.keycap_bg),
+        RichAnnotation::Preformat(_) => style.fg(colors.modified),
+        // Plain text, and the CSS colors this build never enables.
+        _ => style,
+    })
+}
+
 fn choose_text_render<F>(
     glow_rendered: Option<Vec<Line<'static>>>,
     fallback: F,
@@ -1616,6 +1702,7 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
         return load_media_file(target, name, true);
     }
     let is_markdown = lower.ends_with(".md") || lower.ends_with(".markdown");
+    let is_html = has_extension(target, &["htm", "html"]);
     let (lines, numbered, glow_width) = match std::fs::read(target) {
         Err(e) => (vec![Line::raw(format!("(unreadable: {e})"))], true, None),
         Ok(bytes) => {
@@ -1628,13 +1715,18 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
             } else {
                 let truncated = bytes.len() > MAX_BYTES;
                 let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_BYTES)]);
-                // Markdown: render via glow; fall back to syntax highlight on failure.
-                let requested_glow_width = LAST_BODY_WIDTH
+                // Markdown renders via glow and HTML via html2text; either
+                // falls back to syntax highlight on failure. A line target
+                // shows the source so the line number means something.
+                let render_width = LAST_BODY_WIDTH
                     .load(std::sync::atomic::Ordering::Relaxed)
                     .max(20);
-                let glow_rendered = (is_markdown && target_line.is_none())
-                    .then(|| glow_markdown(&text, requested_glow_width))
-                    .flatten();
+                let rendered = match target_line {
+                    Some(_) => None,
+                    None if is_markdown => glow_markdown(&text, render_width),
+                    None if is_html => html_document(&text, render_width),
+                    None => None,
+                };
                 let fallback = || {
                     crate::syntax::highlight(&name, &text, MAX_LINES).unwrap_or_else(|| {
                         text.lines()
@@ -1644,7 +1736,7 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
                     })
                 };
                 let (mut lines, numbered, glow_width) =
-                    choose_text_render(glow_rendered, fallback, requested_glow_width);
+                    choose_text_render(rendered, fallback, render_width);
                 if truncated || text.lines().count() > MAX_LINES {
                     lines.push(Line::raw("… (truncated)"));
                 }
@@ -1662,7 +1754,8 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
         numbered,
         media: None,
         scroll: 0,
-        // Glow already laid out tables and paragraphs for `glow_width`.
+        // Glow or html2text already laid out tables and paragraphs for
+        // `glow_width`.
         wrap: glow_width.is_none(),
         glow_width,
         rows: Vec::new(),
@@ -5250,6 +5343,115 @@ mod tests {
         assert_eq!(doc.glow_width, Some(80));
         assert!(!glow_needs_reload(&doc, 80));
         assert!(glow_needs_reload(&doc, 60));
+    }
+
+    fn html_text(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.to_string().trim_end().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn html_document_styles_headings_emphasis_links_and_code() {
+        use ratatui::style::Modifier;
+        let html = "<h2>Title</h2><p>Some <strong>bold</strong>, a \
+                    <a href=\"https://example.test/\">link</a> and <code>x = 1</code>.</p>";
+        let lines = html_document(html, 80).expect("html renders");
+        let span = |text: &str| {
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .find(|span| span.content.contains(text))
+                .unwrap_or_else(|| panic!("no span containing {text:?}"))
+                .clone()
+        };
+        let title = span("Title");
+        assert_eq!(title.content, "## Title", "the level prefix stays");
+        assert!(title.style.add_modifier.contains(Modifier::BOLD));
+        assert!(title.style.fg.is_some(), "headings take the accent color");
+        assert!(span("bold").style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            span("link")
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
+        assert!(span("x = 1").style.bg.is_some(), "inline code is a chip");
+        assert!(
+            html_text(&lines).contains(&"[1]: https://example.test/".to_string()),
+            "link targets are listed as footnotes: {:?}",
+            html_text(&lines)
+        );
+    }
+
+    #[test]
+    fn html_preformatted_hash_lines_are_not_headings() {
+        use ratatui::style::Modifier;
+        let lines = html_document("<pre># a shell comment\nls</pre>", 80).expect("html renders");
+        let comment = lines
+            .iter()
+            .find(|line| line.to_string().contains("comment"))
+            .expect("comment line");
+        assert_eq!(comment.to_string().trim_end(), "# a shell comment");
+        assert!(
+            comment
+                .spans
+                .iter()
+                .all(|span| !span.style.add_modifier.contains(Modifier::BOLD))
+        );
+    }
+
+    #[test]
+    fn html_strikeout_uses_the_terminal_style_not_combining_marks() {
+        use ratatui::style::Modifier;
+        let lines = html_document("<p><del>gone</del></p>", 80).expect("html renders");
+        let gone = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("gone"))
+            .expect("struck span");
+        assert_eq!(gone.content, "gone", "no U+0336 marks in copied text");
+        assert!(gone.style.add_modifier.contains(Modifier::CROSSED_OUT));
+    }
+
+    #[test]
+    fn html_document_wraps_to_the_body_width() {
+        let words = "word ".repeat(60);
+        let lines = html_document(&format!("<p>{words}</p>"), 30).expect("html renders");
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|line| line.width() <= 30));
+    }
+
+    #[test]
+    fn html_document_never_shows_script_or_style_bodies() {
+        let html = "<style>body { color: red }</style><script>alert(1)</script><p>visible</p>";
+        let text = html_text(&html_document(html, 80).expect("html renders")).join("\n");
+        assert!(text.contains("visible"));
+        assert!(!text.contains("alert") && !text.contains("color"), "{text}");
+    }
+
+    #[test]
+    fn html_document_without_visible_text_falls_back_to_source() {
+        assert!(html_document("<script>document.write('hi')</script>", 80).is_none());
+        assert!(html_document("", 80).is_none());
+    }
+
+    #[test]
+    fn html_files_render_at_the_body_width_and_line_targets_keep_source() {
+        let root = std::env::temp_dir().join(format!("herdr-sidebar-html-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("page.HTML");
+        std::fs::write(&path, "<h1>Hello</h1><p>world</p>\n").unwrap();
+        let doc = load_file(&path, None);
+        assert!(doc.glow_width.is_some(), "rendered HTML reloads on resize");
+        assert!(!doc.numbered && !doc.wrap);
+        assert!(html_text(&doc.lines).contains(&"# Hello".to_string()));
+        let source = load_file(&path, Some(1));
+        assert!(source.numbered, "a line target shows the source");
+        assert!(source.glow_width.is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

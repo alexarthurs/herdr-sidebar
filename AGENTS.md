@@ -1090,6 +1090,16 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
 - `glow` receives the actual preview-body width and the configured light/dark color mode. Its
   terminal-formatted output bypasses the generic text wrapper; first-load and resize mismatches
   schedule one background reload at the new width while preserving the reader's scroll offset.
+- `.html` / `.htm` render in-process through `html2text` (rich mode) at the same body width and
+  ride the same `glow_width` reload path. It only parses: scripts never run, nothing is fetched,
+  and `<script>` / `<style>` bodies are dropped. html2text marks a heading ONLY by its `#`
+  prefix (no annotation), so `html_line` styles a line that opens with one, except inside
+  `<pre>` / `<code>` where `# ` is usually a shell comment. Keep `unicode_strikeout(false)`:
+  the default combining U+0336 marks double up with the crossed-out style and land in copied
+  text. Link targets come out as numbered footnotes. A page with no visible text (built by
+  scripts) falls back to highlighted source, as does any line-target request. Unlike glow it
+  runs inside the viewer, so a panic in it would leave the `loading preview…` frame up (the
+  worker's channel just disconnects), the same exposure the in-process image decoder has.
 - Raster image previews are decoded in-process and rendered as true-color `▀` cells (foreground
   = upper pixel, background = lower pixel), so they work through herdr's terminal compositor
   without Kitty/Sixel passthrough. They preserve aspect ratio, center, and rebuild from the
@@ -1154,7 +1164,10 @@ unit tests can't. **Build the verification binary into its OWN target dir**
 with the running sidebar's Windows exe lock, so no rename-aside dance and the user's live
 panes keep running. Delete the dir afterwards. Run the TUI with `$env:HERDR_PANE_ID=''` so it skips identity-token
 reporting — otherwise the test pane registers as a real sidebar and the tab's launcher/
-ensure logic can fight over it.
+ensure logic can fight over it. Without a pane id the preview cannot close itself, so `q` /
+Esc do nothing: end a run with `pane close`, never by `pane run` into the same pane. The
+still-running TUI takes that text as keystrokes, and its first `e` opens the editor on the
+previewed file.
 
 **Mouse interactions ARE drivable** (verified live): `pane.send_input` text is fed to the
 TUI's stdin, and crossterm parses SGR mouse sequences from it like any terminal input.

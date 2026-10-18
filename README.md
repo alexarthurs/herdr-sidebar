@@ -47,7 +47,8 @@ Use the mouse or press `1`, `2`, and `3`.
 - Click a file to reuse an ephemeral preview tab; double-click to pin it. Preview in the
   same tab with **Preview opens in: pane**, or opt into experimental `replace` mode:
   working panes move to a temporary tab while you preview; Esc / `q` brings them back.
-- Preview text, Markdown, images, and—when `ffmpeg` is available—video poster frames.
+- Preview text, Markdown, HTML (laid out as text; scripts never run), images, and—when
+  `ffmpeg` is available—video poster frames.
   Read-only previews support mouse selection and clipboard copy, including OSC 52 over SSH,
   and reload on their own when the file changes on disk.
 - Find files with `Ctrl+P`; search project contents with `Ctrl+F` or `Ctrl+Shift+F`.

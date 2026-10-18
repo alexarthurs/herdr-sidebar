@@ -57,6 +57,10 @@ image = { version = "0.25", default-features = false, features = [
 # Reads herdr's own config.toml exactly as herdr does (the preview mirrors
 # `[ui] copy_on_select`); a hand-rolled reader missed valid TOML spellings.
 toml = { version = "1.1.7", default-features = false, features = ["parse", "serde", "std"] }
+# Renders .html previews as styled text at the pane width, the way glow does
+# for markdown. Parse-only and pure Rust (html5ever): no scripts, no network
+# fetches, no C build, and no external renderer to install.
+html2text = { version = "0.17", default-features = false }
 
 # Raw euid() for scoping private runtime directories (rundir.rs) to the
 # owning user; already present transitively, so this adds no new download.
