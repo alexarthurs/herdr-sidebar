@@ -567,27 +567,27 @@ HACKING.md — budget time for that before promising a patched build.
   resize path; a pane-only divider resize is respected for the current layout instead of
   snapping back. The existing 15%–50% share bounds still win at extreme tab widths.
 - Auto-hide below N columns (`auto_hide_below`, 0 = off, 64–200 in 8-column steps;
-  `src/autohide.rs`). The sidebar TUI hides itself from `on_resize` when the tab
-  `area.width` is ≤ N: it writes a per-tab marker in `rundir("autohide")` (same
-  helpers as snooze, separate dir) and then closes its pane. Only the quiet ensure hook
-  brings it back, and only once `area.width` > N, clearing the marker. No hysteresis:
-  `area.width` is the whole tab, which the sidebar opening or closing does not change.
-  herdr does NOT let plugins hook `layout.updated` (excluded as high-volume; socket subscriptions
-  only cover output_matched / agent_status_changed / scroll_changed), and a closed pane
-  receives no resizes. So on unix, hiding also spawns `--autohide-watch <tab>`. It polls
-  the tab width every second and runs `--ensure` (with `HERDR_TAB_ID=<tab>`) once the
-  tab is wide, but only while that tab is focused, so a background dock cannot move
-  focus. It exits when the marker is gone, the tab is snoozed or closed, or the socket
-  stops answering. It MUST `setsid`: herdr hangs up the whole session of a closed pane,
-  and a plain new process group died with it (verified live). Background tabs and
-  Windows reopen at the next focus event. Panes in background tabs DO get the PTY
-  resize and hide too (verified live, herdr 0.9.3). A user snooze
-  always wins. A pane that starts in an already-narrow tab (an explicit toggle) starts
-  disarmed (`autohide::Latch`) and only auto-hides after the tab has been > N.
-  A standalone Source Control pane never auto-hides, because ensure never reopens one.
-  herdr's own `ui.mobile_width_threshold` compares the CLIENT terminal width and swaps
-  to a single-column layout; it does not collapse anything, so the two thresholds
-  don't line up exactly.
+  `src/autohide.rs`, #109). The sidebar TUI closes itself from `on_resize` when the tab
+  `area.width` is ≤ N, through the ordinary `close(false)` path (SCM drafts saved first, no
+  snooze marker). The quiet ensure hook declines to dock into a tab that narrow
+  (`auto_hide_allows_open`, measured through any pane of the RESOLVED tab — a workspace scope
+  with several tabs has no single focused pane) and docks again at the first focus event once
+  `area.width` > N. No hysteresis needed: `area.width` is the whole tab, which the sidebar
+  opening or closing does not change. A sidebar that is its tab's ONLY pane never auto-hides:
+  closing the last pane closes the tab (a sidebar left alone in a preview tab).
+  As submitted, the PR also wrote a per-tab marker and, on unix, spawned a `setsid`-detached
+  `--autohide-watch` poller per hidden tab so the sidebar came back without a focus event.
+  Dropped in review: herdr lets plugins hook neither `layout.updated` nor resize, so it needed
+  one process per hidden tab polling `pane.list` every second, the marker was cleared on only
+  some open paths (with `auto_open` off, or the setting turned off, the watcher ran a full
+  `--ensure` every second forever), and it was the plugin's only `unsafe pre_exec`.
+  Panes in background tabs DO get the PTY resize and hide too (verified live by the author,
+  herdr 0.9.3). A user snooze always wins (checked first). A pane that starts in an
+  already-narrow tab (an explicit toggle) starts disarmed (`autohide::Latch`) and only
+  auto-hides after the tab has been > N. A standalone Source Control pane never auto-hides,
+  because ensure never reopens one. herdr's own `ui.mobile_width_threshold` compares the
+  CLIENT terminal width and swaps to a single-column layout; it does not collapse anything,
+  so the two thresholds don't line up exactly.
 - Every Settings action uses `state::update_state`, a lock-protected read-modify-write.
   State/tree/SCM/root writers use persistent sibling `.lock` files with OS-backed locks; the
   kernel releases ownership on process death, so do not poll, age, or delete those files.

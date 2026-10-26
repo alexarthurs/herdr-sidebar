@@ -893,14 +893,15 @@ impl App {
         self.close(true);
     }
 
-    /// The tab became too narrow (⚙ Auto-hide): close our pane under the
-    /// tab's auto-hide marker, which the quiet ensure hook clears once the
-    /// tab is wide again.
+    /// The tab became too narrow (⚙ Auto-hide): close our pane without a
+    /// snooze marker, so the quiet ensure hook docks it again once the tab
+    /// is wide. Never the tab's last pane: that would close the whole tab.
     fn auto_hide_now(&mut self) {
-        crate::flush_pending_root();
         let Some(ctl) = &self.pane_ctl else { return };
-        if let Err(e) = herdr_sidebar::autohide::hide_pane(&ctl.pane_id) {
-            self.notice = Some(format!("auto-hide failed: {e}"));
+        let company = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({}))
+            .is_ok_and(|json| herdr_sidebar::autohide::has_company(&json, &ctl.pane_id));
+        if company {
+            self.close(false);
         }
     }
 

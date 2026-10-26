@@ -440,11 +440,9 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
         panes = ipc::call_text("pane.list", serde_json::json!({}))?;
     }
     let snooze_dir = snooze::dir();
-    let autohide_dir = autohide::dir();
     if let Some(live_tabs) = launch::live_tabs(&panes) {
         snooze::migrate_legacy(&snooze_dir, &live_tabs);
         snooze::sweep(&snooze_dir, &live_tabs);
-        snooze::sweep(&autohide_dir, &live_tabs);
     }
     let now = crate::state::unix_now();
     let decision_view = activation.map_or(view, |target| match target {
@@ -557,7 +555,6 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
                     // quiet hook wrongly leaves it closed, not a resource we
                     // need to fail loudly over.
                     let _ = snooze::clear(&snooze_dir, &tab);
-                    let _ = snooze::clear(&autohide_dir, &tab);
                 }
                 // "Focus on open: off" (⚙ Settings) docks in the background:
                 // open()'s quiet path already hands focus back after the swap.
@@ -573,12 +570,11 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
                 if tracks_snooze {
                     // Same best-effort reasoning as the toggle-open branch above.
                     let _ = snooze::clear(&snooze_dir, &tab);
-                    let _ = snooze::clear(&autohide_dir, &tab);
                 }
                 prepare_activation(target);
                 open(&panes, true, &scope, view, Some(target), creation_event)?;
             } else if !snooze::is_set(&snooze_dir, &tab)
-                && auto_hide_allows_open(&panes, &scope, &tab, state.auto_hide_below)
+                && auto_hide_allows_open(&panes, &tab, state.auto_hide_below)
             {
                 open(&panes, false, &scope, view, None, creation_event)?;
             }
@@ -670,28 +666,22 @@ fn sweep_replace_backoff(dir: &Path, now: u64) {
 }
 
 /// Auto-hide (⚙ Settings): the quiet hook leaves a narrow tab without a
-/// sidebar and docks one again once the tab is wider than the setting, clearing the
-/// tab's auto-hide marker. A layout that cannot be read does not block the
-/// dock.
-fn auto_hide_allows_open(panes_json: &str, scope: &str, tab: &str, threshold: u16) -> bool {
+/// sidebar and docks one again once the tab is wider than the setting. The
+/// width is read through any pane of the already-resolved `tab`: a workspace
+/// scope with several tabs has no single focused pane to ask. A layout that
+/// cannot be read does not block the dock.
+fn auto_hide_allows_open(panes_json: &str, tab: &str, threshold: u16) -> bool {
     if threshold == 0 {
         return true;
     }
-    let fp = launch::focused_pane_in(panes_json, scope);
-    let Some((fid, _)) = fp.split_once('\t') else {
+    let pane = launch::pane_in_tab(panes_json, tab);
+    if pane.is_empty() {
         return true;
-    };
-    let Some(width) = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": fid }))
+    }
+    ipc::call_text("pane.layout", serde_json::json!({ "pane_id": pane }))
         .ok()
         .and_then(|layout| launch::layout_width(&layout))
-    else {
-        return true;
-    };
-    if autohide::should_hide(threshold, width) {
-        return false;
-    }
-    let _ = snooze::clear(&autohide::dir(), tab);
-    true
+        .is_none_or(|width| !autohide::should_hide(threshold, width))
 }
 
 fn snooze_tab_for_scope(panes_json: &str, scope: &str) -> String {

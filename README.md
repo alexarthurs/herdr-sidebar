@@ -112,8 +112,7 @@ Settings persist across tabs and restarts. Configure:
 **Auto-hide below** hides the sidebar while the tab is at most that many columns wide
 (64–200, or off), like herdr's own `ui.mobile_width_threshold`. The width is the tab area,
 which excludes herdr's own sidebar. Once the tab is wider than the setting again, the
-sidebar comes back within about a second on Linux and macOS. Tabs in the background, and
-Windows, get it back at the next pane, tab or workspace focus. A sidebar you hid with `b`
+sidebar comes back at the next pane, tab or workspace focus. A sidebar you hid with `b`
 stays hidden, and one you open yourself in a narrow tab stays open until the tab has been
 wide again. With separate panes, only Explorer auto-hides.
 

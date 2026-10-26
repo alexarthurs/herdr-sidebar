@@ -1,30 +1,14 @@
 //! Auto-hide in narrow tabs: the counterpart of herdr's own
 //! `ui.mobile_width_threshold` for this plugin's pane. When the whole tab
-//! area is at or below the configured column count, a docked sidebar hides
-//! itself; the quiet ensure hook docks it again once the tab is wide enough.
+//! area is at or below the configured column count, a docked sidebar closes
+//! itself; the quiet ensure hook declines to dock one into a tab that narrow
+//! and docks it again at the first focus event once the tab is wider.
 //!
-//! Plugins cannot hook herdr's `layout.updated` event, and a hidden sidebar
-//! has no pane left to receive resizes. So hiding also starts a small
-//! detached watcher (unix) that polls the tab width and runs the quiet ensure
-//! hook once the tab is wide again, while that tab is the focused one.
-//! Background tabs, and Windows, reopen at the next focus event instead.
-//!
-//! The marker is per tab and separate from [`crate::snooze`]: a sidebar the
-//! user hid (« / b) stays hidden however wide the tab gets, while one hidden
-//! for width comes back on its own. Markers for tabs that no longer exist are
-//! swept with the snooze markers.
-
-use std::path::PathBuf;
-use std::time::Duration;
-
-/// How often a watcher re-reads the width of its auto-hidden tab.
-const WATCH_EVERY: Duration = Duration::from_secs(1);
-/// Consecutive socket failures after which a watcher assumes herdr is gone.
-const WATCH_MAX_FAILURES: u32 = 10;
-
-pub fn dir() -> PathBuf {
-    crate::rundir::dir("autohide")
-}
+//! There is deliberately no marker and no watcher process. Plugins cannot
+//! hook herdr's `layout.updated`, so coming back "on its own" would need a
+//! detached poller per hidden tab; the width check in the ensure hook is
+//! stateless, works on every platform, and a user snooze (« / b) still wins
+//! because the hook checks it first.
 
 /// A tab `width` columns wide is too narrow for a sidebar. `threshold` 0
 /// means the setting is off. The width is the whole tab area, which opening
@@ -60,113 +44,33 @@ impl Latch {
     }
 }
 
-/// Mark this pane's tab as auto-hidden and close the pane. The marker is
-/// written before the close for the same reason as the snooze marker: a focus
-/// event landing in between must see it. The caller saves anything a direct
-/// pane close would lose first.
-pub fn hide_pane(pane_id: &str) -> std::io::Result<()> {
-    let panes = crate::ipc::call_text("pane.list", serde_json::json!({}))?;
-    let tab = crate::launch::tab_of(&panes, pane_id);
-    if tab.is_empty() {
-        return Err(std::io::Error::other("could not resolve this tab"));
-    }
-    let dir = dir();
-    crate::snooze::set(&dir, &tab)?;
-    // Best effort: without a watcher the tab still reopens on the next focus.
-    #[cfg(unix)]
-    let _ = spawn_watcher(&tab);
-    if let Err(e) = crate::ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id })) {
-        let _ = crate::snooze::clear(&dir, &tab);
-        return Err(e);
-    }
-    Ok(())
-}
-
-/// Start `--autohide-watch <tab>` in a session of its own: herdr hangs up
-/// the whole session of the pane it closes, and the sidebar pane is about to
-/// close.
-#[cfg(unix)]
-fn spawn_watcher(tab: &str) -> std::io::Result<()> {
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
-    let mut command = Command::new(std::env::current_exe()?);
-    command
-        .args(["--autohide-watch", tab])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // SAFETY: setsid is async-signal-safe and touches no parent state.
-    unsafe {
-        command.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    command.spawn().map(|_| ())
-}
-
-/// The watcher loop behind `--autohide-watch <tab>`. It exits once the tab's
-/// auto-hide marker is gone (reopened by it, a focus hook or the toggle), the
-/// user snoozed the tab, the tab closed, or herdr stopped answering.
-pub fn watch(tab: &str) -> std::io::Result<()> {
-    if tab.is_empty() {
-        return Err(std::io::Error::other("--autohide-watch needs a tab id"));
-    }
-    let dir = dir();
-    let snooze_dir = crate::snooze::dir();
-    let mut failures = 0;
-    loop {
-        std::thread::sleep(WATCH_EVERY);
-        if !crate::snooze::is_set(&dir, tab) || crate::snooze::is_set(&snooze_dir, tab) {
-            return Ok(());
-        }
-        let Ok(panes) = crate::ipc::call_text("pane.list", serde_json::json!({})) else {
-            failures += 1;
-            if failures >= WATCH_MAX_FAILURES {
-                return Ok(());
-            }
-            continue;
-        };
-        failures = 0;
-        if !crate::launch::live_tabs(&panes).is_some_and(|tabs| tabs.contains(tab)) {
-            return Ok(());
-        }
-        // Docking into a background tab could move focus; the tab.focused
-        // hook covers it when the user switches there.
-        if crate::launch::focused_tab(&panes) != tab {
-            continue;
-        }
-        let fp = crate::launch::focused_pane_in(&panes, tab);
-        let Some((pane_id, _)) = fp.split_once('\t') else {
-            continue;
-        };
-        let Some(width) =
-            crate::ipc::call_text("pane.layout", serde_json::json!({ "pane_id": pane_id }))
-                .ok()
-                .and_then(|layout| crate::launch::layout_width(&layout))
-        else {
-            continue;
-        };
-        let threshold = crate::state::load_state().auto_hide_below;
-        if !should_hide(threshold, width) {
-            // The quiet hook re-checks everything (snooze, auto-open, width)
-            // and clears the marker when it docks; if it skipped, for
-            // example on a busy launch lock, the next tick retries.
-            let _ = std::process::Command::new(std::env::current_exe()?)
-                .arg("--ensure")
-                .env("HERDR_TAB_ID", tab)
-                .env_remove("HERDR_PLUGIN_EVENT_JSON")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
-    }
+/// Whether `pane_id` shares its tab with any other pane. Closing the last
+/// pane closes the whole tab, which auto-hide must never do (a sidebar left
+/// alone in a preview tab, for example).
+pub fn has_company(pane_list_json: &str, pane_id: &str) -> bool {
+    let tab = crate::launch::tab_of(pane_list_json, pane_id);
+    !tab.is_empty() && crate::launch::tab_pane_count(pane_list_json, &tab) > 1
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sidebar_alone_in_its_tab_never_auto_hides() {
+        let list = |panes: &str| format!(r#"{{"result":{{"panes":[{panes}]}}}}"#);
+        let alone =
+            list(r#"{"pane_id":"w1:p3","tab_id":"w1:t2"},{"pane_id":"w1:p1","tab_id":"w1:t1"}"#);
+        assert!(!has_company(&alone, "w1:p3"));
+        let shared =
+            list(r#"{"pane_id":"w1:p3","tab_id":"w1:t1"},{"pane_id":"w1:p1","tab_id":"w1:t1"}"#);
+        assert!(has_company(&shared, "w1:p3"));
+        assert!(!has_company("not json", "w1:p3"));
+        assert!(
+            !has_company(&shared, "w1:p9"),
+            "an unknown pane counts as alone"
+        );
+    }
 
     #[test]
     fn off_never_hides() {

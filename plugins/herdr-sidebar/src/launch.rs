@@ -826,6 +826,17 @@ pub fn tab_of(pane_list_json: &str, pane_id: &str) -> String {
         .unwrap_or_default()
 }
 
+/// How many panes live in `tab_id` (0 when unknown or unparsable).
+pub fn tab_pane_count(pane_list_json: &str, tab_id: &str) -> usize {
+    serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)).map_or(0, |msg| {
+        msg.result
+            .panes
+            .iter()
+            .filter(|p| p.tab_id.as_deref() == Some(tab_id))
+            .count()
+    })
+}
+
 /// Any pane living in `tab_id` ("" when the tab is empty or unknown). The
 /// preview flow needs one because herdr 0.9 moves the VIEWING client only on
 /// `pane.focus`; `tab.focus` updates the session-wide record and nothing else.
