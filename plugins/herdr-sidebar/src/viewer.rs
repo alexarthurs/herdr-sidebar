@@ -394,9 +394,10 @@ struct Doc {
     /// The (width, height, wrap, side by side) `rows` was built for; `None`
     /// until first draw.
     rows_key: Option<(u16, u16, bool, bool)>,
-    /// A diff's raw `git diff` text, kept so it can be laid out side by side
-    /// at the pane's width. `None` for everything that is not a diff.
-    diff: Option<DiffSource>,
+    /// A diff, already highlighted on the load worker, kept so it can be
+    /// laid out side by side at the pane's width without re-running syntect.
+    /// `None` for everything that is not a diff.
+    diff: Option<crate::diffview::StyledDiff>,
     /// Show this diff side by side (`v`); starts from the saved setting.
     split: bool,
     /// Source line to scroll back to once `rows` is rebuilt — how a wrap
@@ -407,12 +408,6 @@ struct Doc {
     /// A file preview's modified-time/size stamp, taken on the load worker
     /// BEFORE the content was read: the baseline later polls compare against.
     stamp: Option<FileStamp>,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct DiffSource {
-    rel: String,
-    text: String,
 }
 
 /// Narrower than this, a side-by-side diff leaves too little room per
@@ -455,7 +450,7 @@ impl Doc {
             self.rows = if let Some(media) = &self.media {
                 render_media_rows(media, width, height)
             } else if let (true, Some(diff)) = (split, &self.diff) {
-                crate::diffview::render_split(&diff.rel, &diff.text, usize::from(width), self.wrap)
+                crate::diffview::render_split_styled(diff, usize::from(width), self.wrap)
                     .into_iter()
                     .map(|(src, line)| Row { src, line })
                     .collect()
@@ -1912,11 +1907,12 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
                     vec![Line::raw(format!("({})", err.trim()))]
                 }
             } else {
-                diff = Some(DiffSource {
-                    rel: rel.to_string(),
-                    text: text.to_string(),
-                });
-                crate::diffview::render(rel, &text)
+                // Highlight once here, on the load worker; a resize only
+                // re-runs the side-by-side column layout from this.
+                let styled = crate::diffview::style(rel, &text);
+                let lines = crate::diffview::render_styled(&styled);
+                diff = Some(styled);
+                lines
             }
         }
     };
@@ -4079,10 +4075,7 @@ mod tests {
     fn diff_lays_out_side_by_side_when_toggled_and_wide_enough() {
         let text = "@@ -1,2 +1,2 @@\n keep\n-old line\n+new line\n";
         let mut doc = doc_of(crate::diffview::render("a.txt", text), false);
-        doc.diff = Some(DiffSource {
-            rel: "a.txt".into(),
-            text: text.into(),
-        });
+        doc.diff = Some(crate::diffview::style("a.txt", text));
 
         doc.relayout(80, 20);
         assert_eq!(doc.rows.len(), 3, "unified: one row per diff line");

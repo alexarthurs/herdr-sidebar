@@ -1052,9 +1052,12 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   `diffview::render_split` lays the same parsed, highlighted events out in two columns —
   old left, new right, `│` between — pairing each run of deletions with the additions
   that follow it (leftovers get an empty other side, no tint). It needs the pane width,
-  so a diff `Doc` keeps its raw `git diff` text (`Doc::diff`) and `relayout` calls
-  `render_split` instead of `build_rows`; `rows_key` includes the layout so a toggle or a
-  resize rebuilds. Each column wraps on its own (`wrap::wrap_line` per side, continuations
+  so a diff `Doc` keeps the parsed, ALREADY HIGHLIGHTED `diffview::StyledDiff`
+  (`Doc::diff`, built by `diffview::style` in `load_diff` on the load worker) and `relayout`
+  calls `render_split_styled` instead of `build_rows`; `rows_key` includes the layout so a
+  toggle or a resize rebuilds. Never keep the raw text and re-parse in `relayout`: that runs
+  syntect over the whole diff on the UI thread on every width change, so a resize drag over
+  a large diff stalled input (review finding on #110). Each column wraps on its own (`wrap::wrap_line` per side, continuations
   get a blank gutter, the shorter side is padded with its tint), and `w` off clips each
   column instead. Every row comes back exactly `width` wide with per-side tints on the
   spans, so `build_rows`' full-width padding is not involved. Rows are tagged with the

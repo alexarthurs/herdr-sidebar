@@ -252,11 +252,35 @@ fn styled(rel: &str, diff: &str) -> (Vec<Styled>, usize) {
     (out, w)
 }
 
+/// A diff parsed and highlighted ONCE, on the viewer's load worker. syntect
+/// over a large diff is slow, and the side-by-side layout depends on the
+/// pane width, so a resize must only re-run the cheap column layout from
+/// here, never the highlighter on the UI thread.
+pub struct StyledDiff {
+    lines: Vec<Styled>,
+    number_width: usize,
+}
+
+/// Parse and highlight `diff` for `rel` (its extension picks the grammar).
+pub fn style(rel: &str, diff: &str) -> StyledDiff {
+    let (lines, number_width) = styled(rel, diff);
+    StyledDiff {
+        lines,
+        number_width,
+    }
+}
+
 /// Render a unified diff for `rel` (its extension picks the grammar) into
 /// display lines: `old new ±` gutters, tinted rows, highlighted code. Each
 /// diff line is one display line, in order.
+#[cfg(test)]
 pub fn render(rel: &str, diff: &str) -> Vec<Line<'static>> {
-    let (evs, w) = styled(rel, diff);
+    render_styled(&style(rel, diff))
+}
+
+/// [`render`] from an already styled diff.
+pub fn render_styled(diff: &StyledDiff) -> Vec<Line<'static>> {
+    let (evs, w) = (&diff.lines, diff.number_width);
 
     let gutter = |o: Option<usize>, n: Option<usize>, mark: &str, mark_fg: Color| {
         let fmt = |v: Option<usize>| match v {
@@ -270,31 +294,31 @@ pub fn render(rel: &str, diff: &str) -> Vec<Line<'static>> {
     };
 
     let colors = palette();
-    evs.into_iter()
+    evs.iter()
         .map(|ev| match ev {
             Styled::Hunk => Line::from(Span::styled(
                 format!("{}⋯", " ".repeat(w * 2 + 2)),
                 Style::default().dim(),
             )),
-            Styled::Plain(t) => Line::from(Span::styled(t, Style::default().dim())),
+            Styled::Plain(t) => Line::from(Span::styled(t.clone(), Style::default().dim())),
             Styled::Ctx {
                 old,
                 new,
                 new_spans,
                 ..
             } => {
-                let mut all = gutter(Some(old), Some(new), " ", Color::Reset);
-                all.extend(new_spans);
+                let mut all = gutter(Some(*old), Some(*new), " ", Color::Reset);
+                all.extend(new_spans.iter().cloned());
                 Line::from(all)
             }
             Styled::Del(o, spans) => {
-                let mut all = gutter(Some(o), None, "-", colors.diff_del_mark);
-                all.extend(spans);
+                let mut all = gutter(Some(*o), None, "-", colors.diff_del_mark);
+                all.extend(spans.iter().cloned());
                 Line::from(all).style(Style::default().bg(colors.diff_del_bg))
             }
             Styled::Add(n, spans) => {
-                let mut all = gutter(None, Some(n), "+", colors.diff_add_mark);
-                all.extend(spans);
+                let mut all = gutter(None, Some(*n), "+", colors.diff_add_mark);
+                all.extend(spans.iter().cloned());
                 Line::from(all).style(Style::default().bg(colors.diff_add_bg))
             }
         })
@@ -317,13 +341,23 @@ struct Half {
 /// viewer can keep its place when the layout toggles. Long lines wrap
 /// within their column (or are clipped when `wrap` is off), and every row
 /// is exactly `width` columns.
+#[cfg(test)]
 pub fn render_split(
     rel: &str,
     diff: &str,
     width: usize,
     wrap: bool,
 ) -> Vec<(usize, Line<'static>)> {
-    let (evs, w) = styled(rel, diff);
+    render_split_styled(&style(rel, diff), width, wrap)
+}
+
+/// [`render_split`] from an already styled diff: layout only, no syntect.
+pub fn render_split_styled(
+    diff: &StyledDiff,
+    width: usize,
+    wrap: bool,
+) -> Vec<(usize, Line<'static>)> {
+    let (evs, w) = (&diff.lines, diff.number_width);
     let colors = palette();
     let left_w = width.saturating_sub(1) / 2;
     let right_w = width.saturating_sub(1) - left_w;
