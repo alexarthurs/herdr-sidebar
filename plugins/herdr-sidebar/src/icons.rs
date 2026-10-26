@@ -202,6 +202,9 @@ enum Kind {
     Text,
     Log,
     Pdf,
+    Word,
+    Spreadsheet,
+    Slides,
     Image,
     Audio,
     Video,
@@ -279,6 +282,10 @@ fn extension_kind(ext: &str) -> Kind {
         "txt" => Kind::Text,
         "log" => Kind::Log,
         "pdf" => Kind::Pdf,
+        // Deliberately not `dot` (Graphviz), `pot` (gettext) or `key` (TLS keys).
+        "doc" | "docx" | "docm" | "dotx" | "dotm" | "odt" | "rtf" => Kind::Word,
+        "xls" | "xlsx" | "xlsm" | "xlsb" | "xltx" | "xltm" | "ods" => Kind::Spreadsheet,
+        "ppt" | "pptx" | "pptm" | "pps" | "ppsx" | "potx" | "potm" | "odp" => Kind::Slides,
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "svg" | "tiff" => Kind::Image,
         "mp3" | "wav" | "flac" | "ogg" => Kind::Audio,
         "mp4" | "mkv" | "avi" | "mov" | "webm" => Kind::Video,
@@ -322,6 +329,9 @@ fn emoji(kind: Kind) -> &'static str {
         Kind::Text => "📄",
         Kind::Log => "📋",
         Kind::Pdf => "📕",
+        Kind::Word => "📘",
+        Kind::Spreadsheet => "📗",
+        Kind::Slides => "📙",
         Kind::Image => "📷",
         Kind::Audio => "🎵",
         Kind::Video => "🎬",
@@ -374,6 +384,9 @@ fn material(kind: Kind) -> (&'static str, (u8, u8, u8)) {
         Kind::Text => ("\u{f15c}", (0x9e, 0x9e, 0x9e)), //  text grey
         Kind::Log => ("\u{f15c}", (0x75, 0x75, 0x75)), //  log dark grey
         Kind::Pdf => ("\u{f1c1}", (0xe5, 0x39, 0x35)), //  pdf red
+        Kind::Word => ("\u{f022c}", (0x2b, 0x7c, 0xd3)), // word blue
+        Kind::Spreadsheet => ("\u{f021b}", (0x21, 0xa3, 0x66)), // excel green
+        Kind::Slides => ("\u{f0227}", (0xd3, 0x52, 0x30)), // powerpoint orange
         Kind::Image => ("\u{f1c5}", (0x26, 0xa6, 0x9a)), //  image teal
         Kind::Audio => ("\u{f1c7}", (0xec, 0x40, 0x7a)), //  audio pink
         Kind::Video => ("\u{f1c8}", (0xff, 0x70, 0x43)), //  video orange
@@ -421,6 +434,26 @@ mod tests {
     fn extensions_are_case_insensitive() {
         assert_eq!(emoji_for("MAIN.RS", false, false), "🦀");
         assert_eq!(emoji_for("photo.JPG", false, false), "📷");
+    }
+
+    #[test]
+    fn office_documents_get_their_own_icons() {
+        for (name, emoji, glyph) in [
+            ("report.docx", "📘", "\u{f022c}"),
+            ("Notes.ODT", "📘", "\u{f022c}"),
+            ("budget.xlsx", "📗", "\u{f021b}"),
+            ("legacy.XLS", "📗", "\u{f021b}"),
+            ("deck.pptx", "📙", "\u{f0227}"),
+            ("talk.odp", "📙", "\u{f0227}"),
+        ] {
+            assert_eq!(emoji_for(name, false, false), emoji, "{name}");
+            assert_eq!(icon(IconTheme::Material, name, false, false).glyph, glyph);
+        }
+        // Same extensions, other meanings; CSV keeps its own sheet icon.
+        assert_eq!(emoji_for("graph.dot", false, false), "📄");
+        assert_eq!(emoji_for("messages.pot", false, false), "📄");
+        assert_eq!(emoji_for("server.key", false, false), "📄");
+        assert_eq!(emoji_for("data.csv", false, false), "📊");
     }
 
     #[test]
