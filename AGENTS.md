@@ -1127,6 +1127,11 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   scripts) falls back to highlighted source, as does any line-target request. Unlike glow it
   runs inside the viewer, so a panic in it would leave the `loading preview…` frame up (the
   worker's channel just disconnects), the same exposure the in-process image decoder has.
+  html2text's layout cost grows with the SQUARE of element nesting (its size estimate is
+  recursive): a 1 MiB file of nested `<div>`s pinned a core for ~2 minutes in review, and a
+  load worker cannot be cancelled — every resize started another. Documents over 256 KiB, or
+  whose cheap tag pre-scan (`html_nesting_exceeds`) passes 1024 levels, show their source
+  instead; measured in release at those bounds: depth 1000 ≈ 3 ms, a 256 KiB table ≈ 70 ms.
 - Raster image previews are decoded in-process and rendered as true-color `▀` cells (foreground
   = upper pixel, background = lower pixel), so they work through herdr's terminal compositor
   without Kitty/Sixel passthrough. They preserve aspect ratio, center, and rebuild from the

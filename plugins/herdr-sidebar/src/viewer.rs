@@ -1349,6 +1349,9 @@ fn glow_args(width: u16, light: bool) -> Vec<String> {
 /// targets are listed as numbered footnotes, since the preview cannot follow
 /// a link.
 fn html_document(text: &str, width: u16) -> Option<Vec<Line<'static>>> {
+    if text.len() > MAX_HTML_BYTES || html_nesting_exceeds(text, MAX_HTML_DEPTH) {
+        return None;
+    }
     let rendered = html2text::config::rich()
         .allow_width_overflow()
         .link_footnotes(true)
@@ -1358,16 +1361,72 @@ fn html_document(text: &str, width: u16) -> Option<Vec<Line<'static>>> {
         .lines_from_read(text.as_bytes(), usize::from(width))
         .ok()?;
     let colors = palette();
-    let lines: Vec<Line<'static>> = rendered
+    let mut lines: Vec<Line<'static>> = rendered
         .iter()
         .take(MAX_LINES)
         .map(|line| html_line(line, &colors))
         .collect();
-    lines
+    let visible = lines
         .iter()
         .flat_map(|line| line.spans.iter())
-        .any(|span| !span.content.trim().is_empty())
-        .then_some(lines)
+        .any(|span| !span.content.trim().is_empty());
+    // The caller's truncation marker counts SOURCE lines, which a short
+    // document of long paragraphs can stay under.
+    if rendered.len() > MAX_LINES && text.lines().count() <= MAX_LINES {
+        lines.push(Line::raw("… (truncated)"));
+    }
+    visible.then_some(lines)
+}
+
+/// html2text's layout cost grows with the square of element nesting (its
+/// size estimate is recursive): 1 MiB of nested `<div>`s pinned a core for
+/// two minutes, and work inside the load worker cannot be cancelled — each
+/// resize would start another. Documents past these bounds show their source.
+const MAX_HTML_BYTES: usize = 256 * 1024;
+const MAX_HTML_DEPTH: usize = 1024;
+
+/// A cheap upper bound on element nesting: opening tags deepen, closing tags
+/// return. Void and self-closed elements never deepen, comments and
+/// declarations are skipped. Unclosed `<p>`/`<li>` only over-count, which
+/// errs toward showing the source.
+fn html_nesting_exceeds(text: &str, limit: usize) -> bool {
+    const VOID: &[&str] = &[
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source",
+        "track", "wbr",
+    ];
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while let Some(offset) = bytes[i..].iter().position(|&b| b == b'<') {
+        let start = i + offset + 1;
+        let Some(len) = bytes[start..].iter().position(|&b| b == b'>') else {
+            break;
+        };
+        let tag = &text[start..start + len];
+        i = start + len + 1;
+        if let Some(name) = tag.strip_prefix('/') {
+            if !name.is_empty() {
+                depth = depth.saturating_sub(1);
+            }
+            continue;
+        }
+        let name = tag
+            .split(|c: char| c.is_ascii_whitespace() || c == '/')
+            .next()
+            .unwrap_or_default();
+        if name.is_empty()
+            || name.starts_with(['!', '?'])
+            || tag.ends_with('/')
+            || VOID.iter().any(|v| name.eq_ignore_ascii_case(v))
+        {
+            continue;
+        }
+        depth += 1;
+        if depth > limit {
+            return true;
+        }
+    }
+    false
 }
 
 /// One rendered HTML line as styled spans. html2text marks a heading only by
@@ -5507,6 +5566,26 @@ mod tests {
         let text = html_text(&html_document(html, 80).expect("html renders")).join("\n");
         assert!(text.contains("visible"));
         assert!(!text.contains("alert") && !text.contains("color"), "{text}");
+    }
+
+    #[test]
+    fn deep_or_huge_html_shows_its_source_instead_of_stalling_the_loader() {
+        let nested = |depth: usize| format!("{}x{}", "<div>".repeat(depth), "</div>".repeat(depth));
+        assert!(!html_nesting_exceeds(
+            &nested(MAX_HTML_DEPTH),
+            MAX_HTML_DEPTH
+        ));
+        assert!(html_nesting_exceeds(
+            &nested(MAX_HTML_DEPTH + 1),
+            MAX_HTML_DEPTH
+        ));
+        assert!(html_document(&nested(MAX_HTML_DEPTH + 1), 80).is_none());
+        // Siblings, void elements, self-closing tags and comments never deepen.
+        let flat = "<p>a</p><br><img src=x><hr/><!-- c --><!doctype html>".repeat(2000);
+        assert!(!html_nesting_exceeds(&flat, 8));
+        let huge = "<p>word</p>".repeat(MAX_HTML_BYTES / 11 + 1);
+        assert!(huge.len() > MAX_HTML_BYTES);
+        assert!(html_document(&huge, 80).is_none());
     }
 
     #[test]
