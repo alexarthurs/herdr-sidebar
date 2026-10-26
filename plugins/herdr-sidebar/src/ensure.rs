@@ -440,9 +440,10 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
         panes = ipc::call_text("pane.list", serde_json::json!({}))?;
     }
     let snooze_dir = snooze::dir();
-    let live_tabs = launch::live_tabs(&panes);
-    snooze::migrate_legacy(&snooze_dir, &live_tabs);
-    snooze::sweep(&snooze_dir, &live_tabs);
+    if let Some(live_tabs) = launch::live_tabs(&panes) {
+        snooze::migrate_legacy(&snooze_dir, &live_tabs);
+        snooze::sweep(&snooze_dir, &live_tabs);
+    }
     let now = crate::state::unix_now();
     let decision_view = activation.map_or(view, |target| match target {
         Target::SourceControl => View::SourceControl,

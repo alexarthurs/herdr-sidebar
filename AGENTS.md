@@ -803,7 +803,14 @@ HACKING.md — budget time for that before promising a patched build.
 - There is NO collapse-to-sliver mode anymore (herdr's 10% ratio floor made the sliver
   a wide empty strip — user-rejected). « bottom-right / `b` HIDE the sidebar instead:
   per-tab snooze marker + `pane.close` of its own pane (`hide()` in both apps,
-  `src/snooze.rs` shared with the ensure hook, `launch::tab_of`). The herdr keybinding
+  `src/snooze.rs` shared with the ensure hook, `launch::tab_of`). Markers live in one
+  subdirectory per herdr SESSION (hash of the socket path, #115): tab ids like `w1:t1`
+  repeat across sessions, so a shared directory let one session honor — and its sweep
+  delete — another's markers. Sweep only against a `pane.list` that parsed
+  (`launch::live_tabs` returns `None` for an error reply, which has no tabs). Pre-#115 flat
+  markers are adopted only for this session's live tabs; the shared root is never swept.
+  The replace budget (`rundir("launch")`) is still shared across sessions — harmless, it is
+  time-swept. The herdr keybinding
   `prefix+b` (config.toml `[[keys.command]]` → the toggle action, like the other plugin
   binds) brings it back — or hides it again when it's focused.
 - **Esc must never exit a sidebar TUI** — a stray Esc used to drop the pane back to the

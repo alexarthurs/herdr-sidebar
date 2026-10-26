@@ -886,8 +886,11 @@ pub fn workspace_of(pane_list_json: &str, pane_id: &str) -> String {
 
 /// All tab ids present in a `pane list` JSON — the live-tab set the snooze
 /// cleanup checks markers against.
-pub fn live_tabs(pane_list_json: &str) -> std::collections::BTreeSet<String> {
+/// Every tab id in a `pane.list` reply, or `None` when it is not a successful
+/// reply — an error has no tabs, which is not the same as "no live tabs".
+pub fn live_tabs(pane_list_json: &str) -> Option<std::collections::BTreeSet<String>> {
     serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json))
+        .ok()
         .map(|msg| {
             msg.result
                 .panes
@@ -895,7 +898,6 @@ pub fn live_tabs(pane_list_json: &str) -> std::collections::BTreeSet<String> {
                 .filter_map(|p| p.tab_id)
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// The created pane's id from a `pane.split` response
@@ -1721,12 +1723,16 @@ mod tests {
         assert_eq!(focused_tab(&json), "w1:t1");
         assert_eq!(focused_workspace(&json), "w1");
         assert_eq!(
-            live_tabs(&json).into_iter().collect::<Vec<_>>(),
+            live_tabs(&json).unwrap().into_iter().collect::<Vec<_>>(),
             vec!["w1:t1".to_string(), "w1:t2".to_string()]
         );
         assert_eq!(focused_tab("not json"), "");
         assert_eq!(focused_workspace("not json"), "");
-        assert!(live_tabs("not json").is_empty());
+        assert_eq!(live_tabs("not json"), None);
+        assert_eq!(
+            live_tabs(r#"{"error":{"code":"timeout","message":"busy"}}"#),
+            None
+        );
     }
 
     #[test]
