@@ -846,7 +846,8 @@ HACKING.md — budget time for that before promising a patched build.
   - `App::new` does no status read: it draws at once ("loading…" header, `…` repo branches)
     and restores the saved selection/scroll when the first current result applies; a close
     before that persists the saved values instead of "nothing selected".
-  - Status (30s) and drawer queries (10s) go through the bounded `run_read_in_with_timeout`
+  - Status (120s — a bound a huge `-uall` worktree could never meet would mean the view never
+    loads) and drawer queries (10s) go through the bounded `run_read_in_with_timeout`
     (`GIT_OPTIONAL_LOCKS=0`, Job Object tree-kill on Windows), so a hung git cannot strand the
     worker. Its poll naps start at 1ms so fast reads are not taxed 25ms each.
   - Between an action and its follow-up read the displayed status is stale (`stale()`):

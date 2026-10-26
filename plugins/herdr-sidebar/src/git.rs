@@ -14,8 +14,9 @@ const IGNORED_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Status runs on background workers (the SCM view's status worker, the
 /// Explorer's decoration worker); the bound only keeps a hung git — a stalled
 /// network drive, say — from stranding that worker forever. Generous, because
-/// `-uall` in a very large worktree legitimately takes many seconds.
-const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
+/// `-uall` in a very large worktree legitimately takes many seconds and a
+/// bound it can never meet would mean the view never loads at all.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(120);
 /// Drawer queries are capped log/ref listings; the same stranding guard.
 const DRAWER_TIMEOUT: Duration = Duration::from_secs(10);
 
