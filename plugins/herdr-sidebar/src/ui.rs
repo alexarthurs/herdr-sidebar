@@ -417,6 +417,19 @@ pub fn wrap_hints(
     lines.into_iter().map(Line::from).collect()
 }
 
+/// The longest "how to open the menu" footer hint that fits in `width`
+/// columns, so a narrow sidebar shows a shorter hint instead of a clipped one.
+pub fn fit_menu_hint(width: u16) -> &'static str {
+    [
+        "m / ctrl+rclick for menus",
+        "m / ctrl+rclick: menu",
+        "m: menu",
+    ]
+    .into_iter()
+    .find(|hint| Span::raw(*hint).width() <= usize::from(width))
+    .unwrap_or("")
+}
+
 /// A subtle right-edge scrollbar when the list overflows its viewport.
 /// Purely an indicator: the wheel scrolls, the bar just shows where.
 pub fn draw_scrollbar(frame: &mut Frame, area: Rect, total: usize, viewport: usize, pos: usize) {
@@ -701,6 +714,15 @@ pub fn sibling_panes_of(pane_list_json: &str, my_pane_id: &str, other: View) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fit_menu_hint_shrinks_to_fit() {
+        assert_eq!(fit_menu_hint(40), "m / ctrl+rclick for menus");
+        assert_eq!(fit_menu_hint(25), "m / ctrl+rclick for menus");
+        assert_eq!(fit_menu_hint(24), "m / ctrl+rclick: menu");
+        assert_eq!(fit_menu_hint(10), "m: menu");
+        assert_eq!(fit_menu_hint(6), "");
+    }
 
     /// Perceived brightness on a 0..1 scale, the measure `darken_for_light`
     /// caps.
