@@ -258,7 +258,12 @@ Pane geometry & CLI semantics:
   `overlay|popup|split|tab|zoomed` — plugins cannot add workspace-level chrome (e.g. a real
   sidebar next to herdr's own); the closest approximation is a per-tab dock via event hooks.
   There is also no way to insert a pane at a tab's layout root: a full-height left column is
-  only achievable by docking while the tab still has a single pane.
+  only achievable by docking while the tab still has a single pane. The ensure hook's
+  full-height repair (`launch::repair_step`) therefore only re-parents a pane under the
+  sidebar when it spans EXACTLY the sidebar plus its neighbour — the lower half of the pane
+  the sidebar was split from. Moving the panes of a separate bottom row ("1 top + N bottom")
+  restacked that row into a column, and closing the sidebar cannot move them back (#114);
+  those layouts keep a partial-height sidebar.
 
 Manifest `[[events]]` hooks (undocumented in CLI help; see herdr `src/api/schema/events.rs`):
 

@@ -996,6 +996,14 @@ pub struct RepairStep {
 /// same-tab moves) grows the sidebar to full height. `None` when already full
 /// height or the layout doesn't match. Called in a loop: each step removes one
 /// pane from under the sidebar.
+///
+/// A step is taken only when `below` spans exactly the sidebar plus `beside`,
+/// i.e. it is the lower half of the very pane the sidebar was split from, so
+/// the move keeps the user's structure. Under a "1 top + N bottom" layout the
+/// panes below the sidebar belong to a separate row: moving them one by one
+/// restacked that row into a column under the top pane, and closing the
+/// sidebar cannot move them back (issue #114). Those layouts keep a
+/// partial-height sidebar instead.
 pub fn repair_step(layout_json: &str, pane_id: &str, dock_right: bool) -> Option<RepairStep> {
     let msg = serde_json::from_str::<LayoutMsg>(strip_bom(layout_json)).ok()?;
     let layout = &msg.result.layout;
@@ -1010,21 +1018,30 @@ pub fn repair_step(layout_json: &str, pane_id: &str, dock_right: bool) -> Option
     if me.height >= area.height {
         return None;
     }
-    let find = |pred: &dyn Fn(&Rect) -> bool| -> Option<String> {
+    let find = |pred: &dyn Fn(&Rect) -> bool| -> Option<(String, &Rect)> {
         layout
             .panes
             .iter()
             .filter(|p| p.pane_id.as_deref() != Some(pane_id))
             .filter_map(|p| Some((p.pane_id.as_deref()?, p.rect.as_ref()?)))
             .find(|(id, rect)| is_flag_safe(id) && pred(rect))
-            .map(|(id, _)| id.to_string())
+            .map(|(id, rect)| (id.to_string(), rect))
     };
-    let below = find(&|r: &Rect| r.y == me.y + me.height && r.x <= me.x && me.x < r.x + r.width)?;
-    let beside = if dock_right {
+    let (below, below_rect) =
+        find(&|r: &Rect| r.y == me.y + me.height && r.x <= me.x && me.x < r.x + r.width)?;
+    let (beside, beside_rect) = if dock_right {
         find(&|r: &Rect| r.x + r.width == me.x && r.y == me.y)?
     } else {
         find(&|r: &Rect| r.x == me.x + me.width && r.y == me.y)?
     };
+    let (left, right) = if dock_right {
+        (beside_rect.x, me.x + me.width)
+    } else {
+        (me.x, beside_rect.x + beside_rect.width)
+    };
+    if below_rect.x != left || below_rect.x + below_rect.width != right {
+        return None;
+    }
     Some(RepairStep {
         below,
         beside,
@@ -1807,6 +1824,37 @@ mod tests {
         assert!(repair_step(&full, "e", false).is_none());
         assert!(repair_step(&full, "missing", false).is_none());
         assert!(repair_step("not json", "e", false).is_none());
+    }
+
+    #[test]
+    fn repair_step_leaves_a_separate_bottom_row_alone() {
+        // Issue #114: one full-width top pane over three bottom panes. The
+        // sidebar split the top pane; the bottom row is not part of that
+        // pane, so moving its panes would restack the row into a column.
+        let left = layout_with_area(
+            r#"{"pane_id":"e","rect":{"x":0,"y":0,"width":32,"height":25}},
+               {"pane_id":"top","rect":{"x":32,"y":0,"width":148,"height":25}},
+               {"pane_id":"b1","rect":{"x":0,"y":25,"width":60,"height":25}},
+               {"pane_id":"b2","rect":{"x":60,"y":25,"width":60,"height":25}},
+               {"pane_id":"b3","rect":{"x":120,"y":25,"width":60,"height":25}}"#,
+        );
+        assert!(repair_step(&left, "e", false).is_none());
+        let right = layout_with_area(
+            r#"{"pane_id":"top","rect":{"x":0,"y":0,"width":148,"height":25}},
+               {"pane_id":"e","rect":{"x":148,"y":0,"width":32,"height":25}},
+               {"pane_id":"b1","rect":{"x":0,"y":25,"width":60,"height":25}},
+               {"pane_id":"b2","rect":{"x":60,"y":25,"width":60,"height":25}},
+               {"pane_id":"b3","rect":{"x":120,"y":25,"width":60,"height":25}}"#,
+        );
+        assert!(repair_step(&right, "e", true).is_none());
+        // A single bottom pane wider than the split pane is a separate row too.
+        let wide = layout_with_area(
+            r#"{"pane_id":"e","rect":{"x":0,"y":0,"width":32,"height":25}},
+               {"pane_id":"p1","rect":{"x":32,"y":0,"width":58,"height":25}},
+               {"pane_id":"p4","rect":{"x":90,"y":0,"width":90,"height":25}},
+               {"pane_id":"p7","rect":{"x":0,"y":25,"width":180,"height":25}}"#,
+        );
+        assert!(repair_step(&wide, "e", false).is_none());
     }
 
     #[test]
