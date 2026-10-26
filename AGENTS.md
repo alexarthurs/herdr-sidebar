@@ -815,6 +815,25 @@ HACKING.md — budget time for that before promising a patched build.
 - **Sync Changes** (`S` or the ⇅ button, shown only when ahead/behind ≠ 0): `pull --rebase
   --autostash` then `push`, on a background thread polled from tick(). Ahead/behind parse
   from the porcelain `## branch...upstream [ahead N, behind M]` header.
+- **Confirm risky Git ops** (`confirm_git_ops` in state.json, default false, issue #118; a
+  Settings row in BOTH views, re-read on tick like the other shared settings) puts a y/N in
+  front of one-click ops that rewrite history or touch the remote: Sync from EVERY entry point
+  and drawer Checkout / Merge / Cherry-Pick / Revert / Pop Stash. The decision and the
+  prompt text are one pure table, `gitconfirm::GitOp` (`needs_confirm`, `prompt`), shared by
+  both apps. Every SCM sync path (`S`, ⇅, Git footer, multi-repo header ⟳, the primary button
+  when `sync_is_primary`, Enter/Space on it) funnels through `sync_repo`, which asks and then
+  calls `start_sync`; the Explorer footer's `sync_git_footer` → `start_git_footer_sync` the
+  same way, parking a live Search overlay like the branch picker does. Never start a sync
+  worker except through those, or the setting silently stops covering that button. Sync runs
+  on a worker, not `run_git`, so it has its own `ConfirmSync` overlay; the drawer ops reuse
+  `ConfirmGit{args}` through `run_git_guarded`. Deliberately NOT guarded: Fetch (only moves
+  remote-tracking refs), stash apply / stash push (the stash entry or the work survives),
+  and the branch picker (already a deliberate open → choose two-step). Destructive ops
+  (discard, reset, delete branch/tag, stash drop, remove worktree) confirm regardless. The
+  setting row label is kept to 21 chars so `label + value + 5` fits the default 32-col pane;
+  prompts clear any flash/notice first, because the Explorer's `footer_message` shows a
+  pending notice INSTEAD of an overlay's confirm prompt (SCM's `footer_lines` prefers the
+  prompt, but a stale flash would reappear after the answer).
 - Branch labels are actions, not decoration: clicking the Source Control panel header, a
   multi-repo header's branch label, or either view's Git footer opens the shared `BranchPicker`.
   Local choices use a normal checkout; a remote choice creates its local tracking branch.

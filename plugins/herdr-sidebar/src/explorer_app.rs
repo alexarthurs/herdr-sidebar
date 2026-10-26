@@ -20,6 +20,7 @@ use unicode_width::UnicodeWidthChar;
 use herdr_sidebar::actions::{self, MenuAction, MenuEntry};
 use herdr_sidebar::branch_ui::{BranchPicker, FooterZones, PickerAction, draw_git_footer};
 use herdr_sidebar::git::{Git, Status};
+use herdr_sidebar::gitconfirm::{self, GitOp};
 use herdr_sidebar::gitdeco::{Decorations, RepoStatus};
 use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::ipc;
@@ -196,6 +197,10 @@ enum Overlay {
         path: PathBuf,
         is_dir: bool,
     },
+    /// The opt-in y/N before the Git footer's Sync (`confirm_git_ops`).
+    ConfirmSync {
+        prompt: String,
+    },
     /// The ⚙ settings modal: mouse-toggleable panel settings.
     Settings {
         selected: usize,
@@ -303,6 +308,7 @@ enum Setting {
     Hotkeys,
     GitDecorations,
     GitFooter,
+    ConfirmGitOps,
     Folder,
 }
 
@@ -573,6 +579,7 @@ impl App {
         self.sidebar_state.focus_on_open = shared.focus_on_open;
         self.sidebar_state.custom_editor_on_click = shared.custom_editor_on_click;
         self.sidebar_state.auto_hide_below = shared.auto_hide_below;
+        self.sidebar_state.confirm_git_ops = shared.confirm_git_ops;
         let old_git_footer = self.sidebar_state.show_git_footer;
         self.sidebar_state.show_git_footer = shared.show_git_footer;
         self.sidebar_state.syntax_dark = shared.syntax_dark;
@@ -1445,6 +1452,7 @@ impl App {
             AdjustWidth(bool),
             AdjustAutoHide(bool),
             DeleteConfirmed(PathBuf, bool),
+            SyncConfirmed,
             Picker(PickerAction),
         }
         let settings = self.settings_rows();
@@ -1774,6 +1782,10 @@ impl App {
                 }
                 _ => Cmd::Close,
             },
+            Some(Overlay::ConfirmSync { .. }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => Cmd::SyncConfirmed,
+                _ => Cmd::Close,
+            },
             None => Cmd::Nothing,
         };
         match cmd {
@@ -1806,6 +1818,11 @@ impl App {
                     Ok(()) => self.refresh_tree(),
                     Err(err) => self.notice = Some(format!("delete failed: {err}")),
                 }
+            }
+            Cmd::SyncConfirmed => {
+                // Resume a Search overlay parked under the prompt (else → tree).
+                self.overlay = self.suspended_search.take();
+                self.start_git_footer_sync();
             }
             Cmd::Picker(action) => self.handle_picker_action(action),
         }
@@ -1984,6 +2001,26 @@ impl App {
         };
         if !status.has_upstream {
             self.notice = Some("no upstream to sync with".into());
+            return;
+        }
+        let op = GitOp::Sync {
+            branch: &status.branch,
+            ahead: status.ahead,
+            behind: status.behind,
+        };
+        if op.needs_confirm(self.sidebar_state.confirm_git_ops) {
+            let prompt = op.prompt();
+            // A notice would mask the prompt (footer_message shows it first).
+            self.notice = None;
+            self.suspend_search_for_modal();
+            self.overlay = Some(Overlay::ConfirmSync { prompt });
+            return;
+        }
+        self.start_git_footer_sync();
+    }
+
+    fn start_git_footer_sync(&mut self) {
+        if self.git_syncing.is_some() {
             return;
         }
         let Some(git) = self.repos.first().cloned() else {
@@ -2654,6 +2691,17 @@ impl App {
                 true,
             ),
             (
+                Setting::ConfirmGitOps,
+                gitconfirm::SETTING_LABEL,
+                if self.sidebar_state.confirm_git_ops {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
                 Setting::Folder,
                 "Change folder…",
                 self.tree.root_name(),
@@ -2755,6 +2803,11 @@ impl App {
                 });
                 self.rediscover_repos();
                 self.request_decorations(true);
+            }
+            Setting::ConfirmGitOps => {
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.confirm_git_ops = !state.confirm_git_ops;
+                });
             }
             Setting::Folder => {
                 self.overlay = None;
@@ -3597,6 +3650,9 @@ impl App {
                 format!("Delete '{name}' permanently? (y/N)"),
                 palette().deleted,
             ));
+        }
+        if let Some(Overlay::ConfirmSync { prompt }) = &self.overlay {
+            return Some((prompt.clone(), palette().deleted));
         }
         None
     }
