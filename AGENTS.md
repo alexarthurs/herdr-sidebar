@@ -795,6 +795,36 @@ HACKING.md — budget time for that before promising a patched build.
   hidden pane never strands completed background work. A pane launched with
   `HERDR_SIDEBAR_BACKGROUND_REFRESH=1` (read once at startup, `state::BACKGROUND_REFRESH_ENV`)
   skips only that focus guard, for passive monitor panes; Explorer is unaffected.
+- **Status never runs on the UI thread** (issue #97: `status -uall` in a 239k-file repo froze
+  input and starved the heartbeat into a corpse REPLACE). ONE single-flight worker per SCM App
+  (`RefreshGate` + `status_rx`) reads every repo's status plus the active repo's expanded
+  drawers; the event loop collects it every iteration (`collect_status`) and polls at
+  `ANIMATION_FRAME` while a read is in flight. Rules:
+  - Every git action, `r`/Refresh, a finished sync, and a newly discovered repo set call
+    `request_refresh()`, which bumps the generation: an in-flight read predates the change, so
+    its result is DROPPED and one coalesced follow-up read starts when it returns (never a
+    second concurrent worker). An App rebuild (re-root/cwd-follow) gets a fresh channel.
+  - Periodic reads come from `tick()` only when nothing is running or queued and
+    max(1.5s, 3x the last read's duration) has passed since it returned; the focus backoff and
+    the `HERDR_SIDEBAR_BACKGROUND_REFRESH` bypass still gate them.
+  - Applying a result replaces STATUS DATA ONLY, matched by repo root: commit drafts/cursors,
+    collapse sets and focus are untouched. The selection is captured by `row_stable_id` BEFORE
+    the status it indexes is replaced, then re-found (`reselect`), falling back to the old
+    index when that row is gone. An unchanged result does not rebuild. Drawer lines apply only
+    while the same repo is active, FILE HISTORY follows the same file, and the drawer is still
+    expanded.
+  - `App::new` does no status read: it draws at once ("loading…" header, `…` repo branches)
+    and restores the saved selection/scroll when the first current result applies; a close
+    before that persists the saved values instead of "nothing selected".
+  - Status (30s) and drawer queries (10s) go through the bounded `run_read_in_with_timeout`
+    (`GIT_OPTIONAL_LOCKS=0`, Job Object tree-kill on Windows), so a hung git cannot strand the
+    worker. Its poll naps start at 1ms so fast reads are not taxed 25ms each.
+  - Between an action and its follow-up read the displayed status is stale (`stale()`):
+    Commit then skips its "no staged changes" pre-check and lets git decide, because a
+    just-staged file is not visible yet. Still synchronous on the UI thread, deliberately: the
+    mutating git actions themselves; drawer reloads on a drawer toggle, active-repo switch or
+    FILE HISTORY target change (one bounded query set, immediate feedback); `stage_under` /
+    `unstage_under`'s own status read; repo discovery; and ✧'s `diff_for_message`.
 - Hotkey hints render as keycap chips (`wrap_hints` takes `(key, label)` pairs, shared in
   `ui.rs`). They live in the ⚙ Settings modal; the FOOTER copy is opt-in via the
   "Footer hotkeys" setting (persisted as `hotkeys` in the state file, default hidden —

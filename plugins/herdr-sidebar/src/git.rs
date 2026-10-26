@@ -11,6 +11,13 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 const IGNORED_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Status runs on background workers (the SCM view's status worker, the
+/// Explorer's decoration worker); the bound only keeps a hung git — a stalled
+/// network drive, say — from stranding that worker forever. Generous, because
+/// `-uall` in a very large worktree legitimately takes many seconds.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
+/// Drawer queries are capped log/ref listings; the same stranding guard.
+const DRAWER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One file in the staged or unstaged list.
 #[derive(Clone, Debug, PartialEq)]
@@ -128,7 +135,7 @@ impl Git {
     }
 
     pub fn status(&self) -> Result<Status, String> {
-        let out = run_read_in(
+        let out = run_read_in_with_timeout(
             &self.root,
             &[
                 "status",
@@ -138,6 +145,7 @@ impl Git {
                 "--renames",
                 "--untracked-files=all",
             ],
+            STATUS_TIMEOUT,
         )?;
         Ok(parse_status(&out))
     }
@@ -407,7 +415,7 @@ impl Git {
 
     pub fn graph(&self, limit: usize) -> Result<Vec<String>, String> {
         let n = format!("-{limit}");
-        lines(run_in(
+        lines(run_drawer(
             &self.root,
             &["log", "--graph", "--oneline", "--decorate=short", &n],
         )?)
@@ -415,7 +423,7 @@ impl Git {
 
     pub fn commits(&self, limit: usize) -> Result<Vec<String>, String> {
         let n = format!("-{limit}");
-        lines(run_in(
+        lines(run_drawer(
             &self.root,
             &["log", "--oneline", "--decorate=short", "--date=short", &n],
         )?)
@@ -423,7 +431,7 @@ impl Git {
 
     pub fn file_history(&self, path: &str, limit: usize) -> Result<Vec<String>, String> {
         let n = format!("-{limit}");
-        lines(run_in(
+        lines(run_drawer(
             &self.root,
             &["log", "--oneline", "--follow", &n, "--", path],
         )?)
@@ -431,7 +439,7 @@ impl Git {
 
     /// Local + remote branches, the current one first and starred.
     pub fn branches(&self) -> Result<Vec<String>, String> {
-        lines(run_in(
+        lines(run_drawer(
             &self.root,
             &[
                 "branch",
@@ -570,7 +578,7 @@ impl Git {
     }
 
     pub fn remotes(&self) -> Result<Vec<String>, String> {
-        let out = run_in(&self.root, &["remote", "-v"])?;
+        let out = run_drawer(&self.root, &["remote", "-v"])?;
         // `remote -v` lists fetch and push separately; one line per remote reads better.
         let mut seen = Vec::new();
         for line in out.lines() {
@@ -582,17 +590,17 @@ impl Git {
     }
 
     pub fn stashes(&self) -> Result<Vec<String>, String> {
-        lines(run_in(&self.root, &["stash", "list"])?)
+        lines(run_drawer(&self.root, &["stash", "list"])?)
     }
 
     pub fn tags(&self) -> Result<Vec<String>, String> {
-        lines(run_in(&self.root, &["tag", "--sort=-creatordate"])?)
+        lines(run_drawer(&self.root, &["tag", "--sort=-creatordate"])?)
     }
 
     /// One line per worktree (`git worktree list`): path, short head,
     /// [branch] — the primary checkout first.
     pub fn worktrees(&self) -> Result<Vec<String>, String> {
-        lines(run_in(&self.root, &["worktree", "list"])?)
+        lines(run_drawer(&self.root, &["worktree", "list"])?)
     }
 
     /// Run an arbitrary git command in this repo — the escape hatch the
@@ -642,17 +650,16 @@ fn parse_branch_choices(out: &str) -> Vec<Branch> {
     branches
 }
 
-/// Background status reads must never refresh the index while another pane or
-/// tool is trying to write it. `GIT_OPTIONAL_LOCKS=0` asks Git to skip those
-/// optional index writes without changing the result of these read-only calls.
-fn run_read_in(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = git_command(dir, args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
-    command_result(out.status, out.stdout, out.stderr)
+/// Drawer listings are read-only and run on the SCM status worker, so they
+/// get the same bounded, lock-free read as status.
+fn run_drawer(dir: &Path, args: &[&str]) -> Result<String, String> {
+    run_read_in_with_timeout(dir, args, DRAWER_TIMEOUT)
 }
 
+/// A bounded background read. It must never refresh the index while another
+/// pane or tool is trying to write it: `GIT_OPTIONAL_LOCKS=0` asks Git to skip
+/// those optional index writes without changing the result of read-only calls.
+/// On timeout the whole child tree is terminated (a Job Object on Windows).
 fn run_read_in_with_timeout(
     dir: &Path,
     args: &[&str],
@@ -678,6 +685,9 @@ fn run_read_in_with_timeout(
     let stdout_reader = std::thread::spawn(move || read_all(stdout));
     let stderr_reader = std::thread::spawn(move || read_all(stderr));
     let deadline = Instant::now() + timeout;
+    // Start with short naps: most reads finish in a few milliseconds, and a
+    // fixed 25ms poll would add that much latency to every one of them.
+    let mut nap = Duration::from_millis(1);
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|e| format!("git: {e}"))? {
             break status;
@@ -693,11 +703,13 @@ fn run_read_in_with_timeout(
                 drop(stderr_reader);
             }
             return Err(format!(
-                "ignored-file scan timed out after {}s",
+                "git {} timed out after {}s",
+                args.first().copied().unwrap_or_default(),
                 timeout.as_secs()
             ));
         }
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(nap);
+        nap = (nap * 2).min(Duration::from_millis(25));
     };
     let stdout = stdout_reader
         .join()

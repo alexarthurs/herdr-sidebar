@@ -564,7 +564,9 @@ fn run_scm(
         let mut timeout = REFRESH_EVERY
             .saturating_sub(last_tick.elapsed())
             .min(launch::FOLLOW_CWD_EVERY);
-        if app.is_syncing() {
+        // A background status read lands on the next loop iteration, so poll
+        // briskly while one is in flight instead of waiting out the tick.
+        if app.is_syncing() || app.status_pending() {
             timeout = timeout.min(ANIMATION_FRAME);
         }
         if event::poll(timeout)? {
@@ -592,6 +594,7 @@ fn run_scm(
         }
         app.heartbeat();
         app.poll_picker();
+        app.collect_status();
         if last_tick.elapsed() >= REFRESH_EVERY {
             app.tick();
             last_tick = std::time::Instant::now();
