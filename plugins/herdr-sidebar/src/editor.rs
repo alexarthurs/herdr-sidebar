@@ -218,13 +218,7 @@ impl Editor {
                         }
                         line
                     });
-                    self.status = Some(match copy_to_clipboard(&text) {
-                        Ok(ClipboardWrite::Native) => "copied to clipboard".into(),
-                        Ok(ClipboardWrite::Osc52Unacknowledged) => {
-                            "sent to terminal clipboard".into()
-                        }
-                        Err(e) => format!("clipboard unavailable: {e}"),
-                    });
+                    self.copy_text(&text);
                     return EditAction::None;
                 }
                 KeyCode::Char('x') => {
@@ -727,11 +721,28 @@ impl Editor {
         self.scroll = self.scroll.saturating_add_signed(delta).min(max);
     }
 
-    pub fn on_mouse(&mut self, mouse: &MouseEvent, body: Rect) {
+    /// Copy the selection, as Ctrl+C would with something selected. The
+    /// viewer calls this when a mouse release finishes a selection.
+    pub fn copy_selection(&mut self) {
+        if let Some(text) = self.selected_text() {
+            self.copy_text(&text);
+        }
+    }
+
+    fn copy_text(&mut self, text: &str) {
+        self.status = Some(match copy_to_clipboard(text) {
+            Ok(ClipboardWrite::Native) => "copied to clipboard".into(),
+            Ok(ClipboardWrite::Osc52Unacknowledged) => "sent to terminal clipboard".into(),
+            Err(e) => format!("clipboard unavailable: {e}"),
+        });
+    }
+
+    /// True when a mouse release finishes a non-empty selection.
+    pub fn on_mouse(&mut self, mouse: &MouseEvent, body: Rect) -> bool {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let Some(position) = self.text_position_at(body, mouse.column, mouse.row) else {
-                    return;
+                    return false;
                 };
                 let extending = mouse.modifiers.contains(KeyModifiers::SHIFT);
                 let anchor = if extending {
@@ -746,10 +757,10 @@ impl Editor {
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 let Some(anchor) = self.mouse_anchor else {
-                    return;
+                    return false;
                 };
                 let Some(position) = self.text_position_at(body, mouse.column, mouse.row) else {
-                    return;
+                    return false;
                 };
                 self.anchor = Some(anchor);
                 self.cursor = position;
@@ -760,10 +771,11 @@ impl Editor {
                     self.cursor = position;
                     self.preferred_x = None;
                 }
-                self.mouse_anchor = None;
+                return self.mouse_anchor.take().is_some() && self.selection().is_some();
             }
             _ => {}
         }
+        false
     }
 
     fn text_position_at(&self, body: Rect, column: u16, row: u16) -> Option<TextPos> {
@@ -1098,6 +1110,29 @@ mod tests {
         };
         e.on_mouse(&up, body);
         assert!(e.mouse_anchor.is_none());
+    }
+
+    #[test]
+    fn only_a_mouse_release_that_selects_text_asks_for_a_copy() {
+        let mut e = editor("one two three");
+        let body = Rect::new(0, 0, 20, 3);
+        let at = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        // A plain click selects nothing.
+        assert!(!e.on_mouse(&at(MouseEventKind::Down(MouseButton::Left), 2), body));
+        assert!(!e.on_mouse(&at(MouseEventKind::Up(MouseButton::Left), 2), body));
+        // A drag selects; only its release reports it (columns 0-1 are the
+        // line-number gutter).
+        assert!(!e.on_mouse(&at(MouseEventKind::Down(MouseButton::Left), 2), body));
+        assert!(!e.on_mouse(&at(MouseEventKind::Drag(MouseButton::Left), 5), body));
+        assert!(e.on_mouse(&at(MouseEventKind::Up(MouseButton::Left), 5), body));
+        assert_eq!(e.selected_text().as_deref(), Some("one"));
+        // A stray release without a press in the body copies nothing again.
+        assert!(!e.on_mouse(&at(MouseEventKind::Up(MouseButton::Left), 3), body));
     }
 
     #[test]
