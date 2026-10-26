@@ -108,6 +108,13 @@ Settings persist across tabs and restarts. Configure:
 - Source Control list/tree view (shared across sidebars)
 - Hidden files, Git decorations, Git footer, and footer hotkeys
 - Auto-open, strict open/close toggle, focus-on-open, and live folder following
+- Close emptied tabs (on by default; see below)
+
+**Close emptied tabs** closes a tab once only the sidebar is left in it: exit the last shell
+with `Ctrl+D`, or close the last other pane, and the tab goes away as it would without the
+plugin. The sidebar saves any unfinished commit message first; if it cannot, it stays open
+and shows why. Tabs that still hold a preview or editor are kept. Turn it off to keep a
+sidebar-only tab.
 
 **Auto-hide below** hides the sidebar while the tab is at most that many columns wide
 (64–200, or off), like herdr's own `ui.mobile_width_threshold`. The width is the tab area,

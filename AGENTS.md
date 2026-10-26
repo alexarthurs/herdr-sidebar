@@ -286,6 +286,15 @@ Manifest `[[events]]` hooks (undocumented in CLI help; see herdr `src/api/schema
   fall back to the focused tab.
 - A launcher that hooks `pane.*` and also creates panes must pre-stamp identity while holding
   the shared launcher lock; otherwise its own layout/focus events form a duplicate-pane loop.
+- Pane removal (read in herdr 0.9.5 source): a shell exit (`Ctrl+D`) emits ONLY
+  `pane.exited`, and an API/UI close (`pane.close`, the client's close-pane key/menu) emits
+  ONLY `pane.closed`; both are hookable. `pane.exited` is emitted before the pane is removed,
+  but in the same `&mut App` handler that removes it, and API requests are served by that same
+  App, so a hook's `pane.list` always sees the post-removal layout. Hook context is computed at
+  emit time: `pane.exited` still resolves the dying pane's tab, but `pane.closed` (emitted after
+  removal) carries only `pane_id` + `workspace_id` — a hook reacting to it must scan tabs, not
+  scope. Closing a tab's last pane through `pane.close` closes the tab (the workspace, if it
+  was its last tab); `pane.move` emits neither event.
 
 Pane environment: `HERDR_PANE_ID` is set inside every pane; `HERDR_BIN_PATH` is injected for
 **actions/hooks but not panes** — fall back to `herdr` on PATH. A binary started via terminal input
@@ -588,6 +597,31 @@ HACKING.md — budget time for that before promising a patched build.
   because ensure never reopens one. herdr's own `ui.mobile_width_threshold` compares the
   CLIENT terminal width and swaps to a single-column layout; it does not collapse anything,
   so the two thresholds don't line up exactly.
+- **Close emptied tabs** (`close_lonely_tab`, default ON — files without the field read true;
+  issue #108). Stock herdr closes a tab when its last pane exits; with a docked sidebar the
+  tab used to survive as a full-width sidebar. `pane.exited` + `pane.closed` hooks run
+  `ensure::Mode::Reap` (`--reap` on both the unix main binary and the Windows sidecar).
+  Invariants:
+  - It takes the shared `LaunchLock` BLOCKING (a discrete event; a skipped reap would wait for
+    some unrelated pane to close). Holding it also hides every transient layout of our own
+    launch / refresh / takeover / unified-toggle flows, which all mutate under that lock.
+  - `launch::lonely_sidebar_tabs` scans EVERY tab (`pane.closed` has no tab) and picks tabs
+    whose every pane is a sidebar: an Explorer / Source Control token, or one of our labels
+    without one. Any other pane — shell, agent, preview / editor viewer (token or label),
+    an id that is not flag-safe — keeps the tab. Null token values count as absent.
+  - Live TUIs get Ctrl+Q only (save drafts, close own pane, no snooze marker); a draft that
+    cannot be saved keeps the pane open with its notice, and nothing waits for or kills it.
+    Only panes that cannot hold TUI state are `pane.close`d directly: `herdr-sidebar-starting`,
+    label-only server-resume corpses, and stale heartbeats (the same corpses ensure REPLACEs).
+  - Tabs named by a THIS-session (or session-less legacy) takeover journal — previewed tab
+    and parking tab — are skipped (`takeover::journaled_tabs`); the restore owns them. After an
+    abandoned restore the journal is gone, so a previewed tab left with only its sidebar is
+    reaped like any other.
+  - Idempotent and cheap: each self-close emits `pane.closed`, which re-runs the reap over a
+    snapshot without that tab (one `pane.list`, plus a journal-dir read only when something is
+    lonely). Refresh / redeploy close sidebars only in tabs that keep other panes, so they never
+    create a lonely tab; refresh's "sidebar is the tab's only pane" report now mostly concerns
+    users who turned the setting off.
 - Every Settings action uses `state::update_state`, a lock-protected read-modify-write.
   State/tree/SCM/root writers use persistent sibling `.lock` files with OS-backed locks; the
   kernel releases ownership on process death, so do not poll, age, or delete those files.

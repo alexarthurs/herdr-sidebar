@@ -11,6 +11,7 @@
 //! - `sidebar_width`: preferred sidebar width in terminal columns.
 //! - `auto_hide_below`: hide the sidebar while the tab is at most this many
 //!   columns wide (0 = off).
+//! - `close_lonely_tab`: close a tab once only sidebars are left in it.
 //!
 //! Both views live in ONE binary; switching is an in-process re-render, and
 //! separated panes are the same binary pinned to a starting view with
@@ -26,6 +27,10 @@ pub const DEFAULT_SIDEBAR_WIDTH: u16 = 32;
 pub const MIN_SIDEBAR_WIDTH: u16 = 24;
 pub const MAX_SIDEBAR_WIDTH: u16 = 80;
 pub const SIDEBAR_WIDTH_STEP: u16 = 4;
+
+/// ⚙ Settings label for `close_lonely_tab`, shared by both views' modals.
+/// Short enough to sit beside "off" in a default-width pane.
+pub const CLOSE_LONELY_TAB_LABEL: &str = "Close emptied tabs";
 
 pub fn clamp_sidebar_width(width: u16) -> u16 {
     width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH)
@@ -463,6 +468,10 @@ pub struct State {
     /// Diff previews show old and new side by side instead of one unified
     /// column (`v` in the preview toggles it).
     pub diff_side_by_side: bool,
+    /// Close a tab once its last non-sidebar pane exits or closes, as herdr
+    /// does for a tab whose last pane exits (issue #108). Off keeps the
+    /// sidebar-only tab.
+    pub close_lonely_tab: bool,
 }
 
 impl State {
@@ -514,6 +523,7 @@ impl Default for State {
             custom_editor_on_click: false,
             scm_tree_view: false,
             diff_side_by_side: false,
+            close_lonely_tab: true,
         }
     }
 }
@@ -679,7 +689,7 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"auto_hide_below\":{},\"colors\":\"{}\",\"syntax_dark\":\"{}\",\"syntax_light\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{},\"diff_side_by_side\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"auto_hide_below\":{},\"colors\":\"{}\",\"syntax_dark\":\"{}\",\"syntax_light\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{},\"diff_side_by_side\":{},\"close_lonely_tab\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.search_active,
@@ -700,7 +710,8 @@ fn write_state(path: &Path, state: State) {
         state.preview_placement.label(),
         state.custom_editor_on_click,
         state.scm_tree_view,
-        state.diff_side_by_side
+        state.diff_side_by_side,
+        state.close_lonely_tab
     );
     let _ = std::fs::write(path, json);
 }
@@ -1168,6 +1179,10 @@ pub fn parse_state(json: &str) -> State {
             .get("diff_side_by_side")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.diff_side_by_side),
+        close_lonely_tab: value
+            .get("close_lonely_tab")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.close_lonely_tab),
     }
 }
 
@@ -1328,6 +1343,7 @@ mod tests {
     #[test]
     fn syntax_theme_row_fits_the_settings_modal() {
         let longest_existing = "Updates".len() + "local checkout".len();
+        assert!(CLOSE_LONELY_TAB_LABEL.len() + "off".len() <= longest_existing);
         for color_theme in [ColorTheme::VsCode, ColorTheme::Light, ColorTheme::Terminal] {
             for theme in SyntaxTheme::ALL {
                 let state = State {
@@ -1378,9 +1394,13 @@ mod tests {
             custom_editor_on_click: true,
             scm_tree_view: true,
             diff_side_by_side: true,
+            close_lonely_tab: false,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"auto_hide_below\":96,\"colors\":\"terminal\",\"syntax_dark\":\"base16-mocha.dark\",\"syntax_light\":\"Solarized (light)\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"diff_side_by_side\":true,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"auto_hide_below\":96,\"colors\":\"terminal\",\"syntax_dark\":\"base16-mocha.dark\",\"syntax_light\":\"Solarized (light)\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"diff_side_by_side\":true,\"close_lonely_tab\":false,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
+        // Files written before the setting existed close a tab left with
+        // only sidebars, like herdr closes a tab whose last pane exits.
+        assert!(parse_state("{\"merged\":true}").close_lonely_tab);
         // Diffs stay unified unless the user switched them.
         assert!(!parse_state("{\"merged\":true}").diff_side_by_side);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);

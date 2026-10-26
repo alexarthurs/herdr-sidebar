@@ -493,6 +493,90 @@ pub fn pane_is_starting(pane_list_json: &str, pane_id: &str) -> bool {
         .is_some_and(|p| p.tokens.contains_key(STARTING_TOKEN))
 }
 
+/// How the reap (`ensure::Mode::Reap`) closes one sidebar of a lonely tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReapClose {
+    /// A live TUI: Ctrl+Q, so it saves its drafts and closes its own pane.
+    Graceful,
+    /// No TUI state can exist (still starting, a label-only server-resume
+    /// corpse, or a stale heartbeat the launcher would REPLACE anyway):
+    /// `pane.close` directly, since nothing would answer Ctrl+Q.
+    Direct,
+}
+
+/// A tab whose remaining panes are all sidebars.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LonelyTab {
+    pub tab: String,
+    pub panes: Vec<(String, ReapClose)>,
+}
+
+/// Tabs left holding nothing but sidebar panes (issue #108: the user's last
+/// shell exited and the sidebar filled the tab). A sidebar is a pane with an
+/// Explorer / Source Control token, or one of our labels without one (a
+/// server-resume corpse). Anything else in the tab — a shell, an agent, a
+/// preview / editor viewer (which may hold unsaved edits), an unidentifiable
+/// pane — keeps the whole tab. Unparsable input yields nothing.
+pub fn lonely_sidebar_tabs(pane_list_json: &str, now: u64) -> Vec<LonelyTab> {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return Vec::new();
+    };
+    // `None` = a pane that is not ours (or not safely addressable).
+    let mut tabs = BTreeMap::<String, Option<Vec<(String, ReapClose)>>>::new();
+    for pane in &msg.result.panes {
+        let Some(tab) = pane.tab_id.as_deref() else {
+            continue;
+        };
+        let entry = tabs
+            .entry(tab.to_string())
+            .or_insert_with(|| Some(Vec::new()));
+        match (pane.reap_close(now), pane.pane_id.as_deref()) {
+            (Some(how), Some(id)) if is_flag_safe(id) => {
+                if let Some(sidebars) = entry {
+                    sidebars.push((id.to_string(), how));
+                }
+            }
+            _ => *entry = None,
+        }
+    }
+    tabs.into_iter()
+        .filter_map(|(tab, panes)| {
+            let panes = panes.filter(|panes| !panes.is_empty())?;
+            Some(LonelyTab { tab, panes })
+        })
+        .collect()
+}
+
+impl Pane {
+    /// `Some` when this pane is one of our sidebars, saying how to close it.
+    fn reap_close(&self, now: u64) -> Option<ReapClose> {
+        // A cleared token is reported as null; never read one as present,
+        // or a cleared starting marker would hard-close a live draft.
+        let has = |key: &str| self.tokens.get(key).is_some_and(|value| !value.is_null());
+        let viewer =
+            has(PREVIEW_METADATA_SOURCE) || self.label.as_deref().is_some_and(is_preview_label);
+        if viewer {
+            return None;
+        }
+        let explorer = has(METADATA_SOURCE);
+        let git = has(SC_METADATA_SOURCE);
+        if !explorer && !git {
+            let ours = matches!(
+                self.label.as_deref(),
+                Some(PANE_LABEL | SIDEBAR_LABEL | SC_PANE_LABEL)
+            );
+            return ours.then_some(ReapClose::Direct);
+        }
+        let stale = (explorer && token_stale(&self.tokens, METADATA_SOURCE, now))
+            || (git && token_stale(&self.tokens, SC_METADATA_SOURCE, now));
+        if has(STARTING_TOKEN) || stale {
+            Some(ReapClose::Direct)
+        } else {
+            Some(ReapClose::Graceful)
+        }
+    }
+}
+
 /// `<pane_id>\t<cwd>` of the focused pane, or empty on any failure. The cwd
 /// keeps its spaces (hence the tab separator) but loses any `\\?\` verbatim
 /// prefix.
@@ -1957,5 +2041,55 @@ mod tests {
         assert_eq!(open_plan(&layout(""), false, 32), "");
         let unsafe_id = layout(r#"{"pane_id":"--x","rect":{"x":0,"y":0,"width":90,"height":50}}"#);
         assert_eq!(open_plan(&unsafe_id, true, 32), "");
+    }
+
+    /// Issue #108: only tabs whose every pane is one of our sidebars are
+    /// reaped. A shell, an agent, a preview / editor viewer, or a pane we
+    /// cannot address keeps the tab, and each sidebar says how to close it.
+    #[test]
+    fn lonely_sidebar_tabs_are_exactly_the_tabs_holding_only_sidebars() {
+        let now = 1_000;
+        let live = now.to_string();
+        let stale = (now - HEARTBEAT_STALE_SECS - 1).to_string();
+        let json = format!(
+            r#"{{"result":{{"panes":[
+            {{"pane_id":"w1:p1","tab_id":"w1:mixed","label":"Sidebar","tokens":{{"herdr-sidebar-explorer":"{live}","herdr-sidebar-git":"{live}"}}}},
+            {{"pane_id":"w1:p2","tab_id":"w1:mixed","label":"shell","tokens":{{}}}},
+            {{"pane_id":"w1:p3","tab_id":"w1:alone","label":"Sidebar","tokens":{{"herdr-sidebar-explorer":"{live}","herdr-sidebar-git":"{live}"}}}},
+            {{"pane_id":"w1:p4","tab_id":"w1:preview","tokens":{{"herdr-sidebar-explorer":"{live}"}}}},
+            {{"pane_id":"w1:p5","tab_id":"w1:preview","label":"a.rs · preview","tokens":{{"herdr-sidebar-preview":"{live}"}}}},
+            {{"pane_id":"w1:p6","tab_id":"w1:resumed-preview","label":"Explorer"}},
+            {{"pane_id":"w1:p7","tab_id":"w1:resumed-preview","label":"a.rs · preview"}},
+            {{"pane_id":"w1:p8","tab_id":"w1:pair","label":"Explorer","tokens":{{"herdr-sidebar-explorer":"{live}","herdr-sidebar-git":null}}}},
+            {{"pane_id":"w1:p9","tab_id":"w1:pair","label":"Source Control","tokens":{{"herdr-sidebar-git":"{live}","herdr-sidebar-starting":null}}}},
+            {{"pane_id":"w1:pa","tab_id":"w1:young","tokens":{{"herdr-sidebar-git":"{live}","herdr-sidebar-starting":"1"}}}},
+            {{"pane_id":"w1:pb","tab_id":"w1:corpses","label":"Source Control"}},
+            {{"pane_id":"w1:pc","tab_id":"w1:corpses","tokens":{{"herdr-sidebar-explorer":"{stale}"}}}},
+            {{"pane_id":"w1:pd","tab_id":"w1:editor","tokens":{{"herdr-sidebar-explorer":"{live}"}}}},
+            {{"pane_id":"w1:pe","tab_id":"w1:editor","label":"notes.md · editor","tokens":{{"hs-editor-path":"abc"}}}},
+            {{"pane_id":"w1:pf","tab_id":"w1:custom-editor","tokens":{{"herdr-sidebar-explorer":"{live}"}}}},
+            {{"pane_id":"w1:pg","tab_id":"w1:custom-editor","label":"vim","tokens":{{"hs-editor-path":"abc"}}}},
+            {{"pane_id":"--x","tab_id":"w1:unsafe","tokens":{{"herdr-sidebar-explorer":"{live}"}}}},
+            {{"pane_id":"w1:ph","tab_id":"w1:unsafe","tokens":{{"herdr-sidebar-explorer":"{live}"}}}},
+            {{"pane_id":"w1:pi","label":"Sidebar"}}
+        ]}}}}"#
+        );
+        let lonely = lonely_sidebar_tabs(&json, now);
+        let tab = |id: &str, panes: &[(&str, ReapClose)]| LonelyTab {
+            tab: id.into(),
+            panes: panes.iter().map(|(p, how)| (p.to_string(), *how)).collect(),
+        };
+        use ReapClose::{Direct, Graceful};
+        assert_eq!(
+            lonely,
+            vec![
+                tab("w1:alone", &[("w1:p3", Graceful)]),
+                tab("w1:corpses", &[("w1:pb", Direct), ("w1:pc", Direct)]),
+                tab("w1:pair", &[("w1:p8", Graceful), ("w1:p9", Graceful)]),
+                tab("w1:young", &[("w1:pa", Direct)]),
+            ]
+        );
+        assert!(lonely_sidebar_tabs("not json", now).is_empty());
+        assert!(lonely_sidebar_tabs(r#"{"error":{"code":"x"}}"#, now).is_empty());
     }
 }

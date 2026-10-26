@@ -21,6 +21,10 @@ pub enum Mode {
     Toggle(View),
     /// An explicit host keybinding opens or focuses a specific activity.
     Activate(Target),
+    /// A pane exited or closed (`pane.exited` / `pane.closed` hooks): close
+    /// every tab left holding only sidebars, the way herdr closes a tab
+    /// whose last pane exits (issue #108).
+    Reap,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,12 +369,7 @@ impl RefreshHost for LiveRefresh {
     }
 
     fn request_close(&mut self, pane: &str) -> Result<(), String> {
-        let response = ipc::call_text(
-            "pane.send_input",
-            serde_json::json!({ "pane_id": pane, "text": "", "keys": ["ctrl+q"] }),
-        )
-        .map_err(|error| error.to_string())?;
-        ipc_ok(&response)
+        send_ctrl_q(pane)
     }
 
     fn open(&mut self, panes_json: &str, tab: &str, view: View) -> Result<(), String> {
@@ -391,10 +390,102 @@ pub fn refresh_all() -> std::io::Result<RefreshReport> {
     refresh_with(&mut LiveRefresh).map_err(std::io::Error::other)
 }
 
+/// Ask a running sidebar TUI to save its drafts and close its own pane.
+fn send_ctrl_q(pane: &str) -> Result<(), String> {
+    let response = ipc::call_text(
+        "pane.send_input",
+        serde_json::json!({ "pane_id": pane, "text": "", "keys": ["ctrl+q"] }),
+    )
+    .map_err(|error| error.to_string())?;
+    ipc_ok(&response)
+}
+
+/// Everything the lonely-tab reap needs from herdr, injectable for tests.
+trait ReapHost {
+    fn list(&mut self) -> Result<String, String>;
+    /// Tabs a takeover journal still owes a restore (`takeover::journaled_tabs`).
+    fn journaled_tabs(&mut self) -> std::collections::BTreeSet<String>;
+    /// Ctrl+Q: the TUI saves drafts and closes its own pane, or stays open
+    /// with its error notice when a draft cannot be saved.
+    fn request_close(&mut self, pane: &str) -> Result<(), String>;
+    /// `pane.close`, only for panes that cannot hold TUI state.
+    fn close(&mut self, pane: &str) -> Result<(), String>;
+}
+
+/// Close every tab left holding only sidebars (issue #108). Closing a tab's
+/// last pane closes the tab, so each sidebar is simply asked to close
+/// itself; nothing waits for that, and the `pane.closed` its own close emits
+/// re-runs this cheaply over a snapshot that no longer has the tab. Returns
+/// how many sidebars were asked.
+fn reap_with(host: &mut impl ReapHost, now: u64) -> Result<usize, String> {
+    let lonely = launch::lonely_sidebar_tabs(&host.list()?, now);
+    if lonely.is_empty() {
+        return Ok(0);
+    }
+    let journaled = host.journaled_tabs();
+    let mut asked = 0;
+    for tab in lonely.iter().filter(|tab| !journaled.contains(&tab.tab)) {
+        for (pane, how) in &tab.panes {
+            let result = match how {
+                launch::ReapClose::Graceful => host.request_close(pane),
+                launch::ReapClose::Direct => host.close(pane),
+            };
+            // A pane that vanished in the meantime (it closed itself after
+            // an earlier event) is not an error worth reporting.
+            if result.is_ok() {
+                asked += 1;
+            }
+        }
+    }
+    Ok(asked)
+}
+
+struct LiveReap;
+
+impl ReapHost for LiveReap {
+    fn list(&mut self) -> Result<String, String> {
+        ipc::call_text("pane.list", serde_json::json!({})).map_err(|error| error.to_string())
+    }
+
+    fn journaled_tabs(&mut self) -> std::collections::BTreeSet<String> {
+        crate::takeover::journaled_tabs()
+    }
+
+    fn request_close(&mut self, pane: &str) -> Result<(), String> {
+        send_ctrl_q(pane)
+    }
+
+    fn close(&mut self, pane: &str) -> Result<(), String> {
+        let response = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane }))
+            .map_err(|error| error.to_string())?;
+        ipc_ok(&response)
+    }
+}
+
+/// `--reap` (the `pane.exited` / `pane.closed` hooks). A discrete event, so
+/// it WAITS for the launcher lock instead of yielding like a focus hook: a
+/// skipped reap would leave the tab until some unrelated pane next closes.
+/// Holding the lock also means it never sees a tab our own launch, refresh
+/// or takeover is in the middle of rearranging.
+fn reap() -> std::io::Result<()> {
+    if !crate::state::load_state().close_lonely_tab {
+        return Ok(());
+    }
+    let Some(_lock) = LaunchLock::acquire(true) else {
+        return Ok(());
+    };
+    reap_with(&mut LiveReap, crate::state::unix_now())
+        .map(drop)
+        .map_err(std::io::Error::other)
+}
+
 /// Quiet mode (hooks): make sure the focused tab has an Explorer, never moving
 /// focus, and respecting a tab the user toggled closed. Toggle mode (the
 /// action): open-or-focus-or-close, like VS Code's explorer shortcut.
 pub fn run(mode: Mode) -> std::io::Result<()> {
+    if mode == Mode::Reap {
+        return reap();
+    }
     let toggle = matches!(mode, Mode::Toggle(_));
     let activation = match mode {
         Mode::Activate(target) => Some(target),
@@ -403,7 +494,7 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
     let explicit = toggle || activation.is_some();
     let state = crate::state::load_state();
     let view = match mode {
-        Mode::Ensure => View::Explorer,
+        Mode::Ensure | Mode::Reap => View::Explorer,
         Mode::Toggle(view) => view,
         Mode::Activate(target) => target.pane_view(state.merged),
     };
@@ -1139,6 +1230,131 @@ mod tests {
         let report = refresh_with(&mut host).unwrap();
         assert_eq!(report.refreshed, 2);
         assert!(report.is_complete());
+    }
+
+    /// A simulated herdr for `reap_with`. A Ctrl+Q'd sidebar closes itself
+    /// unless it is in `keeps` (a draft it cannot save); `pane.close` always
+    /// works. Either removes the pane, as its own close would.
+    #[derive(Default)]
+    struct FakeReap {
+        panes: Vec<serde_json::Value>,
+        journaled: std::collections::BTreeSet<String>,
+        keeps: Vec<String>,
+        asked: Vec<String>,
+        closed: Vec<String>,
+    }
+
+    impl FakeReap {
+        fn pane(&mut self, id: &str, tab: &str, label: &str, tokens: serde_json::Value) {
+            self.panes.push(
+                serde_json::json!({"pane_id": id, "tab_id": tab, "label": label, "tokens": tokens}),
+            );
+        }
+        fn has(&self, id: &str) -> bool {
+            self.panes.iter().any(|pane| pane["pane_id"] == id)
+        }
+        fn remove(&mut self, id: &str) -> Result<(), String> {
+            if !self.has(id) {
+                return Err("pane_not_found".into());
+            }
+            self.panes.retain(|pane| pane["pane_id"] != id);
+            Ok(())
+        }
+    }
+
+    impl ReapHost for FakeReap {
+        fn list(&mut self) -> Result<String, String> {
+            Ok(serde_json::json!({"result": {"panes": self.panes}}).to_string())
+        }
+        fn journaled_tabs(&mut self) -> std::collections::BTreeSet<String> {
+            self.journaled.clone()
+        }
+        fn request_close(&mut self, pane: &str) -> Result<(), String> {
+            self.asked.push(pane.into());
+            if self.keeps.iter().any(|id| id == pane) {
+                return Ok(());
+            }
+            self.remove(pane)
+        }
+        fn close(&mut self, pane: &str) -> Result<(), String> {
+            self.closed.push(pane.into());
+            self.remove(pane)
+        }
+    }
+
+    const REAP_NOW: u64 = 10_000;
+
+    fn live_sidebar() -> serde_json::Value {
+        let now = REAP_NOW.to_string();
+        serde_json::json!({ launch::METADATA_SOURCE: now, launch::SC_METADATA_SOURCE: now })
+    }
+
+    /// Issue #108: the last shell exits and the sidebar is alone. It is asked
+    /// to close itself (drafts saved), which closes the tab; tabs with any
+    /// other pane — a shell, a viewer that may hold unsaved edits — and
+    /// tabs a takeover journal still needs are left alone.
+    #[test]
+    fn reap_closes_only_sidebar_only_tabs_and_gracefully() {
+        let mut host = FakeReap::default();
+        host.pane("alone", "w1:t1", "Sidebar", live_sidebar());
+        host.pane("busy", "w1:t2", "Sidebar", live_sidebar());
+        host.pane("shell", "w1:t2", "", serde_json::json!({}));
+        host.pane("previewing", "w1:t3", "", live_sidebar());
+        host.pane(
+            "viewer",
+            "w1:t3",
+            "a.rs · preview",
+            serde_json::json!({ crate::viewer::METADATA_SOURCE: REAP_NOW.to_string() }),
+        );
+        host.pane("parked", "w1:t4", "Sidebar", live_sidebar());
+        host.journaled.insert("w1:t4".into());
+        let mut young = serde_json::json!({ launch::SC_METADATA_SOURCE: REAP_NOW.to_string() });
+        young[launch::STARTING_TOKEN] = serde_json::json!("1");
+        host.pane("young", "w1:t5", "Source Control", young);
+        host.pane("corpse", "w1:t6", "Explorer", serde_json::json!({}));
+
+        assert_eq!(reap_with(&mut host, REAP_NOW), Ok(3));
+        assert_eq!(host.asked, vec!["alone"], "a live TUI only gets Ctrl+Q");
+        assert_eq!(host.closed, vec!["young", "corpse"], "no TUI state yet");
+        for kept in ["busy", "shell", "previewing", "viewer", "parked"] {
+            assert!(host.has(kept), "{kept} must survive");
+        }
+
+        // Each self-close emits pane.closed, which re-runs the reap: with
+        // nothing lonely left it does nothing, so it can never loop.
+        host.asked.clear();
+        host.closed.clear();
+        assert_eq!(reap_with(&mut host, REAP_NOW), Ok(0));
+        assert!(host.asked.is_empty() && host.closed.is_empty());
+    }
+
+    /// A separated Explorer + Source Control pair is lonely together; each
+    /// gets Ctrl+Q. One whose draft cannot be saved stays open (it shows
+    /// its own error), and a later event just asks it again — never a kill.
+    #[test]
+    fn reap_asks_every_sidebar_of_a_separated_pair_and_never_kills_a_draft() {
+        let mut host = FakeReap::default();
+        let now = REAP_NOW.to_string();
+        host.pane(
+            "explorer",
+            "w1:t1",
+            "Explorer",
+            serde_json::json!({ launch::METADATA_SOURCE: now }),
+        );
+        host.pane(
+            "git",
+            "w1:t1",
+            "Source Control",
+            serde_json::json!({ launch::SC_METADATA_SOURCE: now }),
+        );
+        host.keeps.push("git".into());
+        assert_eq!(reap_with(&mut host, REAP_NOW), Ok(2));
+        assert_eq!(host.asked, vec!["explorer", "git"]);
+        assert!(host.closed.is_empty());
+        assert!(host.has("git") && !host.has("explorer"));
+        assert_eq!(reap_with(&mut host, REAP_NOW), Ok(1));
+        assert!(host.has("git"), "an unsaved draft is never hard-closed");
+        assert!(host.closed.is_empty());
     }
 
     #[test]

@@ -27,6 +27,7 @@ fn main() -> std::io::Result<()> {
     let mode = std::env::args().nth(1);
     match mode.as_deref() {
         Some("--ensure") => return ensure::run(ensure::Mode::Ensure),
+        Some("--reap") => return ensure::run(ensure::Mode::Reap),
         Some("--toggle") => {
             return ensure::run(ensure::Mode::Toggle(View::Explorer));
         }
@@ -173,7 +174,7 @@ fn main() -> std::io::Result<()> {
         Some(other) => {
             eprintln!("herdr-sidebar: unknown argument `{other}`");
             eprintln!(
-                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--run-custom-editor|--ensure|--toggle|--toggle-git|--show-explorer|--show-search|--show-git|--quick-open|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--auto-open|--focus-on-open|--dock-right]"
+                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--run-custom-editor|--ensure|--reap|--toggle|--toggle-git|--show-explorer|--show-search|--show-git|--quick-open|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--auto-open|--focus-on-open|--dock-right]"
             );
             std::process::exit(2);
         }

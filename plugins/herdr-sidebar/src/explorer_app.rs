@@ -296,6 +296,7 @@ enum Setting {
     CustomEditorCommand,
     CustomEditorClick,
     AutoOpen,
+    CloseLonelyTab,
     StrictToggle,
     FocusOnOpen,
     FollowCwd,
@@ -573,6 +574,7 @@ impl App {
         self.sidebar_state.focus_on_open = shared.focus_on_open;
         self.sidebar_state.custom_editor_on_click = shared.custom_editor_on_click;
         self.sidebar_state.auto_hide_below = shared.auto_hide_below;
+        self.sidebar_state.close_lonely_tab = shared.close_lonely_tab;
         let old_git_footer = self.sidebar_state.show_git_footer;
         self.sidebar_state.show_git_footer = shared.show_git_footer;
         self.sidebar_state.syntax_dark = shared.syntax_dark;
@@ -2604,6 +2606,17 @@ impl App {
                 true,
             ),
             (
+                Setting::CloseLonelyTab,
+                sidebar::CLOSE_LONELY_TAB_LABEL,
+                if self.sidebar_state.close_lonely_tab {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
                 Setting::StrictToggle,
                 "Strict toggle",
                 if self.sidebar_state.strict_toggle {
@@ -2729,6 +2742,11 @@ impl App {
             Setting::AutoOpen => {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.auto_open = !state.auto_open);
+            }
+            Setting::CloseLonelyTab => {
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.close_lonely_tab = !state.close_lonely_tab;
+                });
             }
             Setting::StrictToggle => {
                 self.sidebar_state =
