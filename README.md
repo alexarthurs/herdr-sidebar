@@ -70,6 +70,8 @@ working panes back manually. Third-party TUIs are not yet verified with takeover
 </div>
 
 - Stage, unstage, discard, commit, inspect diffs, and sync with the upstream.
+- Read a diff unified or side by side: `v` in the diff toggles old-left / new-right
+  columns, and the choice sticks for later diffs.
 - Click the branch name—in the panel header, a repository row, or the Git footer—to
   switch branches, create one with **New branch…**, or track a remote branch.
   Deleting an unmerged branch requires a separate force-delete confirmation.
@@ -128,8 +130,9 @@ folder stays put until that pane changes directory again.
 
 Preview: drag to select (releasing copies, following herdr's `copy_on_select`),
 `Ctrl/Cmd+C` to copy, arrows/PageUp/PageDown or
-Space/`b` to scroll, `w` to toggle wrapping, `r` to reload, and `q` or Esc to close.
-Releasing a drag in edit mode (`e`) copies the same way.
+Space/`b` to scroll, `w` to toggle wrapping, `r` to reload, `v` to switch a diff
+between unified and side-by-side, and `q` or Esc to close. Releasing a drag in edit
+mode (`e`) copies the same way.
 
 Host keybindings can invoke the direct `show-explorer`, `show-search`, `show-git`, and
 `quick-open` actions. For example, bind `cmd+p` to:

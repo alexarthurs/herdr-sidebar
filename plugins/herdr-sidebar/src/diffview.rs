@@ -182,9 +182,24 @@ fn overlay_bg(spans: Vec<Span<'static>>, range: (usize, usize), bg: Color) -> Ve
     out
 }
 
-/// Render a unified diff for `rel` (its extension picks the grammar) into
-/// display lines: `old new ±` gutters, tinted rows, highlighted code.
-pub fn render(rel: &str, diff: &str) -> Vec<Line<'static>> {
+/// A parsed diff line with its code already highlighted and word-tinted,
+/// shared by the unified and side-by-side layouts.
+enum Styled {
+    Hunk,
+    Plain(String),
+    Ctx {
+        old: usize,
+        new: usize,
+        old_spans: Vec<Span<'static>>,
+        new_spans: Vec<Span<'static>>,
+    },
+    Del(usize, Vec<Span<'static>>),
+    Add(usize, Vec<Span<'static>>),
+}
+
+/// Parse and highlight `diff`, returning the lines and the width of the
+/// widest line number.
+fn styled(rel: &str, diff: &str) -> (Vec<Styled>, usize) {
     let evs = parse_events(diff);
     let ranges = word_ranges(&evs);
 
@@ -205,6 +220,44 @@ pub fn render(rel: &str, diff: &str) -> Vec<Line<'static>> {
     let mut old_hl = LineHighlighter::new(rel);
     let mut new_hl = LineHighlighter::new(rel);
 
+    let colors = palette();
+    let out = evs
+        .iter()
+        .enumerate()
+        .map(|(idx, ev)| match ev {
+            Ev::Hunk => Styled::Hunk,
+            Ev::Plain(t) => Styled::Plain(t.clone()),
+            Ev::Ctx(o, n, t) => Styled::Ctx {
+                old: *o,
+                new: *n,
+                old_spans: old_hl.line(t),
+                new_spans: new_hl.line(t),
+            },
+            Ev::Del(o, t) => {
+                let mut spans = old_hl.line(t);
+                if let Some(&range) = ranges.get(&idx) {
+                    spans = overlay_bg(spans, range, colors.diff_del_word_bg);
+                }
+                Styled::Del(*o, spans)
+            }
+            Ev::Add(n, t) => {
+                let mut spans = new_hl.line(t);
+                if let Some(&range) = ranges.get(&idx) {
+                    spans = overlay_bg(spans, range, colors.diff_add_word_bg);
+                }
+                Styled::Add(*n, spans)
+            }
+        })
+        .collect();
+    (out, w)
+}
+
+/// Render a unified diff for `rel` (its extension picks the grammar) into
+/// display lines: `old new ±` gutters, tinted rows, highlighted code. Each
+/// diff line is one display line, in order.
+pub fn render(rel: &str, diff: &str) -> Vec<Line<'static>> {
+    let (evs, w) = styled(rel, diff);
+
     let gutter = |o: Option<usize>, n: Option<usize>, mark: &str, mark_fg: Color| {
         let fmt = |v: Option<usize>| match v {
             Some(v) => format!("{v:>w$}"),
@@ -217,42 +270,239 @@ pub fn render(rel: &str, diff: &str) -> Vec<Line<'static>> {
     };
 
     let colors = palette();
-    let mut lines = Vec::new();
-    for (idx, ev) in evs.iter().enumerate() {
-        match ev {
-            Ev::Hunk => lines.push(Line::from(Span::styled(
+    evs.into_iter()
+        .map(|ev| match ev {
+            Styled::Hunk => Line::from(Span::styled(
                 format!("{}⋯", " ".repeat(w * 2 + 2)),
                 Style::default().dim(),
-            ))),
-            Ev::Plain(t) => lines.push(Line::from(Span::styled(t.clone(), Style::default().dim()))),
-            Ev::Ctx(o, n, t) => {
-                old_hl.line(t);
-                let spans = new_hl.line(t);
-                let mut all = gutter(Some(*o), Some(*n), " ", Color::Reset);
-                all.extend(spans);
-                lines.push(Line::from(all));
+            )),
+            Styled::Plain(t) => Line::from(Span::styled(t, Style::default().dim())),
+            Styled::Ctx {
+                old,
+                new,
+                new_spans,
+                ..
+            } => {
+                let mut all = gutter(Some(old), Some(new), " ", Color::Reset);
+                all.extend(new_spans);
+                Line::from(all)
             }
-            Ev::Del(o, t) => {
-                let mut spans = old_hl.line(t);
-                if let Some(&range) = ranges.get(&idx) {
-                    spans = overlay_bg(spans, range, colors.diff_del_word_bg);
-                }
-                let mut all = gutter(Some(*o), None, "-", colors.diff_del_mark);
+            Styled::Del(o, spans) => {
+                let mut all = gutter(Some(o), None, "-", colors.diff_del_mark);
                 all.extend(spans);
-                lines.push(Line::from(all).style(Style::default().bg(colors.diff_del_bg)));
+                Line::from(all).style(Style::default().bg(colors.diff_del_bg))
             }
-            Ev::Add(n, t) => {
-                let mut spans = new_hl.line(t);
-                if let Some(&range) = ranges.get(&idx) {
-                    spans = overlay_bg(spans, range, colors.diff_add_word_bg);
-                }
-                let mut all = gutter(None, Some(*n), "+", colors.diff_add_mark);
+            Styled::Add(n, spans) => {
+                let mut all = gutter(None, Some(n), "+", colors.diff_add_mark);
                 all.extend(spans);
-                lines.push(Line::from(all).style(Style::default().bg(colors.diff_add_bg)));
+                Line::from(all).style(Style::default().bg(colors.diff_add_bg))
+            }
+        })
+        .collect()
+}
+
+/// One side of a side-by-side row: a line number, its `-`/`+` mark, the
+/// code, and the side's row tint.
+struct Half {
+    no: usize,
+    mark: &'static str,
+    mark_fg: Color,
+    spans: Vec<Span<'static>>,
+    bg: Option<Color>,
+}
+
+/// Render `diff` side by side for a `width`-wide pane: old lines on the
+/// left, new on the right, deletions paired with the additions that follow
+/// them. Each row is tagged with the [`render`] line it starts at, so a
+/// viewer can keep its place when the layout toggles. Long lines wrap
+/// within their column (or are clipped when `wrap` is off), and every row
+/// is exactly `width` columns.
+pub fn render_split(
+    rel: &str,
+    diff: &str,
+    width: usize,
+    wrap: bool,
+) -> Vec<(usize, Line<'static>)> {
+    let (evs, w) = styled(rel, diff);
+    let colors = palette();
+    let left_w = width.saturating_sub(1) / 2;
+    let right_w = width.saturating_sub(1) - left_w;
+    let full_row = |spans: Vec<Span<'static>>| Line::from(fit(spans, width, None));
+
+    let mut rows = Vec::new();
+    let pair =
+        |rows: &mut Vec<(usize, Line<'static>)>,
+         src: usize,
+         left: Option<Half>,
+         right: Option<Half>| {
+            let l = half_rows(left.as_ref(), w, left_w, wrap);
+            let r = half_rows(right.as_ref(), w, right_w, wrap);
+            for i in 0..l.len().max(r.len()).max(1) {
+                let mut spans = l
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| fit(Vec::new(), left_w, left.as_ref().and_then(|h| h.bg)));
+                spans.push(Span::styled("│", Style::default().dim()));
+                spans.extend(r.get(i).cloned().unwrap_or_else(|| {
+                    fit(Vec::new(), right_w, right.as_ref().and_then(|h| h.bg))
+                }));
+                rows.push((src, Line::from(spans)));
+            }
+        };
+    let del = |no: usize, spans: &[Span<'static>]| Half {
+        no,
+        mark: "-",
+        mark_fg: colors.diff_del_mark,
+        spans: spans.to_vec(),
+        bg: Some(colors.diff_del_bg),
+    };
+    let add = |no: usize, spans: &[Span<'static>]| Half {
+        no,
+        mark: "+",
+        mark_fg: colors.diff_add_mark,
+        spans: spans.to_vec(),
+        bg: Some(colors.diff_add_bg),
+    };
+
+    let mut i = 0;
+    while i < evs.len() {
+        match &evs[i] {
+            Styled::Hunk => {
+                let marker = format!("{}⋯", " ".repeat(w + 3));
+                rows.push((
+                    i,
+                    full_row(vec![Span::styled(marker, Style::default().dim())]),
+                ));
+                i += 1;
+            }
+            Styled::Plain(t) => {
+                let line = Line::from(Span::styled(t.clone(), Style::default().dim()));
+                let mut pieces = crate::wrap::wrap_line(&line, width.max(1));
+                if !wrap {
+                    pieces.truncate(1);
+                }
+                for piece in pieces {
+                    rows.push((i, full_row(piece.spans)));
+                }
+                i += 1;
+            }
+            Styled::Ctx {
+                old,
+                new,
+                old_spans,
+                new_spans,
+            } => {
+                let ctx = |no: usize, spans: &[Span<'static>]| Half {
+                    no,
+                    mark: " ",
+                    mark_fg: Color::Reset,
+                    spans: spans.to_vec(),
+                    bg: None,
+                };
+                pair(
+                    &mut rows,
+                    i,
+                    Some(ctx(*old, old_spans)),
+                    Some(ctx(*new, new_spans)),
+                );
+                i += 1;
+            }
+            Styled::Del(..) | Styled::Add(..) => {
+                let del_start = i;
+                while matches!(evs.get(i), Some(Styled::Del(..))) {
+                    i += 1;
+                }
+                let add_start = i;
+                while matches!(evs.get(i), Some(Styled::Add(..))) {
+                    i += 1;
+                }
+                let (dels, adds) = (add_start - del_start, i - add_start);
+                for k in 0..dels.max(adds) {
+                    let left = match evs.get(del_start + k) {
+                        Some(Styled::Del(no, spans)) if k < dels => Some(del(*no, spans)),
+                        _ => None,
+                    };
+                    let right = match evs.get(add_start + k) {
+                        Some(Styled::Add(no, spans)) if k < adds => Some(add(*no, spans)),
+                        _ => None,
+                    };
+                    let src = if k < dels {
+                        del_start + k
+                    } else {
+                        add_start + k
+                    };
+                    pair(&mut rows, src, left, right);
+                }
             }
         }
     }
-    lines
+    rows
+}
+
+/// Lay one side out in a `col`-wide column: the gutter on the first row,
+/// blank gutters on continuations, each row padded to the column.
+fn half_rows(half: Option<&Half>, w: usize, col: usize, wrap: bool) -> Vec<Vec<Span<'static>>> {
+    let Some(h) = half else {
+        return Vec::new();
+    };
+    let gutter_w = w + 3;
+    let code = Line::from(h.spans.clone());
+    let mut pieces = crate::wrap::wrap_line(&code, col.saturating_sub(gutter_w).max(1));
+    if !wrap {
+        pieces.truncate(1);
+    }
+    pieces
+        .into_iter()
+        .enumerate()
+        .map(|(i, piece)| {
+            let mut spans = if i == 0 {
+                vec![
+                    Span::styled(format!("{:>w$} ", h.no), Style::default().dim()),
+                    Span::styled(format!("{} ", h.mark), Style::default().fg(h.mark_fg)),
+                ]
+            } else {
+                vec![Span::raw(" ".repeat(gutter_w))]
+            };
+            spans.extend(piece.spans);
+            fit(spans, col, h.bg)
+        })
+        .collect()
+}
+
+/// Pad `spans` with spaces to exactly `col` columns (clipping anything
+/// wider) and give every span without its own background the row tint.
+fn fit(spans: Vec<Span<'static>>, col: usize, bg: Option<Color>) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut used = 0;
+    for span in spans {
+        let width = span.width();
+        if used + width > col {
+            let mut clipped = String::new();
+            for c in span.content.chars() {
+                let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+                if used + cw > col {
+                    break;
+                }
+                used += cw;
+                clipped.push(c);
+            }
+            out.push(Span::styled(clipped, span.style));
+            break;
+        }
+        used += width;
+        out.push(span);
+    }
+    if used < col {
+        out.push(Span::raw(" ".repeat(col - used)));
+    }
+    if let Some(bg) = bg {
+        for span in &mut out {
+            if span.style.bg.is_none() {
+                span.style = span.style.bg(bg);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -321,6 +571,97 @@ mod tests {
         assert!(lines[1].to_string().contains("-- trailing comment"));
         // Old-side numbering must not skip: line 3 is old line 3, not 2.
         assert!(lines[2].to_string().starts_with(" 3  2"));
+    }
+
+    /// The plain text of each half of a side-by-side row, split at the `│`.
+    fn halves(line: &Line<'_>) -> (String, String) {
+        let text = line.to_string();
+        let (l, r) = text
+            .split_once('│')
+            .expect("a side-by-side row has a divider");
+        (l.trim_end().to_string(), r.trim_end().to_string())
+    }
+
+    #[test]
+    fn side_by_side_pairs_old_and_new_lines() {
+        let colors = palette();
+        let rows = render_split("app.ts", DIFF, 100, true);
+        // ctx, the del/add pair, the leftover add, ctx.
+        assert_eq!(rows.len(), 4);
+        let (l, r) = halves(&rows[0].1);
+        assert!(l.starts_with(" 1   import"), "{l:?}");
+        assert!(r.starts_with(" 1   import"), "{r:?}");
+        let (l, r) = halves(&rows[1].1);
+        assert!(
+            l.starts_with(" 2 - console.log(\"scm-playground up\");"),
+            "{l:?}"
+        );
+        assert!(r.starts_with(" 2 + console.log(\"scm oh yeah\");"), "{r:?}");
+        // Each half carries its own tint, and the word-level tints survive.
+        let bgs: Vec<_> = rows[1].1.spans.iter().map(|s| s.style.bg).collect();
+        assert!(bgs.contains(&Some(colors.diff_del_bg)));
+        assert!(bgs.contains(&Some(colors.diff_add_bg)));
+        assert!(bgs.contains(&Some(colors.diff_del_word_bg)));
+        assert!(bgs.contains(&Some(colors.diff_add_word_bg)));
+        // An addition with no deletion to pair with leaves the old side empty.
+        let (l, r) = halves(&rows[2].1);
+        assert_eq!(l, "");
+        assert!(r.starts_with(" 3 + // TODO: debounce input"), "{r:?}");
+        let (l, r) = halves(&rows[3].1);
+        assert!(l.starts_with(" 3   search"), "{l:?}");
+        assert!(r.starts_with(" 4   search"), "{r:?}");
+    }
+
+    #[test]
+    fn side_by_side_rows_fill_the_width_and_map_to_unified_lines() {
+        let rows = render_split("app.ts", DIFF, 80, true);
+        for (_, row) in &rows {
+            assert_eq!(row.width(), 80, "{:?}", row.to_string());
+        }
+        // Tagged with the unified line each row starts at, so toggling the
+        // layout keeps the reader's place.
+        let srcs: Vec<usize> = rows.iter().map(|(src, _)| *src).collect();
+        assert_eq!(srcs, vec![0, 1, 3, 4]);
+    }
+
+    #[test]
+    fn side_by_side_wraps_within_each_column() {
+        let long = format!(
+            "@@ -1,1 +1,1 @@\n-{}\n+short\n",
+            "word ".repeat(20).trim_end()
+        );
+        let rows = render_split("x.txt", &long, 60, true);
+        assert!(rows.len() > 1, "a long old line wraps onto more rows");
+        for (src, row) in &rows[1..] {
+            // The first hunk has no marker row, so the pair is line 0.
+            assert_eq!(*src, 0, "continuations belong to the same pair");
+            assert_eq!(row.width(), 60);
+            let (l, r) = halves(row);
+            assert!(
+                l.starts_with("    "),
+                "continuations leave the gutter blank: {l:?}"
+            );
+            assert_eq!(r, "", "the short new line does not repeat");
+        }
+        let unwrapped = render_split("x.txt", &long, 60, false);
+        assert_eq!(unwrapped.len(), 1, "one clipped row");
+        assert_eq!(unwrapped[0].1.width(), 60);
+    }
+
+    #[test]
+    fn side_by_side_keeps_hunk_markers_and_plain_lines_full_width() {
+        let two_hunks = "@@ -1,1 +1,1 @@\n ctx\n@@ -9,1 +9,1 @@\n ctx2\n";
+        let rows = render_split("x.rs", two_hunks, 40, true);
+        assert_eq!(rows.len(), 3);
+        assert!(rows[1].1.to_string().contains('⋯'));
+        let bin = render_split(
+            "x.bin",
+            "Binary files a/x.bin and b/x.bin differ\n",
+            40,
+            true,
+        );
+        assert_eq!(bin.len(), 1);
+        assert!(bin[0].1.to_string().starts_with("Binary files"));
     }
 
     #[test]
