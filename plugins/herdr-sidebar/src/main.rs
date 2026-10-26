@@ -27,6 +27,10 @@ fn main() -> std::io::Result<()> {
     let mode = std::env::args().nth(1);
     match mode.as_deref() {
         Some("--ensure") => return ensure::run(ensure::Mode::Ensure),
+        Some("--autohide-watch") => {
+            let tab = std::env::args().nth(2).unwrap_or_default();
+            return herdr_sidebar::autohide::watch(&tab);
+        }
         Some("--toggle") => {
             return ensure::run(ensure::Mode::Toggle(View::Explorer));
         }

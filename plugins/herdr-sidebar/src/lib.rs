@@ -5,6 +5,7 @@
 
 pub mod actions;
 pub mod ansi;
+pub mod autohide;
 pub mod branch_ui;
 pub mod diffview;
 pub mod editor;
