@@ -67,15 +67,15 @@ struct SiblingCwd {
     focused: bool,
 }
 
-/// How often a sidebar in the focused tab polls `pane.list` for its sibling's
-/// cwd. herdr reports a `cd` within milliseconds, so this alone bounds how
-/// long the tree lags behind the terminal; the 5 s heartbeat made it feel
-/// stuck.
+/// How often a sidebar polls `pane.list` for its sibling's live cwd while its
+/// tab is on screen. herdr reports a `cd` within milliseconds, so this bounds
+/// how long the tree lags behind the terminal; the 5 s heartbeat felt stuck.
 pub const FOLLOW_CWD_EVERY: std::time::Duration = std::time::Duration::from_millis(300);
 
-/// Background tabs poll slower: every sidebar is a `pane.list` client, and
-/// nobody watches a tab that is not on screen.
-pub const FOLLOW_CWD_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Background tabs keep the historical heartbeat cadence: every sidebar (one
+/// per preview tab) is a `pane.list` client, and nobody watches a tab that is
+/// not on screen.
+pub const FOLLOW_CWD_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The next cwd-poll interval: fast while any pane in this sidebar's tab has
 /// focus, slow otherwise (including on unparsable input).
@@ -97,6 +97,91 @@ pub fn follow_cwd_interval(pane_list_json: &str, my_pane_id: &str) -> std::time:
         FOLLOW_CWD_EVERY
     } else {
         FOLLOW_CWD_IDLE
+    }
+}
+
+/// Samples `pane.list` for cwd following on a worker thread: at the focused
+/// cadence that is ~3 socket round trips a second, and each can wait out the
+/// 5 s IPC timeout on a busy server, so it must never run on the UI loop.
+///
+/// A sample is handed to the [`CwdFollower`] only once two consecutive samples
+/// agree. Fast sampling otherwise catches transient `foreground_cwd` values
+/// (a tool that briefly runs elsewhere), and each one would re-root the view
+/// and release a manual folder choice that 5 s sampling used to miss.
+#[derive(Debug)]
+pub struct FollowPoller {
+    inflight: Option<std::sync::mpsc::Receiver<Option<String>>>,
+    last_start: Option<std::time::Instant>,
+    every: std::time::Duration,
+    last_sample: Option<Vec<SiblingCwd>>,
+}
+
+impl Default for FollowPoller {
+    fn default() -> Self {
+        Self {
+            inflight: None,
+            last_start: None,
+            every: FOLLOW_CWD_EVERY,
+            last_sample: None,
+        }
+    }
+}
+
+impl FollowPoller {
+    /// Start a background sample when one is due and none is running.
+    pub fn maybe_start(
+        &mut self,
+        now: std::time::Instant,
+        fetch: impl FnOnce() -> Option<String> + Send + 'static,
+    ) {
+        if self.inflight.is_some()
+            || self
+                .last_start
+                .is_some_and(|started| now.saturating_duration_since(started) < self.every)
+        {
+            return;
+        }
+        self.last_start = Some(now);
+        let (tx, rx) = std::sync::mpsc::channel();
+        if std::thread::Builder::new()
+            .name("cwd-follow".into())
+            .spawn(move || {
+                let _ = tx.send(fetch());
+            })
+            .is_ok()
+        {
+            self.inflight = Some(rx);
+        }
+    }
+
+    /// A finished sample, without blocking: `Some(None)` is a failed one.
+    pub fn take(&mut self) -> Option<Option<String>> {
+        let rx = self.inflight.as_ref()?;
+        let sample = match rx.try_recv() {
+            Ok(sample) => sample,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.inflight = None;
+        Some(sample)
+    }
+
+    /// Adapt the cadence to this sample and, once it is confirmed by the
+    /// previous one, ask the follower where to go.
+    pub fn accept(
+        &mut self,
+        pane_list_json: &str,
+        my_pane_id: &str,
+        follower: &mut CwdFollower,
+    ) -> Option<String> {
+        self.every = follow_cwd_interval(pane_list_json, my_pane_id);
+        let sample = sibling_cwds(pane_list_json, my_pane_id);
+        let confirmed = self.last_sample.as_ref() == Some(&sample);
+        self.last_sample = Some(sample);
+        if !confirmed {
+            return None;
+        }
+        follower.next_cwd(pane_list_json, my_pane_id)
     }
 }
 
@@ -1369,6 +1454,77 @@ mod tests {
             FOLLOW_CWD_IDLE
         );
         assert_eq!(follow_cwd_interval("garbage", "w1:p3"), FOLLOW_CWD_IDLE);
+    }
+
+    #[test]
+    fn the_poller_follows_a_cd_only_once_two_samples_agree() {
+        let at = |cwd: &str| {
+            pane_list(&format!(
+                r#"{{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"}},
+                   {{"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"{cwd}","focused":true}}"#
+            ))
+        };
+        let mut follower = CwdFollower::default();
+        let mut poll = FollowPoller::default();
+        assert_eq!(poll.accept(&at("/one"), "w1:p3", &mut follower), None);
+        assert_eq!(
+            poll.accept(&at("/one"), "w1:p3", &mut follower).as_deref(),
+            Some("/one")
+        );
+        // A one-sample excursion is ignored, and so cannot release a manual
+        // folder choice either.
+        follower.mark_manual_folder();
+        assert_eq!(poll.accept(&at("/tmp/x"), "w1:p3", &mut follower), None);
+        assert_eq!(poll.accept(&at("/one"), "w1:p3", &mut follower), None);
+        assert_eq!(poll.accept(&at("/one"), "w1:p3", &mut follower), None);
+        // A real cd lands on the second sample.
+        assert_eq!(poll.accept(&at("/two"), "w1:p3", &mut follower), None);
+        assert_eq!(
+            poll.accept(&at("/two"), "w1:p3", &mut follower).as_deref(),
+            Some("/two")
+        );
+    }
+
+    #[test]
+    fn the_poller_samples_off_thread_at_the_tabs_cadence() {
+        let unfocused = pane_list(
+            r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"},
+               {"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"/one"},
+               {"pane_id":"w1:p4","tab_id":"w1:t2","focused":true}"#,
+        );
+        let mut poll = FollowPoller::default();
+        let now = std::time::Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let json = unfocused.clone();
+        poll.maybe_start(now, move || {
+            rx.recv().ok()?;
+            Some(json)
+        });
+        // Still running: no result, and no second sample is started.
+        assert_eq!(poll.take(), None);
+        let first = poll.last_start;
+        poll.maybe_start(now + FOLLOW_CWD_IDLE, || None);
+        assert_eq!(poll.last_start, first, "a sample is already in flight");
+        tx.send(()).unwrap();
+        let sample = loop {
+            if let Some(sample) = poll.take() {
+                break sample;
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(sample.as_deref(), Some(unfocused.as_str()));
+        poll.accept(&unfocused, "w1:p3", &mut CwdFollower::default());
+        // A background tab keeps the 5 s cadence.
+        poll.maybe_start(now + FOLLOW_CWD_EVERY, || None);
+        assert!(poll.inflight.is_none(), "a background tab is not due yet");
+        poll.maybe_start(now + FOLLOW_CWD_IDLE, || None);
+        let failed = loop {
+            if let Some(sample) = poll.take() {
+                break sample;
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(failed, None);
     }
 
     const FOCUSED: &str =

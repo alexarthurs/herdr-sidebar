@@ -971,10 +971,9 @@ pub struct App {
     pane_ctl: Option<PaneCtl>,
     /// Last heartbeat stamp, throttling the token refresh.
     last_beat: std::time::Instant,
-    /// Last sibling-cwd poll and the gap until the next one (fast in the
-    /// focused tab, see `launch::follow_cwd_interval`).
-    last_follow: std::time::Instant,
-    follow_every: std::time::Duration,
+    /// Background `pane.list` sampling for cwd following (see
+    /// `launch::FollowPoller`).
+    follow_poll: herdr_sidebar::launch::FollowPoller,
     /// A native folder picker running on a background thread; its result
     /// arrives here (None = cancelled).
     picking: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
@@ -1100,8 +1099,7 @@ impl App {
             other_exe,
             pane_ctl,
             last_beat: std::time::Instant::now(),
-            last_follow: std::time::Instant::now(),
-            follow_every: herdr_sidebar::launch::FOLLOW_CWD_EVERY,
+            follow_poll: Default::default(),
             picking: None,
             cwd_follower,
             persisted_draft_roots,
@@ -1232,10 +1230,7 @@ impl App {
     /// Re-stamp the identity tokens so launchers know this pane is alive.
     pub fn heartbeat(&mut self) {
         self.poll_unified_close();
-        if self.last_follow.elapsed() >= self.follow_every {
-            self.last_follow = std::time::Instant::now();
-            self.follow_sibling_cwd();
-        }
+        self.follow_sibling_cwd();
         if self.last_beat.elapsed() < std::time::Duration::from_secs(5) {
             return;
         }
@@ -1294,15 +1289,17 @@ impl App {
         {
             return;
         }
-        let Some(ctl) = &self.pane_ctl else { return };
-        let Ok(panes) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) else {
+        let Some(pane_id) = self.pane_ctl.as_ref().map(|ctl| ctl.pane_id.clone()) else {
             return;
         };
-        self.follow_every = herdr_sidebar::launch::follow_cwd_interval(&panes, &ctl.pane_id);
+        let sample = self.follow_poll.take();
+        self.follow_poll.maybe_start(std::time::Instant::now(), || {
+            herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})).ok()
+        });
+        let Some(Some(panes)) = sample else { return };
         let target = self
-            .cwd_follower
-            .borrow_mut()
-            .next_cwd(&panes, &ctl.pane_id);
+            .follow_poll
+            .accept(&panes, &pane_id, &mut self.cwd_follower.borrow_mut());
         let Some(target) = target else { return };
         let target = PathBuf::from(target);
         if target == self.cwd || !target.is_dir() || std::env::set_current_dir(&target).is_err() {

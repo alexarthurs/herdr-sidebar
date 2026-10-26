@@ -468,9 +468,15 @@ HACKING.md — budget time for that before promising a patched build.
   deliberately has NO fallback to `cwd`: an absent live value is safer than silently
   re-rooting to a stale directory.
 - "Follow pane folder" is persisted as `follow_cwd` in `state.json` and defaults on,
-  including for state files written before the field existed. Both views sample on the
-  existing ~5s heartbeat and share one process-local `CwdFollower`, so precedence survives
-  an app rebuild and unified-view switch.
+  including for state files written before the field existed. Both views share one
+  process-local `CwdFollower`, so precedence survives an app rebuild and unified-view switch.
+- Sampling (#104) runs on `launch::FollowPoller`'s worker thread, every 300 ms while any pane
+  in the sidebar's tab has focus and every 5 s otherwise (the old heartbeat cadence; one
+  sidebar per preview tab makes background polling multiply). It must stay off the UI loop:
+  at 300 ms a synchronous `pane.list` (5 s IPC timeout) would stall input several times a
+  second on a busy server. A sample reaches the follower only once the next sample agrees —
+  fast sampling otherwise catches transient `foreground_cwd` values, and each would re-root
+  the view (SCM rebuilds its whole app) and release a manual folder choice.
 - Multi-pane precedence is deterministic: focused eligible sibling, then the previously
   followed sibling, then lexical pane id. Candidate lists are sorted before selection;
   `pane.list` response order is never treated as meaningful. Explorer, Source Control,
@@ -614,9 +620,10 @@ HACKING.md — budget time for that before promising a patched build.
   other mobile herdr clients have no right-click at all, and `pane send-keys` can't send
   one either). It routes through the same builder ctrl+right-click uses, so the menus
   can never drift apart; the explorer anchors the popup under the selected row via
-  `selection_anchor`, the SCM view via its existing `row_y`. The footer hint reads
-  `m / ctrl+rclick: menu` — same width as the old `ctrl+rclick for menus`, so it still
-  fits a ~34-col pane.
+  `selection_anchor`, the SCM view via its existing `row_y`. The footer hint
+  (`ui::fit_menu_hint`, #103) is the longest of `m / ctrl+rclick for menus`,
+  `m / ctrl+rclick: menu` and `m: menu` that fits beside the « button, or nothing, so a
+  24-column sidebar never clips it.
 - Gotcha: after the ✧ suggestion lands, panel focus moves to the message box — letter keys
   then type text instead of triggering actions (Esc returns to the list).
 - Explorer Quick Open is `Ctrl+P` and reuses the normal preview client rather than inventing
