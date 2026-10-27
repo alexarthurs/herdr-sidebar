@@ -53,6 +53,11 @@ Use the mouse or press `1`, `2`, and `3`.
 - Find files with `Ctrl+P`; search project contents with `Ctrl+F` or `Ctrl+Shift+F`.
   Search supports case, whole-word, regex, and include/exclude filters.
 - Stage files or folders from the tree without crossing nested-repository boundaries.
+- Drag a file or folder onto another folder to move or copy it (the footer asks which;
+  hovering a closed folder opens it). Files dropped from a file manager are copied into
+  the selected folder. `Ctrl+X` / `Ctrl+C` / `Ctrl+V` (or the context menu) cut, copy
+  and paste files, and share them with the file manager through the system clipboard
+  (Linux needs `xclip` or `wl-clipboard`).
 - Opt into a terminal editor for mouse clicks, while Enter keeps the built-in preview.
 - Press `e` in a text preview for the experimental editor with selection, find,
   clipboard actions, explicit save, and external-change protection.
@@ -114,6 +119,7 @@ folder stays put until that pane changes directory again.
 | `Enter` | toggle / preview | `c` | commit message |
 | `Ctrl+P` | quick open | `A` | draft message |
 | `Ctrl+F` | content search | `S` | sync |
+| `Ctrl+X` / `C` / `V` | cut / copy / paste files | | |
 | `.` | hidden files | `o` | open diff |
 | `r` | refresh | `r` | refresh |
 | `m` | context menu | `m` | context menu |

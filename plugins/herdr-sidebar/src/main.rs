@@ -15,7 +15,10 @@ use std::io::Read;
 use std::rc::Rc;
 use std::time::Duration;
 
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event,
+};
 use herdr_sidebar::{ensure, launch, state, viewer};
 use state::{Exit, View};
 
@@ -238,7 +241,9 @@ fn main() -> std::io::Result<()> {
     // turns every pane we draw monochrome.
     crossterm::style::force_color_output(true);
     let mut terminal = ratatui::init();
-    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // Bracketed paste: a file dropped from a file manager arrives as pasted
+    // text, and only a marked paste can be told apart from typed shortcuts.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
     // First run on a machine without a Nerd Font: offer to install one
     // before any icons render. The prompt stamps the pane's identity token
     // itself (the app loops haven't started yet, and a token-less pane gets
@@ -304,7 +309,11 @@ fn main() -> std::io::Result<()> {
             }
         }
     };
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture
+    );
     ratatui::restore();
     result
 }
@@ -530,6 +539,7 @@ fn run_explorer(
             let exit = match event::read()? {
                 Event::Key(key) => app.on_key(key),
                 Event::Mouse(mouse) => app.on_mouse(mouse),
+                Event::Paste(text) => app.on_paste(text),
                 Event::Resize(width, _) => {
                     app.on_resize(width);
                     None
@@ -569,6 +579,7 @@ fn run_scm(
             let exit = match event::read()? {
                 Event::Key(key) => app.on_key(key),
                 Event::Mouse(mouse) => app.on_mouse(mouse),
+                Event::Paste(text) => app.on_paste(text),
                 Event::Resize(width, _) => {
                     app.on_resize(width);
                     None

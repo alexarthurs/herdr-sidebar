@@ -696,6 +696,48 @@ HACKING.md — budget time for that before promising a patched build.
   button. The active view's selection chip always wins over hover.
   Hit zones come from each rendered glyph's actual width, so emoji and Nerd Font themes stay aligned.
 
+### Explorer drag and drop, Cut / Copy / Paste (`src/transfer.rs`)
+
+Verified live against herdr 0.9.1 on Linux (X11, Cinnamon):
+
+- herdr forwards button-held motion (`Drag(Left)`) and releases (`Up(Left)`) to a plugin pane
+  with mouse capture, so tree drag and drop is driven entirely by SGR mouse input. A press only
+  becomes a drag once the pointer leaves the pressed ROW (a shaky click stays a click). The
+  press has already run the click's action by then — a folder press toggled the folder, so
+  starting a drag toggles it back (`Press::toggled`); a file press has already previewed it.
+- **Do not rely on modifiers in mouse events.** Ctrl/Alt at the release preselect Copy when the
+  terminal reports them, but the drop always opens a footer confirmation (Move / Copy / Cancel,
+  clickable, also `⏎` / `m` / `c` / Tab / Esc), like VS Code's `explorer.confirmDragAndDrop`.
+  Dropping back onto the source's own folder is a silent no-op; a folder into itself or a
+  descendant is refused (`transfer::drop_problem`).
+- Terminals send NO motion while the pointer rests, so folder auto-open (700 ms) and edge
+  auto-scroll run from `tick()`; `is_syncing()` returns true while dragging to get the 120 ms
+  animation tick instead of the 500 ms idle poll. A plain `Moved` event (no button) during a drag
+  means the release was lost outside the pane: the drag is cancelled.
+- Moves use `fs::rename` (never overwrite — a taken name is an error), falling back to copy +
+  delete on `CrossesDevices`; copies pick `name copy.ext` / `name copy 2.ext` and recreate
+  symlinks rather than following them. Both run on a worker thread (`transfer_rx`) so a big
+  folder cannot starve the heartbeat. Deliberately NOT `git mv`: git detects the rename on stage.
+- A file manager drop reaches a terminal app only as PASTED TEXT (shell-quoted paths, escaped
+  paths or `file://` URIs depending on the emulator) — no coordinates, and herdr delivers it to
+  the FOCUSED pane, so the sidebar must be focused and the destination is the selected folder
+  (New File semantics). The TUI therefore enables bracketed paste (`EnableBracketedPaste` in
+  `main.rs`); `transfer::parse_dropped` only accepts text whose every item is an existing
+  absolute path. Any other paste in the bare tree is IGNORED (replayed as keys it would run
+  shortcuts — `q` quits); in text fields it is replayed as ONE line (`ui::paste_keys`: a pasted
+  newline must not submit a prompt or the SCM commit box). Bracketed paste was driven with
+  `pane send-text` + `ESC[200~ … ESC[201~`, which bypasses herdr's own paste path; a real drop
+  from a file manager still needs a manual check per terminal.
+- File clipboard: a single `xclip` / `wl-copy` process serves ONE target, so Linux writes
+  `x-special/gnome-copied-files` (`copy`/`cut` + URIs: Nautilus, Nemo, Caja — the only format
+  that carries Cut) except on KDE, which gets `text/uri-list`. macOS uses `osascript` with
+  `POSIX file` items, Windows `Set-Clipboard -LiteralPath`; both are unverified. OSC 52 is text
+  only, so over SSH Copy still works inside the sidebar but not toward the file manager. Paste
+  prefers the system clipboard (a file manager's Copy/Cut, Cut there means move) and falls back
+  to the Explorer's own clipboard only when the export had failed.
+- `Ctrl+C` in the tree was previously swallowed by the bare `c` (change folder) arm because the
+  match ignored modifiers; the ctrl arms now come first.
+
 ### Explorer git decorations & staging (`src/gitdeco.rs`, issues #19/#20)
 
 - The Explorer decorates rows from `Git::discover_all` (the SAME repo set the SCM view

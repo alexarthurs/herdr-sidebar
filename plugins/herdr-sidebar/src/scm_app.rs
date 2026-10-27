@@ -1606,6 +1606,25 @@ impl App {
         }
     }
 
+    /// Bracketed paste: typed into the commit message or the branch picker's
+    /// name field; ignored elsewhere, where its letters would run shortcuts.
+    pub fn on_paste(&mut self, text: String) -> Option<Exit> {
+        let typing = match self.overlay {
+            Some(Overlay::BranchPicker(_)) => true,
+            Some(_) => false,
+            None => self.focus == Focus::Message,
+        };
+        if !typing {
+            return None;
+        }
+        for key in herdr_sidebar::ui::paste_keys(&text) {
+            if let Some(exit) = self.on_key(key) {
+                return Some(exit);
+            }
+        }
+        None
+    }
+
     /// Handle one key press; `Some(exit)` ends the event loop.
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Exit> {
         if key.kind != KeyEventKind::Press {

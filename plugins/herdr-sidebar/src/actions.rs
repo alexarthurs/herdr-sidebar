@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 pub enum MenuAction {
     NewFile,
     NewFolder,
+    /// Cut / Copy / Paste of the files themselves (not their paths).
+    Cut,
+    Copy,
+    Paste,
     CopyPath,
     CopyRelativePath,
     Rename,
@@ -52,6 +56,14 @@ pub fn menu_entries(target: Option<bool>, in_repo: bool) -> Vec<MenuEntry> {
             MenuEntry::Action(MenuAction::Stage, "Stage Changes"),
         ]);
     }
+    entries.push(MenuEntry::Separator);
+    if target.is_some() {
+        entries.extend([
+            MenuEntry::Action(MenuAction::Cut, "Cut"),
+            MenuEntry::Action(MenuAction::Copy, "Copy"),
+        ]);
+    }
+    entries.push(MenuEntry::Action(MenuAction::Paste, "Paste"));
     if target.is_some() {
         entries.extend([
             MenuEntry::Separator,
@@ -297,7 +309,7 @@ fn osc52_sequence_fits(input_len: usize) -> bool {
 /// friends exit in milliseconds; one that hangs must not wedge its caller.
 const CLIPBOARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-fn copy_with(argv: &[&str], text: &str) -> io::Result<()> {
+pub(crate) fn copy_with(argv: &[&str], text: &str) -> io::Result<()> {
     use std::io::Write;
 
     let mut child = clipboard_command(argv)
@@ -372,7 +384,7 @@ fn copy_with(argv: &[&str], text: &str) -> io::Result<()> {
 /// a PowerShell 7 `PSModulePath` (issue #96): 5.1 would autoload PS7's
 /// CoreCLR modules and lose `Get-Clipboard`. Without the variable, 5.1 uses
 /// its own defaults.
-fn clipboard_command(argv: &[&str]) -> std::process::Command {
+pub(crate) fn clipboard_command(argv: &[&str]) -> std::process::Command {
     let mut command = std::process::Command::new(argv[0]);
     command.args(&argv[1..]);
     if argv[0].eq_ignore_ascii_case("powershell") {
@@ -784,7 +796,7 @@ fn tab_create_ids(response: &str) -> Option<(String, String)> {
 
 /// Quote text embedded in a double-quoted AppleScript string literal.
 #[cfg(any(test, target_os = "macos"))]
-fn applescript_escape(text: &str) -> String {
+pub(crate) fn applescript_escape(text: &str) -> String {
     text.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
@@ -868,9 +880,12 @@ mod tests {
         let row = menu_entries(Some(false), true);
         assert!(matches!(row[0], MenuEntry::Action(MenuAction::NewFile, _)));
         assert!(has(&row, MenuAction::Delete));
+        assert!(has(&row, MenuAction::Cut) && has(&row, MenuAction::Copy));
         let root = menu_entries(None, true);
         assert!(!has(&root, MenuAction::Rename));
         assert!(has(&root, MenuAction::Reveal));
+        // The root can receive a paste, but there is nothing to cut or copy.
+        assert!(has(&root, MenuAction::Paste) && !has(&root, MenuAction::Cut));
     }
 
     #[test]

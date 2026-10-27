@@ -3,6 +3,7 @@
 //! pane-list parsing both views use to find their sibling panes. One home —
 //! these used to be copy-mirrored between two crates.
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -12,6 +13,22 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::icons::IconTheme;
 use crate::state::{ColorTheme, View};
+
+/// A bracketed paste replayed as typed keys into a one-line text field.
+/// Line breaks and tabs become spaces — a pasted newline must not submit the
+/// field the way typing Enter would — and other control characters drop.
+pub fn paste_keys(text: &str) -> Vec<KeyEvent> {
+    text.trim_end_matches(['\r', '\n'])
+        .replace("\r\n", "\n")
+        .chars()
+        .filter_map(|c| match c {
+            '\n' | '\r' | '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .map(|c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+        .collect()
+}
 
 /// Keycap chip colors for the footer hints — a subtle "keyboard key" look
 /// instead of a wall of dim text.
@@ -980,6 +997,19 @@ mod tests {
             assert!(hits(rect, rect.x, 0));
             assert_eq!(action, TitleAction::NewFolder);
         }
+    }
+
+    #[test]
+    fn pasted_text_types_one_line_without_submitting() {
+        let typed: String = paste_keys("a b\r\nc\td\u{7}\n")
+            .into_iter()
+            .map(|key| match key.code {
+                KeyCode::Char(c) => c,
+                other => panic!("unexpected key {other:?}"),
+            })
+            .collect();
+        assert_eq!(typed, "a b c d");
+        assert!(paste_keys("\n").is_empty());
     }
 
     #[test]

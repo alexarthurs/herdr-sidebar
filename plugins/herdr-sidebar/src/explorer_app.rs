@@ -24,6 +24,7 @@ use herdr_sidebar::gitdeco::{Decorations, RepoStatus};
 use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::ipc;
 use herdr_sidebar::state::{self as sidebar, View};
+use herdr_sidebar::transfer::{self, Op};
 use herdr_sidebar::tree::{Row, Tree};
 use herdr_sidebar::ui::{
     TitleAction, activity_button_style, activity_icons, chrome_button_style, draw_activity_caps,
@@ -43,6 +44,8 @@ const MY_VIEW: View = View::Explorer;
 /// that.
 const DECO_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
 const TREE_SYNC_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long a drag must rest on a collapsed folder before it opens.
+const DRAG_OPENS_FOLDER: std::time::Duration = std::time::Duration::from_millis(700);
 
 struct RepoDecorationRefresh {
     root: PathBuf,
@@ -160,6 +163,41 @@ struct BodyGeom {
     offset: usize,
 }
 
+/// A left press on a tree row. It becomes a [`Drag`] once the pointer leaves
+/// that row with the button still held, so a slightly shaky click stays a
+/// click.
+struct Press {
+    index: usize,
+    path: PathBuf,
+    /// The press already expanded/collapsed this folder; a drag undoes that.
+    toggled: bool,
+}
+
+/// A tree row being dragged onto another folder.
+struct Drag {
+    source: PathBuf,
+    /// The collapsed folder under the pointer and since when: resting on it
+    /// for [`DRAG_OPENS_FOLDER`] opens it, like VS Code.
+    hover_folder: Option<(PathBuf, std::time::Instant)>,
+}
+
+/// The Explorer's own Cut / Copy. `exported` = the same files also reached
+/// the system clipboard, which then takes precedence on Paste (a file
+/// manager may have replaced them since).
+struct FileClip {
+    paths: Vec<PathBuf>,
+    op: Op,
+    exported: bool,
+}
+
+/// A transfer confirmation's footer buttons.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransferChoice {
+    Move,
+    Copy,
+    Cancel,
+}
+
 /// What a prompt's input will be used for on Enter.
 enum PromptKind {
     NewFile(PathBuf),
@@ -194,6 +232,16 @@ enum Overlay {
     ConfirmDelete {
         path: PathBuf,
         is_dir: bool,
+    },
+    /// Files about to be moved or copied into `dest` (a drag, or files
+    /// dropped from a file manager): Move / Copy / Cancel in the footer.
+    /// `op` is the preselected answer that Enter picks.
+    ConfirmTransfer {
+        sources: Vec<PathBuf>,
+        dest: PathBuf,
+        op: Op,
+        /// Button click zones from the last draw.
+        buttons: Vec<(Rect, TransferChoice)>,
     },
     /// The ⚙ settings modal: mouse-toggleable panel settings.
     Settings {
@@ -397,6 +445,12 @@ pub struct App {
     search_scroll: usize,
     search_snap: bool,
     pending_unified_width: Option<(u16, std::time::Instant)>,
+    press: Option<Press>,
+    drag: Option<Drag>,
+    file_clip: Option<FileClip>,
+    /// A move/copy running on a worker so a big folder cannot starve the
+    /// heartbeat; the destination comes back with the outcome.
+    transfer_rx: Option<std::sync::mpsc::Receiver<(transfer::Outcome, PathBuf)>>,
 }
 
 /// How long two clicks on the same row still count as a double click.
@@ -518,6 +572,10 @@ impl App {
             search_scroll: 0,
             search_snap: false,
             pending_unified_width: None,
+            press: None,
+            drag: None,
+            file_clip: None,
+            transfer_rx: None,
         };
         app.apply_identity();
         app.request_decorations(true);
@@ -537,6 +595,8 @@ impl App {
         self.collect_quick_index();
         self.collect_content_search();
         self.collect_git_sync();
+        self.collect_transfer();
+        self.drag_tick();
         self.start_content_search_if_due();
         self.collect_decorations();
         if self.last_deco.elapsed() < DECO_REFRESH {
@@ -545,8 +605,10 @@ impl App {
         self.request_decorations(false);
     }
 
+    /// Work that wants the fast animation tick: a sync, a running transfer,
+    /// or a drag (folder auto-open and edge scrolling happen between events).
     pub fn is_syncing(&self) -> bool {
-        self.git_syncing.is_some()
+        self.git_syncing.is_some() || self.transfer_rx.is_some() || self.drag.is_some()
     }
 
     /// A separated Source Control pane can change this shared setting while
@@ -1033,6 +1095,10 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return None;
         }
+        if self.drag.is_some() && key.code == KeyCode::Esc {
+            self.drag = None;
+            return None;
+        }
         if key.code == KeyCode::Char('q')
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
@@ -1123,7 +1189,12 @@ impl App {
             self.overlay_key(key);
             return None;
         }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
+            KeyCode::Char('x') if ctrl => self.clip_selection(Op::Move),
+            KeyCode::Char('c') if ctrl => self.clip_selection(Op::Copy),
+            KeyCode::Char('v') if ctrl => self.paste_files(),
             KeyCode::Char('q') => return Some(Exit::Quit),
             // Esc never quits the sidebar — it closes the preview instead.
             KeyCode::Esc => self.close_preview(),
@@ -1215,11 +1286,22 @@ impl App {
         }
         match mouse.kind {
             MouseEventKind::Moved => {
+                // Motion without a button: the release was lost (it happened
+                // outside the pane), so the drag is over.
+                self.press = None;
+                self.drag = None;
                 self.hovered = self.row_at(mouse.row);
             }
             MouseEventKind::ScrollUp => self.scroll_view(-3),
             MouseEventKind::ScrollDown => self.scroll_view(3),
+            MouseEventKind::Drag(MouseButton::Left) => self.drag_motion(mouse.row),
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.press = None;
+                self.finish_drag(mouse.row, mouse.modifiers);
+            }
             MouseEventKind::Down(MouseButton::Left) => {
+                self.press = None;
+                self.drag = None;
                 if let Some(&(_, action)) = self
                     .title_zones
                     .iter()
@@ -1248,11 +1330,17 @@ impl App {
                     .take()
                     .is_some_and(|(i, at)| i == index && now.duration_since(at) < DOUBLE_CLICK);
                 self.last_click = Some((index, now));
+                let toggles = is_dir && folder_click_toggles(on_chevron, double);
+                self.press = Some(Press {
+                    index,
+                    path: path.clone(),
+                    toggled: toggles,
+                });
                 if is_dir {
                     // A single click anywhere on the row toggles. Suppress a
                     // name's second click so a double-click cannot immediately
                     // undo the first; explicit chevron clicks always toggle.
-                    if folder_click_toggles(on_chevron, double) {
+                    if toggles {
                         self.toggle();
                     }
                 } else if self.sidebar_state.custom_editor_on_click
@@ -1287,6 +1375,316 @@ impl App {
                 self.open_context_menu(mouse.column, mouse.row);
             }
             _ => {}
+        }
+        None
+    }
+
+    /// Where a drop on pane row `mouse_row` lands: a folder row is itself the
+    /// destination, a file row means its folder, and the empty space under
+    /// the last row means the root. `None` outside the list.
+    fn drop_dir_at(&self, mouse_row: u16) -> Option<PathBuf> {
+        if let Some(index) = self.row_at(mouse_row) {
+            let row = &self.rows[index];
+            return if row.is_dir {
+                Some(row.path.clone())
+            } else {
+                row.path.parent().map(Path::to_path_buf)
+            };
+        }
+        let body = self.body;
+        (mouse_row >= body.top && mouse_row < body.top + body.height).then(|| self.tree.root_path())
+    }
+
+    /// Left-button motion: start dragging once the pointer leaves the
+    /// pressed row, then track the collapsed folder under it.
+    fn drag_motion(&mut self, mouse_row: u16) {
+        if self.drag.is_none() {
+            let Some(press) = self.press.as_ref() else {
+                return;
+            };
+            if self.row_at(mouse_row) == Some(press.index) {
+                return;
+            }
+            let Some(press) = self.press.take() else {
+                return;
+            };
+            if press.toggled {
+                self.tree.toggle(&press.path);
+                self.rebuild();
+            }
+            // The footer shows the drag's status now, not an older notice.
+            self.notice = None;
+            self.drag = Some(Drag {
+                source: press.path,
+                hover_folder: None,
+            });
+        }
+        let hover = self
+            .row_at(mouse_row)
+            .map(|index| &self.rows[index])
+            .filter(|row| row.is_dir && !row.expanded)
+            .map(|row| row.path.clone());
+        if let Some(drag) = self.drag.as_mut()
+            && drag.hover_folder.as_ref().map(|(path, _)| path) != hover.as_ref()
+        {
+            drag.hover_folder = hover.map(|path| (path, std::time::Instant::now()));
+        }
+    }
+
+    /// Between events while dragging: open the collapsed folder the pointer
+    /// rests on, and keep scrolling while it rests on the list's top or
+    /// bottom edge — terminals only report motion, so holding still at the
+    /// edge would otherwise stop the scroll.
+    fn drag_tick(&mut self) {
+        let Some(drag) = self.drag.as_mut() else {
+            return;
+        };
+        let Some((_, y)) = self.mouse_pos else {
+            return;
+        };
+        if let Some((folder, since)) = &drag.hover_folder
+            && since.elapsed() >= DRAG_OPENS_FOLDER
+        {
+            let folder = folder.clone();
+            drag.hover_folder = None;
+            self.tree.expand(&folder);
+            self.rebuild();
+        }
+        let body = self.body;
+        if body.height > 2 {
+            if y <= body.top {
+                self.scroll_view(-1);
+            } else if y >= body.top + body.height - 1 {
+                self.scroll_view(1);
+            }
+        }
+    }
+
+    /// Button released: a drag becomes a Move / Copy question. Ctrl or Alt
+    /// held at the release preselects Copy — when the terminal reports
+    /// modifiers at all, which is why the footer always offers both.
+    fn finish_drag(&mut self, mouse_row: u16, modifiers: KeyModifiers) {
+        let Some(drag) = self.drag.take() else {
+            return;
+        };
+        let Some(dest) = self.drop_dir_at(mouse_row) else {
+            return;
+        };
+        // Dropped back onto its own folder: nothing to do, like VS Code.
+        if drag.source.parent() == Some(dest.as_path()) {
+            return;
+        }
+        let op = if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            Op::Copy
+        } else {
+            Op::Move
+        };
+        self.confirm_transfer(vec![drag.source], dest, op);
+    }
+
+    /// The footer status while dragging: where the drop would land.
+    fn drag_status(&self) -> Option<(String, Color)> {
+        let drag = self.drag.as_ref()?;
+        let (_, y) = self.mouse_pos?;
+        let message = match self.drop_dir_at(y) {
+            None => return Some(("drag onto a folder · esc cancels".into(), palette().ignored)),
+            Some(dest) if drag.source.parent() == Some(dest.as_path()) => {
+                return Some(("drop onto another folder".into(), palette().ignored));
+            }
+            Some(dest) => {
+                match transfer::drop_problem(std::slice::from_ref(&drag.source), &dest, Op::Copy) {
+                    Some(problem) => return Some((problem, palette().deleted)),
+                    None => format!(
+                        "drop '{}' into '{}' · esc cancels",
+                        transfer::display_name(&drag.source),
+                        self.dest_label(&dest)
+                    ),
+                }
+            }
+        };
+        Some((message, palette().header_accent))
+    }
+
+    fn dest_label(&self, dest: &Path) -> String {
+        if dest == self.tree.root_path() {
+            self.tree.root_name()
+        } else {
+            transfer::display_name(dest)
+        }
+    }
+
+    /// Ask before files land: Move / Copy / Cancel in the footer, `op`
+    /// preselected.
+    fn confirm_transfer(&mut self, sources: Vec<PathBuf>, dest: PathBuf, op: Op) {
+        if let Some(problem) = transfer::drop_problem(&sources, &dest, Op::Copy) {
+            self.notice = Some(problem);
+            return;
+        }
+        self.notice = None;
+        self.overlay = Some(Overlay::ConfirmTransfer {
+            sources,
+            dest,
+            op,
+            buttons: Vec::new(),
+        });
+    }
+
+    fn start_transfer(&mut self, sources: Vec<PathBuf>, dest: PathBuf, op: Op) {
+        self.overlay = None;
+        if self.transfer_rx.is_some() {
+            self.notice = Some("still busy with the previous move/copy".into());
+            return;
+        }
+        if let Some(problem) = transfer::drop_problem(&sources, &dest, op) {
+            self.notice = Some(problem);
+            return;
+        }
+        let doing = match op {
+            Op::Move => "moving",
+            Op::Copy => "copying",
+        };
+        self.notice = Some(format!("{doing} {}…", items_label(&sources)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = transfer::transfer(&sources, &dest, op);
+            let _ = tx.send((outcome, dest));
+        });
+        self.transfer_rx = Some(rx);
+    }
+
+    fn collect_transfer(&mut self) {
+        let Some(rx) = &self.transfer_rx else {
+            return;
+        };
+        let (outcome, dest) = match rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.transfer_rx = None;
+                self.notice = Some("move/copy stopped unexpectedly".into());
+                self.refresh_tree();
+                return;
+            }
+        };
+        self.transfer_rx = None;
+        // A Cut is consumed by its paste.
+        if outcome.op == Op::Move
+            && self
+                .file_clip
+                .as_ref()
+                .is_some_and(|clip| clip.op == Op::Move)
+        {
+            self.file_clip = None;
+        }
+        if dest != self.tree.root_path() {
+            self.tree.expand(&dest);
+        }
+        self.refresh_tree();
+        if let Some(index) = outcome
+            .landed
+            .first()
+            .and_then(|first| self.rows.iter().position(|row| &row.path == first))
+        {
+            self.select(index);
+        }
+        let done = match outcome.op {
+            Op::Move => "moved",
+            Op::Copy => "copied",
+        };
+        self.notice = Some(match &outcome.failed {
+            None => format!(
+                "{done} {} into '{}'",
+                items_label(&outcome.landed),
+                self.dest_label(&dest)
+            ),
+            Some((path, error)) => {
+                let mut text = format!(
+                    "{} failed for '{}': {error}",
+                    outcome.op.verb(),
+                    transfer::display_name(path)
+                );
+                if !outcome.landed.is_empty() {
+                    text.push_str(&format!(" ({} {done})", outcome.landed.len()));
+                }
+                text
+            }
+        });
+    }
+
+    /// Ctrl+X / Ctrl+C / the menu's Cut and Copy on the selected row.
+    fn clip_selection(&mut self, op: Op) {
+        let Some(row) = self.selected_row() else {
+            self.notice = Some("select a file or folder first".into());
+            return;
+        };
+        self.set_file_clip(vec![row.path.clone()], op);
+    }
+
+    fn set_file_clip(&mut self, paths: Vec<PathBuf>, op: Op) {
+        let done = match op {
+            Op::Move => "cut",
+            Op::Copy => "copied",
+        };
+        let label = items_label(&paths);
+        let exported = transfer::copy_files_to_clipboard(&paths, op);
+        self.notice = Some(match &exported {
+            Ok(()) => format!("{done} {label} — paste here or in the file manager"),
+            Err(error) => format!("{done} {label} — paste here (file manager: {error})"),
+        });
+        self.file_clip = Some(FileClip {
+            paths,
+            op,
+            exported: exported.is_ok(),
+        });
+    }
+
+    /// Ctrl+V / the menu's Paste: files from the system clipboard (a file
+    /// manager's Copy or Cut, or our own exported one), else the Explorer's
+    /// own clipboard, into the folder New File would use.
+    fn paste_files(&mut self) {
+        let dest = create_target_dir(self.selected_row(), self.tree.root_path());
+        self.paste_files_into(dest);
+    }
+
+    fn paste_files_into(&mut self, dest: PathBuf) {
+        let (op, paths) = match transfer::files_from_clipboard() {
+            Some(found) => found,
+            None => match &self.file_clip {
+                Some(clip) if !clip.exported => (clip.op, clip.paths.clone()),
+                _ => {
+                    self.notice = Some("nothing to paste".into());
+                    return;
+                }
+            },
+        };
+        self.start_transfer(paths, dest, op);
+    }
+
+    /// Bracketed paste. A file manager drop arrives this way (the terminal
+    /// types the dropped paths), but WITHOUT a position — it lands in the
+    /// folder New File would use, after a confirmation that defaults to
+    /// Copy. Other pastes go to whichever text field is open, one line.
+    pub fn on_paste(&mut self, text: String) -> Option<Exit> {
+        if self.overlay.is_none() {
+            if let Some(paths) = transfer::parse_dropped(&text) {
+                let dest = create_target_dir(self.selected_row(), self.tree.root_path());
+                self.confirm_transfer(paths, dest, Op::Copy);
+            }
+            // Anything else typed into the bare tree would run as shortcuts.
+            return None;
+        }
+        if !matches!(
+            self.overlay,
+            Some(
+                Overlay::Prompt { .. } | Overlay::QuickOpen { .. } | Overlay::ContentSearch { .. }
+            )
+        ) {
+            return None;
+        }
+        for key in herdr_sidebar::ui::paste_keys(&text) {
+            if let Some(exit) = self.on_key(key) {
+                return Some(exit);
+            }
         }
         None
     }
@@ -1394,6 +1792,7 @@ impl App {
             ToggleSetting(usize),
             AdjustWidth(bool),
             DeleteConfirmed(PathBuf, bool),
+            Transfer(Op),
             Picker(PickerAction),
         }
         let settings = self.settings_rows();
@@ -1713,6 +2112,16 @@ impl App {
                 }
                 _ => Cmd::Close,
             },
+            Some(Overlay::ConfirmTransfer { op, .. }) => match key.code {
+                KeyCode::Enter | KeyCode::Char('y' | 'Y') => Cmd::Transfer(*op),
+                KeyCode::Char('m' | 'M') => Cmd::Transfer(Op::Move),
+                KeyCode::Char('c' | 'C') => Cmd::Transfer(Op::Copy),
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+                    *op = op.toggled();
+                    Cmd::Nothing
+                }
+                _ => Cmd::Close,
+            },
             None => Cmd::Nothing,
         };
         match cmd {
@@ -1738,6 +2147,7 @@ impl App {
             }
             Cmd::ToggleSetting(index) => self.toggle_setting(index),
             Cmd::AdjustWidth(wider) => self.adjust_sidebar_width(wider),
+            Cmd::Transfer(op) => self.run_confirmed_transfer(op),
             Cmd::DeleteConfirmed(path, is_dir) => {
                 self.overlay = None;
                 match actions::delete(&path, is_dir) {
@@ -1757,6 +2167,7 @@ impl App {
             ToggleSetting(usize),
             Reopen(u16, u16),
             Picker(PickerAction),
+            Transfer(Op),
         }
         let row_count = self.settings_rows().len();
         let cmd = match self.overlay.as_mut() {
@@ -1841,6 +2252,18 @@ impl App {
                 }
             }
             Some(Overlay::BranchPicker(picker)) => Cmd::Picker(picker.mouse(mouse)),
+            Some(Overlay::ConfirmTransfer { buttons, .. }) => match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => match buttons
+                    .iter()
+                    .find(|(rect, _)| hits(*rect, mouse.column, mouse.row))
+                    .map(|(_, choice)| *choice)
+                {
+                    Some(TransferChoice::Move) => Cmd::Transfer(Op::Move),
+                    Some(TransferChoice::Copy) => Cmd::Transfer(Op::Copy),
+                    Some(TransferChoice::Cancel) | None => Cmd::Close,
+                },
+                _ => Cmd::Nothing,
+            },
             // Prompts/confirms are keyboard-driven; clicks do nothing.
             _ => Cmd::Nothing,
         };
@@ -1854,6 +2277,13 @@ impl App {
                 self.open_context_menu(x, y);
             }
             Cmd::Picker(action) => self.handle_picker_action(action),
+            Cmd::Transfer(op) => self.run_confirmed_transfer(op),
+        }
+    }
+
+    fn run_confirmed_transfer(&mut self, op: Op) {
+        if let Some(Overlay::ConfirmTransfer { sources, dest, .. }) = self.overlay.take() {
+            self.start_transfer(sources, dest, op);
         }
     }
 
@@ -2805,6 +3235,16 @@ impl App {
                     Err(err) => format!("copy failed: {err}"),
                 });
             }
+            MenuAction::Cut | MenuAction::Copy => {
+                let Some((path, _)) = target else { return };
+                let op = if action == MenuAction::Cut {
+                    Op::Move
+                } else {
+                    Op::Copy
+                };
+                self.set_file_clip(vec![path], op);
+            }
+            MenuAction::Paste => self.paste_files_into(create_dir),
             MenuAction::Rename => {
                 let Some((path, _)) = target else { return };
                 let current = path
@@ -3229,6 +3669,11 @@ impl App {
             let theme = self.theme;
             let hovered = self.hovered;
             let selected = self.selected;
+            let drop_dir = self
+                .drag
+                .as_ref()
+                .and(self.mouse_pos)
+                .and_then(|(_, y)| self.drop_dir_at(y));
             let items: Vec<ListItem> = self
                 .rows
                 .iter()
@@ -3236,14 +3681,19 @@ impl App {
                 .skip(self.scroll)
                 .take(h)
                 .map(|(i, r)| {
-                    row_item(
+                    let item = row_item(
                         r,
                         theme,
                         hovered == Some(i),
                         selected == Some(i),
                         self.row_deco(r),
                         body.width,
-                    )
+                    );
+                    if drop_dir.as_ref() == Some(&r.path) {
+                        item.style(drop_target_style())
+                    } else {
+                        item
+                    }
                 })
                 .collect();
             frame.render_widget(List::new(items), body);
@@ -3271,10 +3721,15 @@ impl App {
             footer_button,
         );
         let footer_lines: Vec<Line> = if let Some((msg, color)) = self.footer_message() {
-            wrap_footer_message(&msg, footer.width, 4)
+            let mut lines: Vec<Line> = wrap_footer_message(&msg, footer.width, 4)
                 .into_iter()
                 .map(|l| l.fg(color).into())
-                .collect()
+                .collect();
+            if self.transfer_buttons_shown() {
+                let y = footer.y + lines.len() as u16;
+                lines.push(self.transfer_buttons_line(footer.x, y));
+            }
+            lines
         } else {
             match &self.overlay {
                 Some(Overlay::Prompt { title, input, .. }) => {
@@ -3467,6 +3922,7 @@ impl App {
         let git_footer = self.sidebar_state.show_git_footer && self.git_footer_status.is_some();
         let content = if let Some((msg, _)) = self.footer_message() {
             wrap_footer_message(&msg, width, 4).len() as u16
+                + u16::from(self.transfer_buttons_shown())
         } else if matches!(self.overlay, Some(Overlay::Prompt { .. })) {
             1
         } else if self.show_hotkeys() {
@@ -3482,8 +3938,21 @@ impl App {
     /// The uniform-style footer message, if one is active: a notice, or the
     /// delete confirm. Shared by footer_height and draw so they agree.
     fn footer_message(&self) -> Option<(String, Color)> {
+        if let Some(status) = self.drag_status() {
+            return Some(status);
+        }
         if let Some(notice) = &self.notice {
             return Some((notice.clone(), palette().modified));
+        }
+        if let Some(Overlay::ConfirmTransfer { sources, dest, .. }) = &self.overlay {
+            return Some((
+                format!(
+                    "Drop {} into '{}'?",
+                    items_label(sources),
+                    self.dest_label(dest)
+                ),
+                palette().header_accent,
+            ));
         }
         if let Some(Overlay::ConfirmDelete { path, .. }) = &self.overlay {
             let name = path
@@ -3496,6 +3965,51 @@ impl App {
             ));
         }
         None
+    }
+
+    /// The confirmation's question is on screen, so its buttons go under it.
+    fn transfer_buttons_shown(&self) -> bool {
+        self.notice.is_none()
+            && self.drag.is_none()
+            && matches!(self.overlay, Some(Overlay::ConfirmTransfer { .. }))
+    }
+
+    /// Move / Copy / Cancel under the question, the preselected answer in
+    /// keycap colors. Records the click zones.
+    fn transfer_buttons_line(&mut self, x: u16, y: u16) -> Line<'static> {
+        let mouse = self.mouse_pos;
+        let Some(Overlay::ConfirmTransfer { op, buttons, .. }) = self.overlay.as_mut() else {
+            return Line::default();
+        };
+        buttons.clear();
+        let mut spans = vec![Span::raw(" ")];
+        let mut cursor = x + 1;
+        for (label, choice) in [
+            ("Move", TransferChoice::Move),
+            ("Copy", TransferChoice::Copy),
+            ("Cancel", TransferChoice::Cancel),
+        ] {
+            let text = format!(" {label} ");
+            let width = Span::raw(text.as_str()).width() as u16;
+            let rect = Rect::new(cursor, y, width, 1);
+            let preselected = matches!(
+                (choice, *op),
+                (TransferChoice::Move, Op::Move) | (TransferChoice::Copy, Op::Copy)
+            );
+            let style = if preselected {
+                Style::default()
+                    .bg(palette().keycap_bg)
+                    .fg(palette().keycap_fg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                chrome_button_style(mouse.is_some_and(|(mx, my)| hits(rect, mx, my)))
+            };
+            spans.push(Span::styled(text, style));
+            spans.push(Span::raw(" "));
+            buttons.push((rect, choice));
+            cursor += width + 1;
+        }
+        Line::from(spans)
     }
 
     /// The VS Code activity bar: view-switcher icons plus a detach button.
@@ -4610,6 +5124,22 @@ fn row_item(
     match row_bg(hovered, selected) {
         Some(style) => item.style(style),
         None => item,
+    }
+}
+
+/// The folder a drag would drop into: the accent fill, stronger than the
+/// selection so the dragged row and its destination never read alike.
+fn drop_target_style() -> Style {
+    Style::default()
+        .bg(palette().button_bg)
+        .fg(palette().button_fg)
+}
+
+/// `'name'` for one path, `N items` for several.
+fn items_label(paths: &[PathBuf]) -> String {
+    match paths {
+        [one] => format!("'{}'", transfer::display_name(one)),
+        many => format!("{} items", many.len()),
     }
 }
 
