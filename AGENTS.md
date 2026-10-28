@@ -510,7 +510,12 @@ HACKING.md — budget time for that before promising a patched build.
   `tab_created`; manifest hook names remain dotted (`tab.created`). Creation hooks still dock
   their event scope when it is in the background, then conditionally repair focus only when the
   new sidebar stole it, so `--no-focus` remains authoritative without reopening issue #32's
-  missed-preview-tab race. Ordinary focus hooks restore the scoped pane because their first
+  missed-preview-tab race. `pane.swap` focuses the new sidebar's workspace even when the
+  worktree was opened with `--no-focus`; its displaced pane belongs to that background
+  workspace, not necessarily the previously focused one. Re-read focus just before swapping
+  and restore that pane when the sidebar is still focused afterward. A failed pre-swap read
+  falls back to the entry snapshot; use the displaced pane only when the chosen snapshot
+  has no focused pane. Ordinary focus hooks restore the scoped pane because their first
   global snapshot can still point at the tab/workspace the client just left.
 - A crashing startup must never create an unbounded `REPLACE` loop. Quiet hooks persist a
   per-tab replacement budget in the private runtime directory: three attempts per minute, then

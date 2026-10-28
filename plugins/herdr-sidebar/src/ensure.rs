@@ -685,15 +685,16 @@ fn creation_focus_repair(
     new_sidebar: &str,
     displaced_by_swap: Option<&str>,
 ) -> Option<String> {
-    let after = focused_pane_id(panes_after);
-    if after != new_sidebar {
+    if focused_pane_id(panes_after) != new_sidebar {
         return None;
     }
-    if let Some(displaced) = displaced_by_swap.filter(|pane| !pane.is_empty()) {
-        return Some(displaced.to_string());
-    }
     let before = focused_pane_id(panes_before);
-    (!before.is_empty() && before != new_sidebar).then_some(before)
+    let previous = if before.is_empty() {
+        displaced_by_swap.unwrap_or_default().to_string()
+    } else {
+        before
+    };
+    (!previous.is_empty() && previous != new_sidebar).then_some(previous)
 }
 
 fn focus(pane_id: &str) -> std::io::Result<()> {
@@ -805,7 +806,11 @@ fn open(
         new_pane
     };
 
+    // A creation hook can be queued while the user changes tabs. Capture the
+    // focused pane immediately before swapping, not only at hook entry.
+    let mut focus_before_layout = None;
     if needs_swap {
+        focus_before_layout = ipc::call_text("pane.list", serde_json::json!({})).ok();
         ipc::call_text(
             "pane.swap",
             serde_json::json!({ "source_pane_id": new_pane, "target_pane_id": target }),
@@ -848,7 +853,7 @@ fn open(
         // itself left focus on the new sidebar pane; otherwise do nothing.
         if let Ok(after) = ipc::call_text("pane.list", serde_json::json!({}))
             && let Some(previous) = creation_focus_repair(
-                panes_json,
+                focus_before_layout.as_deref().unwrap_or(panes_json),
                 &after,
                 &new_pane,
                 needs_swap.then_some(target.as_str()),
@@ -1185,8 +1190,28 @@ mod tests {
 
         assert_eq!(
             creation_focus_repair(before, sidebar_stole_focus, "w2:p2", Some("w2:p1")).as_deref(),
+            Some("w1:p1"),
+            "a background worktree's sidebar must not switch away from the original workspace"
+        );
+
+        let same_tab_before = r#"{"result":{"panes":[
+            {"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","focused":true},
+            {"pane_id":"w2:p3","tab_id":"w2:t1","workspace_id":"w2","focused":false}
+        ]}}"#;
+        assert_eq!(
+            creation_focus_repair(same_tab_before, sidebar_stole_focus, "w2:p2", Some("w2:p1"))
+                .as_deref(),
             Some("w2:p1"),
-            "after a swap, restore the displaced pane rather than stale global focus"
+            "a dock in the focused tab restores its original pane"
+        );
+        let no_prior_focus = r#"{"result":{"panes":[
+            {"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","focused":false}
+        ]}}"#;
+        assert_eq!(
+            creation_focus_repair(no_prior_focus, sidebar_stole_focus, "w2:p2", Some("w2:p1"))
+                .as_deref(),
+            Some("w2:p1"),
+            "without a recorded prior focus, restore the displaced pane"
         );
     }
 
