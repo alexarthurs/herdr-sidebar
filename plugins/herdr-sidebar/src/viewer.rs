@@ -382,9 +382,17 @@ struct Doc {
     /// Long lines wrap unless the user toggles them off (`w`). Per document:
     /// a newly loaded one starts wrapped again.
     wrap: bool,
-    /// Width glow formatted this markdown document for. A mismatch with the
-    /// live body triggers one background reload instead of generic rewrap.
-    glow_width: Option<u16>,
+    /// Width an external formatter (glow markdown, tidy-viewer table) laid
+    /// this document out for. A mismatch with the live body triggers one
+    /// background reload instead of generic rewrap.
+    render_width: Option<u16>,
+    /// The representation NOT on screen for a CSV/TSV table: the exact source
+    /// while the table shows, the table while the source shows. `t` swaps.
+    alternate: Option<Vec<Line<'static>>>,
+    /// The exact source is selected instead of the lossy table. Kept even
+    /// while no table exists (renderer failed), so a later successful
+    /// refresh honours it.
+    source_view: bool,
     /// `lines` laid out for the pane, rebuilt only when the width or the
     /// wrap toggle changes (see [`Doc::relayout`]).
     rows: Vec<Row>,
@@ -447,6 +455,36 @@ impl Doc {
                 .position(|r| r.src >= src)
                 .unwrap_or(self.rows.len().saturating_sub(1));
         }
+    }
+
+    /// Swap table and exact source. Representations have no row mapping, so
+    /// the reader's place, selection and layout reset.
+    fn toggle_source(&mut self) -> bool {
+        let Some(other) = self.alternate.take() else {
+            return false;
+        };
+        self.alternate = Some(std::mem::replace(&mut self.lines, other));
+        self.source_view = !self.source_view;
+        self.numbered = self.source_view;
+        self.wrap = self.source_view;
+        self.scroll = 0;
+        self.rows.clear();
+        self.rows_key = None;
+        self.pending_src = None;
+        self.selection = PreviewSelection::default();
+        true
+    }
+
+    /// Apply a carried table/source preference to a freshly loaded doc.
+    fn set_source_view(&mut self, source: bool) {
+        if self.source_view != source && !self.toggle_source() {
+            self.source_view = source;
+        }
+    }
+
+    /// A formatter's layout is on screen (not source or a plain preview).
+    fn shows_formatted(&self) -> bool {
+        self.render_width.is_some() && !self.source_view
     }
 
     /// The source line at the top of the body — the anchor a relayout
@@ -769,7 +807,9 @@ fn load(request: &Request) -> Doc {
             media: None,
             scroll: 0,
             wrap: true,
-            glow_width: None,
+            render_width: None,
+            alternate: None,
+            source_view: false,
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
@@ -815,7 +855,9 @@ fn loading_doc(request: &Request) -> Doc {
         media: None,
         scroll: 0,
         wrap: true,
-        glow_width: None,
+        render_width: None,
+        alternate: None,
+        source_view: false,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
@@ -867,17 +909,17 @@ const MAX_REFRESH_IN_FLIGHT: usize = 2;
 /// can retry (bounded by [`MAX_REFRESH_IN_FLIGHT`]).
 const REFRESH_ABANDON_AFTER: Duration = Duration::from_secs(30);
 
-struct InFlight;
+struct InFlight(&'static std::sync::atomic::AtomicUsize);
 
 impl InFlight {
-    fn claim() -> Option<Self> {
+    fn claim(counter: &'static std::sync::atomic::AtomicUsize, max: usize) -> Option<Self> {
         // Claim, then back out if over the cap: `fetch_update` is deprecated
         // on current stable and its `try_update` rename is newer than our MSRV.
         let order = std::sync::atomic::Ordering::SeqCst;
-        if REFRESH_IN_FLIGHT.fetch_add(1, order) < MAX_REFRESH_IN_FLIGHT {
-            Some(Self)
+        if counter.fetch_add(1, order) < max {
+            Some(Self(counter))
         } else {
-            REFRESH_IN_FLIGHT.fetch_sub(1, order);
+            counter.fetch_sub(1, order);
             None
         }
     }
@@ -885,7 +927,7 @@ impl InFlight {
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        REFRESH_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1141,6 +1183,7 @@ fn copy_selection(doc: &Doc) -> String {
 }
 
 fn apply_diff_refresh(doc: &mut Doc, mut refreshed: Doc) {
+    refreshed.set_source_view(doc.source_view);
     if doc.media.is_none()
         && doc.name == refreshed.name
         && doc.context == refreshed.context
@@ -1148,11 +1191,44 @@ fn apply_diff_refresh(doc: &mut Doc, mut refreshed: Doc) {
         && doc.lines == refreshed.lines
     {
         doc.stamp = refreshed.stamp;
+        // The hidden representation may still have changed: a table that
+        // rounds to the same text over new exact values, or a recovered
+        // renderer behind an unchanged source view.
+        if doc.alternate.is_some() || refreshed.alternate.is_some() {
+            doc.alternate = refreshed.alternate;
+            doc.render_width = refreshed.render_width;
+        }
         return;
     }
-    refreshed.wrap = doc.wrap;
-    refreshed.pending_src = Some(doc.top_src());
+    // Table and source rows do not correspond: a table/source change starts
+    // at the top with that representation's own defaults. Documents without
+    // a table (glow markdown included) keep the original carry-over.
+    if (doc.alternate.is_none() && refreshed.alternate.is_none())
+        || doc.shows_formatted() == refreshed.shows_formatted()
+    {
+        refreshed.wrap = doc.wrap;
+        refreshed.pending_src = Some(doc.top_src());
+    }
     *doc = refreshed;
+}
+
+/// Install a finished load. A new document replaces a loading frame (whose
+/// defaults reset everything); a width reload of the same document keeps the
+/// reader's table/source choice and place, even if made while in flight.
+/// A reload whose table render failed while the exact source was on screen
+/// is the same source preview, so the reader's place and `w` carry over.
+fn apply_loaded(doc: &mut Doc, mut loaded: Doc) {
+    loaded.set_source_view(doc.source_view);
+    if doc.render_width.is_some() && loaded.render_width.is_some() {
+        loaded.scroll = doc.scroll;
+        if loaded.alternate.is_some() {
+            loaded.wrap = doc.wrap;
+        }
+    } else if doc.render_width.is_some() && doc.source_view && doc.alternate.is_some() {
+        loaded.scroll = doc.scroll;
+        loaded.wrap = doc.wrap;
+    }
+    *doc = loaded;
 }
 
 enum ViewMode {
@@ -1276,7 +1352,9 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
         media: None,
         scroll: 0,
         wrap: true,
-        glow_width: None,
+        render_width: None,
+        alternate: None,
+        source_view: false,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
@@ -1337,13 +1415,13 @@ fn glow_args(width: u16, light: bool) -> Vec<String> {
 fn choose_text_render<F>(
     glow_rendered: Option<Vec<Line<'static>>>,
     fallback: F,
-    glow_width: u16,
+    render_width: u16,
 ) -> (Vec<Line<'static>>, bool, Option<u16>)
 where
     F: FnOnce() -> Vec<Line<'static>>,
 {
     match glow_rendered {
-        Some(rendered) => (rendered, false, Some(glow_width)),
+        Some(rendered) => (rendered, false, Some(render_width)),
         None => (fallback(), true, None),
     }
 }
@@ -1416,17 +1494,55 @@ fn decode_image_file(target: &Path) -> Result<image::RgbaImage, String> {
         .map_err(|error| error.to_string())
 }
 
-fn ffmpeg_in_path(path: &std::ffi::OsStr, cwd: Option<&Path>) -> Option<PathBuf> {
+/// Per-user install dirs trusted inside `cwd` only when `cwd` IS the home
+/// directory (Herdr previews inherit the spawn cwd, commonly `~`). Each must
+/// canonicalize to itself under the canonical home, so a symlinked alias into a
+/// project is not trusted.
+fn home_tool_dirs(home: Option<&Path>, cwd: Option<&Path>) -> Vec<PathBuf> {
+    let Some(home) = home
+        .filter(|home| home.is_absolute())
+        .and_then(|home| home.canonicalize().ok())
+    else {
+        return Vec::new();
+    };
+    if cwd != Some(home.as_path()) {
+        return Vec::new();
+    }
+    [[".local", "bin"], [".cargo", "bin"]]
+        .iter()
+        .map(|parts| home.join(parts[0]).join(parts[1]))
+        .filter(|dir| dir.canonicalize().is_ok_and(|real| &real == dir))
+        .collect()
+}
+
+/// `program` (no extension) in an absolute PATH entry outside `cwd`, or in a
+/// verified [`home_tool_dirs`] entry. Returns the canonical executable, which
+/// must itself resolve outside `cwd` or directly into a trusted dir.
+fn program_in_path(
+    program: &str,
+    path: &std::ffi::OsStr,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
     let executable = if cfg!(windows) {
-        "ffmpeg.exe"
+        format!("{program}.exe")
     } else {
-        "ffmpeg"
+        program.to_string()
+    };
+    let trusted = home_tool_dirs(home, cwd);
+    let allowed = |path: &Path, dir: &Path| {
+        !cwd.is_some_and(|cwd| path.starts_with(cwd)) || trusted.iter().any(|t| t == dir)
     };
     std::env::split_paths(path)
         .filter(|directory| directory.is_absolute())
         .filter_map(|directory| directory.canonicalize().ok())
-        .filter(|directory| !cwd.is_some_and(|cwd| directory.starts_with(cwd)))
-        .map(|directory| directory.join(executable))
+        .filter(|directory| allowed(directory, directory))
+        .filter_map(|directory| directory.join(&executable).canonicalize().ok())
+        .filter(|candidate| {
+            candidate
+                .parent()
+                .is_some_and(|dir| allowed(candidate, dir))
+        })
         .find(|candidate| {
             if !candidate.is_file() {
                 return false;
@@ -1443,17 +1559,20 @@ fn ffmpeg_in_path(path: &std::ffi::OsStr, cwd: Option<&Path>) -> Option<PathBuf>
         })
 }
 
-fn ffmpeg_on_path() -> Option<PathBuf> {
+fn program_on_path(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|path| path.canonicalize().ok());
-    ffmpeg_in_path(&path, cwd.as_deref())
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from);
+    program_in_path(program, &path, cwd.as_deref(), home.as_deref())
 }
 
 fn decode_video_poster(target: &Path) -> Result<image::RgbaImage, String> {
-    let ffmpeg =
-        ffmpeg_on_path().ok_or_else(|| "video preview needs ffmpeg on PATH".to_string())?;
+    let ffmpeg = program_on_path("ffmpeg")
+        .ok_or_else(|| "video preview needs ffmpeg on PATH".to_string())?;
     let mut command = std::process::Command::new(ffmpeg);
     command.args([
         "-hide_banner",
@@ -1594,7 +1713,9 @@ fn load_media_file(target: &Path, name: String, video_poster: bool) -> Doc {
         media,
         scroll: 0,
         wrap: false,
-        glow_width: None,
+        render_width: None,
+        alternate: None,
+        source_view: false,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
@@ -1604,6 +1725,15 @@ fn load_media_file(target: &Path, name: String, video_poster: bool) -> Doc {
 }
 
 fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
+    load_file_with(target, target_line, &tidy_table)
+}
+
+/// [`load_file`] with the CSV/TSV table renderer injected (tests fake it).
+fn load_file_with(
+    target: &Path,
+    target_line: Option<usize>,
+    render_table: &dyn Fn(&str, char) -> Option<Vec<Line<'static>>>,
+) -> Doc {
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -1616,24 +1746,31 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
         return load_media_file(target, name, true);
     }
     let is_markdown = lower.ends_with(".md") || lower.ends_with(".markdown");
-    let (lines, numbered, glow_width) = match std::fs::read(target) {
-        Err(e) => (vec![Line::raw(format!("(unreadable: {e})"))], true, None),
+    let (lines, numbered, render_width, alternate) = match std::fs::read(target) {
+        Err(e) => (
+            vec![Line::raw(format!("(unreadable: {e})"))],
+            true,
+            None,
+            None,
+        ),
         Ok(bytes) => {
             if bytes.contains(&0) {
                 (
                     vec![Line::raw(format!("(binary file — {} bytes)", bytes.len()))],
                     false,
                     None,
+                    None,
                 )
             } else {
                 let truncated = bytes.len() > MAX_BYTES;
                 let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_BYTES)]);
+                let cut = truncated || text.lines().count() > MAX_LINES;
                 // Markdown: render via glow; fall back to syntax highlight on failure.
-                let requested_glow_width = LAST_BODY_WIDTH
+                let requested_width = LAST_BODY_WIDTH
                     .load(std::sync::atomic::Ordering::Relaxed)
                     .max(20);
                 let glow_rendered = (is_markdown && target_line.is_none())
-                    .then(|| glow_markdown(&text, requested_glow_width))
+                    .then(|| glow_markdown(&text, requested_width))
                     .flatten();
                 let fallback = || {
                     crate::syntax::highlight(&name, &text, MAX_LINES).unwrap_or_else(|| {
@@ -1643,15 +1780,30 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
                             .collect()
                     })
                 };
-                let (mut lines, numbered, glow_width) =
-                    choose_text_render(glow_rendered, fallback, requested_glow_width);
-                if truncated || text.lines().count() > MAX_LINES {
+                let (mut lines, numbered, render_width) =
+                    choose_text_render(glow_rendered, fallback, requested_width);
+                if cut {
                     lines.push(Line::raw("… (truncated)"));
                 }
                 if lines.is_empty() {
                     lines.push(Line::raw("(empty file)"));
                 }
-                (lines, numbered, glow_width)
+                // CSV/TSV: an optional tidy-viewer table, with the exact
+                // source kept one `t` away. Line targets always open source.
+                let input = table_input(&text, truncated);
+                let table = table_delimiter(target)
+                    .filter(|_| target_line.is_none() && !input.trim().is_empty())
+                    .and_then(|delimiter| render_table(input, delimiter));
+                match table {
+                    Some(mut table) => {
+                        if cut || table.len() > MAX_LINES {
+                            table.truncate(MAX_LINES);
+                            table.push(Line::raw("… (truncated)"));
+                        }
+                        (table, false, Some(requested_width), Some(lines))
+                    }
+                    None => (lines, numbered, render_width, None),
+                }
             }
         }
     };
@@ -1662,9 +1814,11 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
         numbered,
         media: None,
         scroll: 0,
-        // Glow already laid out tables and paragraphs for `glow_width`.
-        wrap: glow_width.is_none(),
-        glow_width,
+        // Glow/tidy already laid the document out for `render_width`.
+        wrap: render_width.is_none(),
+        render_width,
+        alternate,
+        source_view: false,
         rows: Vec::new(),
         rows_key: None,
         pending_src: target_line.map(|line| line.saturating_sub(1)),
@@ -1673,9 +1827,179 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
     }
 }
 
-fn glow_needs_reload(doc: &Doc, body_width: u16) -> bool {
+fn formatted_needs_reload(doc: &Doc, body_width: u16) -> bool {
     let body_width = body_width.max(20);
-    doc.glow_width.is_some_and(|width| width != body_width)
+    // The exact source view has no width-dependent layout to refresh.
+    !doc.source_view && doc.render_width.is_some_and(|width| width != body_width)
+}
+
+fn table_delimiter(target: &Path) -> Option<char> {
+    if has_extension(target, &["csv"]) {
+        Some(',')
+    } else if has_extension(target, &["tsv"]) {
+        Some('\t')
+    } else {
+        None
+    }
+}
+
+/// The bounded slice a table renderer sees: at most [`MAX_LINES`] lines
+/// (line endings intact), cut back to the last physical line ending when
+/// [`MAX_BYTES`] cut the file mid-line. This is a physical-line boundary
+/// only; no CSV record validation (a quoted multi-line record can be cut).
+fn table_input(text: &str, truncated: bool) -> &str {
+    if let Some((end, _)) = text.match_indices('\n').nth(MAX_LINES - 1) {
+        return &text[..=end];
+    }
+    if truncated {
+        return text.rfind('\n').map_or("", |end| &text[..=end]);
+    }
+    text
+}
+
+/// Fixed argv: explicit delimiter, every bounded row, maximum precision,
+/// and `-p` so ragged rows fail (back to source) instead of being guessed;
+/// `-p` does not reject every malformed CSV.
+/// No `-e`: tidy fits the pane and reports the columns it could not show.
+fn tidy_args(delimiter: char, light: bool) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-a".into(),
+        "-p".into(),
+        "-s".into(),
+        delimiter.to_string(),
+        "-n".into(),
+        MAX_LINES.to_string(),
+        "-g".into(),
+        "7".into(),
+    ];
+    if light {
+        args.extend(["-c".into(), "5".into()]);
+    }
+    args
+}
+
+const MAX_TABLE_OUTPUT: usize = 8 * 1024 * 1024;
+const TABLE_TIMEOUT: Duration = Duration::from_secs(4);
+static TABLE_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const MAX_TABLE_IN_FLIGHT: usize = 2;
+
+/// Optional `tidy-viewer` (never the ambiguous `tv`) table. `None` falls back
+/// to the source preview: missing tool, failure, timeout, or unusable output.
+/// tidy sizes itself from the pane's controlling terminal.
+fn tidy_table(input: &str, delimiter: char) -> Option<Vec<Line<'static>>> {
+    let mut command = std::process::Command::new(program_on_path("tidy-viewer")?);
+    command.args(tidy_args(delimiter, crate::ui::is_light()));
+    let output = run_bounded(
+        command,
+        input.as_bytes().to_vec(),
+        MAX_TABLE_OUTPUT,
+        TABLE_TIMEOUT,
+        &TABLE_IN_FLIGHT,
+    )?;
+    table_lines(&output)
+}
+
+fn table_lines(output: &[u8]) -> Option<Vec<Line<'static>>> {
+    let lines = ansi::to_lines(&String::from_utf8_lossy(output));
+    lines
+        .iter()
+        .any(|line| {
+            line.spans
+                .iter()
+                .any(|span| !span.content.trim().is_empty())
+        })
+        .then_some(lines)
+}
+
+/// Feed `input` to `command` and capture its stdout, all within `timeout`:
+/// input delivery, child exit, and stdout EOF. Any failure, nonzero exit, or
+/// more than `max_output` bytes returns `None` and kills the direct child.
+/// Pipe threads are never joined — a descendant holding a pipe could block
+/// them forever — but each holds one of `slots`, so no more than
+/// [`MAX_TABLE_IN_FLIGHT`] such groups can exist; when full, `None`.
+// ponytail: a pipe-holding grandchild is not killed, it only pins a slot
+// until it exits; use a process group / Job Object if that shows up.
+fn run_bounded(
+    mut command: std::process::Command,
+    input: Vec<u8>,
+    max_output: usize,
+    timeout: Duration,
+    slots: &'static std::sync::atomic::AtomicUsize,
+) -> Option<Vec<u8>> {
+    use std::io::Write as _;
+    use std::sync::mpsc::TryRecvError;
+    let slot = std::sync::Arc::new(InFlight::claim(slots, MAX_TABLE_IN_FLIGHT)?);
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = command.spawn().ok()?;
+    let (Some(mut stdin), Some(mut stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let (written_tx, written_rx) = std::sync::mpsc::channel();
+    let held = slot.clone();
+    std::thread::spawn(move || {
+        let _slot = held;
+        let _ = written_tx.send(stdin.write_all(&input).is_ok());
+    });
+    let (output_tx, output_rx) = std::sync::mpsc::channel();
+    // Clone, not move: `slot` stays held here until the child is reaped, even
+    // if both pipe threads finish first (child closed its pipes, then hung).
+    let held = slot.clone();
+    std::thread::spawn(move || {
+        let _slot = held;
+        let mut bytes = Vec::new();
+        let read = (&mut stdout)
+            .take(max_output as u64 + 1)
+            .read_to_end(&mut bytes);
+        let _ = output_tx.send(read.ok().map(|_| bytes));
+    });
+    let deadline = Instant::now() + timeout;
+    let (mut written, mut exited, mut output) = (false, false, None);
+    let result = loop {
+        if !written {
+            match written_rx.try_recv() {
+                Ok(true) => written = true,
+                Ok(false) | Err(TryRecvError::Disconnected) => break None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if output.is_none() {
+            match output_rx.try_recv() {
+                Ok(Some(bytes)) if bytes.len() <= max_output => output = Some(bytes),
+                Ok(_) | Err(TryRecvError::Disconnected) => break None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if !exited {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => exited = true,
+                Ok(None) => {}
+                _ => break None,
+            }
+        }
+        if written && exited && output.is_some() {
+            break output;
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    if result.is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    drop(slot);
+    result
 }
 
 fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
@@ -1734,7 +2058,9 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         media: None,
         scroll: 0,
         wrap: true,
-        glow_width: None,
+        render_width: None,
+        alternate: None,
+        source_view: false,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
@@ -2087,7 +2413,9 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         media: None,
         scroll: 0,
         wrap: true,
-        glow_width: None,
+        render_width: None,
+        alternate: None,
+        source_view: false,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
@@ -2142,12 +2470,9 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         if let Some((request, loaded)) = loaded {
             preview_load = None;
             if current.as_ref() == Some(&request)
-                && let (ViewMode::Preview(doc), Some(mut loaded)) = (&mut mode, loaded)
+                && let (ViewMode::Preview(doc), Some(loaded)) = (&mut mode, loaded)
             {
-                if doc.glow_width.is_some() && loaded.glow_width.is_some() {
-                    loaded.scroll = doc.scroll;
-                }
-                *doc = loaded;
+                apply_loaded(doc, loaded);
             }
         }
         let prompt_text = prompt.as_ref().map(Prompt::text);
@@ -2180,7 +2505,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         if preview_load.is_none()
             && let (ViewMode::Preview(doc), Some(request @ Request::File { line: None, .. })) =
                 (&mode, current.as_ref())
-            && glow_needs_reload(doc, body_width)
+            && formatted_needs_reload(doc, body_width)
         {
             LAST_BODY_WIDTH.store(body_width, std::sync::atomic::Ordering::Relaxed);
             preview_load = Some(start_preview_load(request.clone()));
@@ -2381,6 +2706,9 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         doc.pending_src = Some(doc.top_src());
                                         doc.wrap = !doc.wrap;
                                     }
+                                    KeyCode::Char('t') => {
+                                        doc.toggle_source();
+                                    }
                                     _ => {}
                                 }
                             }
@@ -2579,7 +2907,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 && let ViewMode::Preview(doc) = &mode
                 && let Some(request @ (Request::Diff { .. } | Request::File { .. })) =
                     current.clone()
-                && let Some(in_flight) = InFlight::claim()
+                && let Some(in_flight) = InFlight::claim(&REFRESH_IN_FLIGHT, MAX_REFRESH_IN_FLIGHT)
             {
                 let baseline = doc.stamp;
                 let worker_request = request.clone();
@@ -2633,11 +2961,22 @@ fn draw_doc(
 
     let file_icon = icon(theme, &doc.name, false, false);
     let icon_style = ui_icon_style(file_icon.rgb);
-    let left = vec![
+    let mut left = vec![
         Span::styled(" ✕ ", Style::default().bold().fg(palette().header_accent)),
         Span::styled(format!("{} ", file_icon.glyph), icon_style),
         Span::styled(doc.name.clone(), Style::default().bold()),
     ];
+    if doc.alternate.is_some() {
+        let label = if doc.source_view {
+            " [source]"
+        } else {
+            " [table]"
+        };
+        left.push(Span::styled(
+            label,
+            Style::default().fg(palette().header_accent),
+        ));
+    }
     let used: usize = left.iter().map(Span::width).sum();
     let avail = usize::from(area.width).saturating_sub(used + 2);
     let shown = if doc.context.chars().count() > avail {
@@ -2687,10 +3026,23 @@ fn draw_doc(
         } else {
             " image preview  q close".into()
         }
-    } else if editable {
-        preview_hint(&["e edit", "space/b page", wrap_hint], footer.width)
     } else {
-        preview_hint(&["space/b page", "↑↓ scroll", wrap_hint], footer.width)
+        let toggle = doc.alternate.as_ref().map(|_| {
+            if doc.source_view {
+                "t table"
+            } else {
+                "t source (exact)"
+            }
+        });
+        let parts: Vec<&str> = if editable {
+            toggle
+                .into_iter()
+                .chain(["e edit", "space/b page", wrap_hint])
+                .collect()
+        } else {
+            vec!["space/b page", "↑↓ scroll", wrap_hint]
+        };
+        preview_hint(&parts, footer.width)
     };
     frame.render_widget(Paragraph::new(Line::from(hint).dim()), footer);
     (usize::from(body.height).saturating_sub(1).max(1), body)
@@ -3791,7 +4143,9 @@ mod tests {
             media: None,
             scroll: 0,
             wrap: true,
-            glow_width: None,
+            render_width: None,
+            alternate: None,
+            source_view: false,
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
@@ -3892,8 +4246,125 @@ mod tests {
         let search_path = std::env::join_paths([&local_bin, &external_bin]).unwrap();
         let project = project.canonicalize().unwrap();
         assert_eq!(
-            ffmpeg_in_path(&search_path, Some(&project)),
+            program_in_path("ffmpeg", &search_path, Some(&project), None),
             Some(external_bin.canonicalize().unwrap().join(executable))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn fake_tool(directory: &Path, program: &str) -> PathBuf {
+        std::fs::create_dir_all(directory).unwrap();
+        let file = directory.join(if cfg!(windows) {
+            format!("{program}.exe")
+        } else {
+            program.to_string()
+        });
+        std::fs::write(&file, b"placeholder").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        file.canonicalize().unwrap()
+    }
+
+    /// Herdr previews run with cwd = the spawn dir, often `~`: user-installed
+    /// tools in `~/.local/bin` / `~/.cargo/bin` must resolve, nothing else in
+    /// home may.
+    #[test]
+    fn tool_lookup_trusts_only_standard_user_bins_when_cwd_is_home() {
+        let root = std::env::temp_dir().join(format!("viewer-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let local = home.join(".local").join("bin");
+        let cargo = home.join(".cargo").join("bin");
+        let project_tools = home.join("project").join("tools");
+        let external = root.join("external");
+        let path = |dirs: &[&PathBuf]| std::env::join_paths(dirs).unwrap();
+        for program in ["tidy-viewer", "ffmpeg"] {
+            let installed = fake_tool(&local, program);
+            fake_tool(&project_tools, program);
+            let cargo_tool = fake_tool(&cargo, program);
+            let outside = fake_tool(&external, program);
+            let cwd = home.canonicalize().unwrap();
+            let find = |search: &std::ffi::OsStr, home_dir: Option<&Path>| {
+                program_in_path(program, search, Some(&cwd), home_dir)
+            };
+            // With cwd = home, a home tool dir is trusted only when home is known.
+            assert_eq!(find(&path(&[&local]), None), None);
+            assert_eq!(find(&path(&[&local]), Some(&home)), Some(installed.clone()));
+            assert_eq!(find(&path(&[&cargo]), Some(&home)), Some(cargo_tool));
+            // A project dir under home is still never trusted, even first.
+            assert_eq!(
+                find(&path(&[&project_tools, &local]), Some(&home)),
+                Some(installed.clone())
+            );
+            assert_eq!(find(&path(&[&project_tools]), Some(&home)), None);
+            // Relative and empty PATH entries never count.
+            let relative = std::env::join_paths([Path::new(""), Path::new(".local/bin")]).unwrap();
+            assert_eq!(find(&relative, Some(&home)), None);
+            // A real project cwd keeps the old rule; outside tools still resolve.
+            let project = home.join("project").canonicalize().unwrap();
+            assert_eq!(
+                program_in_path(
+                    program,
+                    &path(&[&project_tools]),
+                    Some(&project),
+                    Some(&home)
+                ),
+                None
+            );
+            assert_eq!(
+                program_in_path(
+                    program,
+                    &path(&[&project_tools, &external]),
+                    Some(&project),
+                    Some(&home)
+                ),
+                Some(outside)
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_tool_symlinks_into_projects_stay_rejected() {
+        let root = std::env::temp_dir().join(format!("viewer-home-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let project_tools = home.join("project").join("tools");
+        let project_tool = fake_tool(&project_tools, "tidy-viewer");
+        let cwd_home = home.canonicalize().unwrap();
+        // Directory alias: ~/.local/bin -> ~/project/tools.
+        std::fs::create_dir_all(home.join(".local")).unwrap();
+        std::os::unix::fs::symlink(&project_tools, home.join(".local").join("bin")).unwrap();
+        let local = std::env::join_paths([home.join(".local").join("bin")]).unwrap();
+        assert_eq!(
+            program_in_path("tidy-viewer", &local, Some(&cwd_home), Some(&home)),
+            None
+        );
+        // Executable alias: ~/.cargo/bin/tidy-viewer -> ~/project/tools/tidy-viewer.
+        let cargo = home.join(".cargo").join("bin");
+        std::fs::create_dir_all(&cargo).unwrap();
+        std::os::unix::fs::symlink(&project_tool, cargo.join("tidy-viewer")).unwrap();
+        let cargo_path = std::env::join_paths([&cargo]).unwrap();
+        assert_eq!(
+            program_in_path("tidy-viewer", &cargo_path, Some(&cwd_home), Some(&home)),
+            None
+        );
+        // The same alias from a non-home cwd is rejected too.
+        let project = home.join("project").canonicalize().unwrap();
+        assert_eq!(
+            program_in_path("tidy-viewer", &cargo_path, Some(&project), Some(&home)),
+            None
+        );
+        // A valid external program reached through a trusted dir symlink still works.
+        let external = fake_tool(&root.join("external"), "ffmpeg");
+        std::os::unix::fs::symlink(&external, cargo.join("ffmpeg")).unwrap();
+        assert_eq!(
+            program_in_path("ffmpeg", &cargo_path, Some(&cwd_home), Some(&home)),
+            Some(external)
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -4047,14 +4518,12 @@ mod tests {
 
     #[test]
     fn refresh_workers_are_capped() {
-        let held: Vec<_> = std::iter::from_fn(InFlight::claim).take(10).collect();
+        let claim = || InFlight::claim(&REFRESH_IN_FLIGHT, MAX_REFRESH_IN_FLIGHT);
+        let held: Vec<_> = std::iter::from_fn(claim).take(10).collect();
         assert_eq!(held.len(), MAX_REFRESH_IN_FLIGHT);
-        assert!(InFlight::claim().is_none());
+        assert!(claim().is_none());
         drop(held);
-        assert!(
-            InFlight::claim().is_some(),
-            "finished workers free their slot"
-        );
+        assert!(claim().is_some(), "finished workers free their slot");
     }
 
     #[test]
@@ -5229,7 +5698,7 @@ mod tests {
     fn glow_rendered_markdown_uses_the_body_width_without_generic_rewrap() {
         let rendered = vec![Line::raw("preformatted table")];
         let fallback = vec![Line::raw("markdown source")];
-        let (lines, numbered, glow_width) = choose_text_render(Some(rendered), || fallback, 80);
+        let (lines, numbered, render_width) = choose_text_render(Some(rendered), || fallback, 80);
         let doc = Doc {
             name: "table.md".into(),
             context: String::new(),
@@ -5237,8 +5706,10 @@ mod tests {
             numbered,
             media: None,
             scroll: 0,
-            wrap: glow_width.is_none(),
-            glow_width,
+            wrap: render_width.is_none(),
+            render_width,
+            alternate: None,
+            source_view: false,
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
@@ -5247,9 +5718,9 @@ mod tests {
         };
         assert!(!doc.wrap, "glow output must not be generically re-wrapped");
         assert!(!doc.numbered, "glow formats its own layout, no gutter");
-        assert_eq!(doc.glow_width, Some(80));
-        assert!(!glow_needs_reload(&doc, 80));
-        assert!(glow_needs_reload(&doc, 60));
+        assert_eq!(doc.render_width, Some(80));
+        assert!(!formatted_needs_reload(&doc, 80));
+        assert!(formatted_needs_reload(&doc, 60));
     }
 
     #[test]
@@ -5447,5 +5918,547 @@ mod tests {
             Some(("w1:p2".into(), true)),
             "document-labelled resumed viewers remain reclaimable"
         );
+    }
+
+    // ---- CSV/TSV tables -------------------------------------------------
+
+    fn table_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("viewer-table-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn texts(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    /// Lossy like tidy: strips leading zeros and truncates cells.
+    fn fake_table(input: &str, delimiter: char) -> Option<Vec<Line<'static>>> {
+        Some(
+            input
+                .lines()
+                .map(|row| {
+                    let cells: Vec<String> = row
+                        .split(delimiter)
+                        .map(|c| c.trim_start_matches('0').chars().take(5).collect())
+                        .collect();
+                    Line::raw(cells.join(" | "))
+                })
+                .collect(),
+        )
+    }
+
+    fn no_table(_: &str, _: char) -> Option<Vec<Line<'static>>> {
+        None
+    }
+
+    #[test]
+    fn only_csv_and_tsv_files_get_a_table_delimiter() {
+        assert_eq!(table_delimiter(Path::new("a.CSV")), Some(','));
+        assert_eq!(table_delimiter(Path::new("dir/b.Tsv")), Some('\t'));
+        for other in [
+            "x.xls",
+            "x.xlsx",
+            "x.txt",
+            "x.md",
+            "x.json",
+            "x.csv.bak",
+            "csv",
+            "x.psv",
+        ] {
+            assert_eq!(table_delimiter(Path::new(other)), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn tidy_argv_is_fixed_with_an_explicit_delimiter() {
+        assert_eq!(
+            tidy_args('\t', false),
+            ["-a", "-p", "-s", "\t", "-n", "5000", "-g", "7"]
+        );
+        let light = tidy_args(',', true);
+        assert_eq!(light[3], ",");
+        assert!(light.ends_with(&["-c".to_string(), "5".to_string()]));
+        assert!(!light.iter().any(|arg| arg == "-e"), "tidy fits the pane");
+    }
+
+    #[test]
+    fn csv_opens_as_a_table_and_t_swaps_to_the_exact_source() {
+        let dir = table_dir("csv");
+        let path = dir.join("ids.CSV");
+        let bytes = b"id,price\n00123,123.456789012345\n";
+        std::fs::write(&path, bytes).unwrap();
+        let seen = std::cell::RefCell::new(None);
+        let render = |input: &str, delimiter: char| {
+            *seen.borrow_mut() = Some((input.to_string(), delimiter));
+            fake_table(input, delimiter)
+        };
+        let mut doc = load_file_with(&path, None, &render);
+        assert_eq!(
+            seen.borrow().clone(),
+            Some((String::from_utf8(bytes.to_vec()).unwrap(), ','))
+        );
+        assert_eq!(texts(&doc.lines), ["id | price", "123 | 123.4"]);
+        assert!(!doc.numbered && !doc.wrap && !doc.source_view);
+        assert!(doc.render_width.is_some());
+        let source = load_file_with(&path, None, &no_table).lines;
+
+        doc.relayout(40, 10);
+        doc.scroll = 1;
+        doc.selection.anchor = Some(RenderPos::default());
+        doc.pending_src = Some(1);
+        assert!(doc.toggle_source());
+        assert!(doc.source_view && doc.numbered && doc.wrap);
+        assert_eq!(doc.scroll, 0);
+        assert!(doc.rows_key.is_none() && doc.pending_src.is_none());
+        assert!(doc.selection.anchor.is_none());
+        assert_eq!(doc.lines, source, "t shows the exact source preview");
+        assert!(
+            texts(&doc.lines)
+                .concat()
+                .contains("00123,123.456789012345")
+        );
+        assert!(
+            !formatted_needs_reload(&doc, 7),
+            "the source view never reloads for width"
+        );
+        assert!(doc.toggle_source());
+        assert_eq!(texts(&doc.lines), ["id | price", "123 | 123.4"]);
+        assert!(formatted_needs_reload(&doc, 7), "a stale table re-renders");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "source never rewritten"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tsv_tables_get_an_explicit_tab_and_bounded_output() {
+        let dir = table_dir("tsv");
+        let path = dir.join("t.tsv");
+        std::fs::write(&path, "a\tb\n1\t2\n").unwrap();
+        let delimiter = std::cell::Cell::new(None);
+        let huge = |_: &str, d: char| {
+            delimiter.set(Some(d));
+            Some(vec![Line::raw("row"); MAX_LINES + 5])
+        };
+        let doc = load_file_with(&path, None, &huge);
+        assert_eq!(delimiter.get(), Some('\t'));
+        assert_eq!(doc.lines.len(), MAX_LINES + 1);
+        assert_eq!(texts(&doc.lines).last().unwrap(), "… (truncated)");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn table_input_is_bounded_at_physical_lines() {
+        let many: String = (0..MAX_LINES + 10).map(|i| format!("{i},x\r\n")).collect();
+        let cut = table_input(&many, false);
+        assert_eq!(cut.lines().count(), MAX_LINES);
+        assert!(cut.ends_with("\r\n"));
+        assert_eq!(table_input("a,b\n1,2\n3,", true), "a,b\n1,2\n");
+        assert_eq!(table_input("a,b\n1,2", false), "a,b\n1,2");
+        assert_eq!(table_input("no newline", true), "");
+    }
+
+    #[test]
+    fn line_targets_and_other_types_never_start_the_table_renderer() {
+        let dir = table_dir("bypass");
+        let never = |_: &str, _: char| -> Option<Vec<Line<'static>>> {
+            panic!("the table renderer must not run")
+        };
+        let csv = dir.join("data.csv");
+        std::fs::write(&csv, "a,b\n1,2\n3,4\n").unwrap();
+        let doc = load_file_with(&csv, Some(3), &never);
+        assert_eq!(doc.pending_src, Some(2), "line targets start on source");
+        assert!(doc.alternate.is_none() && doc.numbered && doc.render_width.is_none());
+        for name in [
+            "book.xls",
+            "book.xlsx",
+            "notes.txt",
+            "data.json",
+            "empty.csv",
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, if name == "empty.csv" { " \n" } else { "a,b\n" }).unwrap();
+            let doc = load_file_with(&path, None, &never);
+            assert!(doc.alternate.is_none() && doc.numbered, "{name}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_table_render_is_the_plain_source_preview() {
+        let dir = table_dir("fail");
+        let path = dir.join("data.tsv");
+        std::fs::write(&path, "a\tb\n1\t2\n").unwrap();
+        let mut doc = load_file_with(&path, None, &no_table);
+        assert_eq!(doc.lines, load_file_with(&path, Some(1), &no_table).lines);
+        assert!(doc.numbered && doc.wrap && doc.alternate.is_none());
+        assert!(!doc.toggle_source(), "t needs a table to swap with");
+        assert!(!doc.source_view);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_source_choice_survives_a_failed_and_a_recovered_refresh() {
+        let dir = table_dir("recover");
+        let path = dir.join("data.csv");
+        std::fs::write(&path, "a,b\n1,2\n").unwrap();
+
+        // Table on screen: a failed refresh is a representation change.
+        let mut doc = load_file_with(&path, None, &fake_table);
+        doc.relayout(40, 10);
+        doc.scroll = 1;
+        apply_diff_refresh(&mut doc, load_file_with(&path, None, &no_table));
+        assert!(!doc.source_view && doc.numbered && doc.alternate.is_none());
+        assert_eq!((doc.scroll, doc.pending_src), (0, None));
+
+        // Source chosen: failure and recovery both keep it.
+        let mut doc = load_file_with(&path, None, &fake_table);
+        doc.toggle_source();
+        let source = doc.lines.clone();
+        apply_diff_refresh(&mut doc, load_file_with(&path, None, &no_table));
+        assert!(doc.source_view && doc.alternate.is_none());
+        assert_eq!(doc.lines, source);
+        apply_diff_refresh(&mut doc, load_file_with(&path, None, &fake_table));
+        assert!(doc.source_view && doc.alternate.is_some());
+        assert_eq!(doc.lines, source);
+        std::fs::write(&path, "a,b\n1,2\n0042,5\n").unwrap();
+        apply_diff_refresh(&mut doc, load_file_with(&path, None, &fake_table));
+        assert!(doc.source_view && texts(&doc.lines).concat().contains("0042,5"));
+        assert!(doc.toggle_source());
+        assert_eq!(texts(&doc.lines), ["a | b", "1 | 2", "42 | 5"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_identical_table_over_new_source_updates_what_t_reveals() {
+        let dir = table_dir("identical");
+        let path = dir.join("ids.csv");
+        std::fs::write(&path, "id\n00123\n").unwrap();
+        let mut doc = load_file_with(&path, None, &fake_table);
+        doc.relayout(40, 1);
+        doc.scroll = 1;
+        std::fs::write(&path, "id\n000123\n").unwrap();
+        apply_diff_refresh(&mut doc, load_file_with(&path, None, &fake_table));
+        assert_eq!(doc.scroll, 1, "an unchanged table keeps its place");
+        assert!(doc.toggle_source());
+        assert!(texts(&doc.lines).concat().contains("000123"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn t_and_w_during_an_in_flight_width_reload_are_honoured() {
+        let dir = table_dir("inflight");
+        let path = dir.join("data.csv");
+        std::fs::write(&path, "a,b\n1,2\n").unwrap();
+        let mut doc = load_file_with(&path, None, &fake_table);
+        doc.wrap = true;
+        apply_loaded(&mut doc, load_file_with(&path, None, &fake_table));
+        assert!(doc.wrap && !doc.source_view, "w survives the reload");
+
+        doc.toggle_source();
+        let source = doc.lines.clone();
+        apply_loaded(&mut doc, load_file_with(&path, None, &fake_table));
+        assert!(doc.source_view && doc.numbered);
+        assert_eq!(doc.lines, source, "t survives the reload");
+
+        let request = Request::File {
+            path: path.clone(),
+            line: None,
+        };
+        let mut fresh = loading_doc(&request);
+        apply_loaded(&mut fresh, load_file_with(&path, None, &fake_table));
+        assert!(!fresh.source_view, "a new document starts on its table");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_width_reload_keeps_the_chosen_source_place() {
+        let dir = table_dir("widthfail");
+        let path = dir.join("data.csv");
+        let rows: String = (0..30).map(|i| format!("{i},x\n")).collect();
+        std::fs::write(&path, rows).unwrap();
+        let mut doc = load_file_with(&path, None, &fake_table);
+        doc.toggle_source();
+        doc.relayout(40, 5);
+        doc.scroll = 7;
+        doc.wrap = false;
+        let source = doc.lines.clone();
+        apply_loaded(&mut doc, load_file_with(&path, None, &no_table));
+        assert!(doc.source_view && doc.alternate.is_none());
+        assert_eq!(doc.lines, source);
+        assert_eq!((doc.scroll, doc.wrap), (7, false));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn markdown(formatted: bool, text: &str) -> Doc {
+        let mut doc = doc_of(vec![Line::raw(text.to_string())], !formatted);
+        if formatted {
+            doc.wrap = false;
+            doc.render_width = Some(80);
+        }
+        doc
+    }
+
+    #[test]
+    fn markdown_refresh_between_glow_and_fallback_keeps_its_carry_over() {
+        for (from, to) in [(true, false), (false, true)] {
+            let mut doc = markdown(from, "before");
+            doc.relayout(40, 10);
+            let wrap = doc.wrap;
+            let top = doc.top_src();
+            apply_diff_refresh(&mut doc, markdown(to, "after"));
+            assert_eq!(doc.wrap, wrap, "{from}->{to}");
+            assert_eq!(doc.pending_src, Some(top), "{from}->{to}");
+            assert_eq!(doc.render_width.is_some(), to);
+        }
+    }
+
+    #[test]
+    fn table_chrome_labels_the_view_and_keeps_q_close_first() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut doc = doc_of(vec![Line::raw("id | price")], false);
+        doc.alternate = Some(vec![Line::raw("id,price")]);
+        doc.render_width = Some(60);
+        let mut terminal = Terminal::new(TestBackend::new(60, 4)).unwrap();
+        let mut render = |doc: &mut Doc| -> Vec<String> {
+            terminal
+                .draw(|f| {
+                    draw_doc(f, doc, IconTheme::Emoji, true, None);
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(60)
+                .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+                .collect()
+        };
+        let screen = render(&mut doc);
+        assert!(screen[0].contains("[table]"), "{screen:?}");
+        assert!(
+            screen[3].starts_with(" q close  t source (exact)"),
+            "{screen:?}"
+        );
+        doc.toggle_source();
+        let screen = render(&mut doc);
+        assert!(screen[0].contains("[source]"), "{screen:?}");
+        assert!(screen[3].starts_with(" q close  t table"), "{screen:?}");
+    }
+
+    #[test]
+    fn table_output_must_have_visible_text() {
+        assert!(table_lines(b"").is_none());
+        assert!(table_lines(b"\x1b[31m  \x1b[0m\n\n").is_none());
+        assert_eq!(texts(&table_lines(b"\x1b[1ma\x1b[0m").unwrap()), ["a"]);
+    }
+
+    #[cfg(unix)]
+    fn sh(script: &str) -> std::process::Command {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[cfg(unix)]
+    fn wait_for_slots(slots: &std::sync::atomic::AtomicUsize, at_most: usize) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let held = slots.load(std::sync::atomic::Ordering::SeqCst);
+            if held <= at_most || Instant::now() >= deadline {
+                return held;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_runs_stream_input_and_output_concurrently() {
+        use std::sync::atomic::AtomicUsize;
+        static SLOTS: AtomicUsize = AtomicUsize::new(0);
+        // Far past a pipe buffer in both directions at once.
+        let input = vec![b'x'; 1024 * 1024];
+        let run = |input: Vec<u8>| {
+            run_bounded(sh("cat"), input, 2 << 20, Duration::from_secs(10), &SLOTS)
+        };
+        assert_eq!(run(input.clone()), Some(input));
+        assert_eq!(wait_for_slots(&SLOTS, 0), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_runs_fail_closed() {
+        use std::sync::atomic::AtomicUsize;
+        static SLOTS: AtomicUsize = AtomicUsize::new(0);
+        let run = |command, input: &[u8], max, millis| {
+            run_bounded(
+                command,
+                input.to_vec(),
+                max,
+                Duration::from_millis(millis),
+                &SLOTS,
+            )
+        };
+        let missing = std::process::Command::new("/nonexistent/tidy-viewer");
+        assert_eq!(run(missing, b"a", 10, 2000), None, "absent");
+        assert_eq!(run(sh("cat >/dev/null; exit 3"), b"a", 10, 2000), None);
+        assert_eq!(
+            run(sh("cat >/dev/null"), b"a", 10, 2000),
+            Some(Vec::new()),
+            "empty output is the caller's call"
+        );
+        assert_eq!(
+            run(
+                sh("cat >/dev/null; head -c 5000 /dev/zero"),
+                b"a",
+                1000,
+                2000
+            ),
+            None,
+            "oversized"
+        );
+        let big = vec![b'x'; 1024 * 1024];
+        assert_eq!(
+            run(sh("exec 0<&-; echo out"), &big, 1000, 2000),
+            None,
+            "input never delivered"
+        );
+        let started = Instant::now();
+        assert_eq!(run(sh("exec sleep 30"), b"a", 10, 200), None, "hang");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(wait_for_slots(&SLOTS, 0), 0, "killed child frees its pipes");
+    }
+
+    /// Kills the test's own process group (recorded by its shell BEFORE it
+    /// spawns anything) and removes its scratch dir, even when an assertion
+    /// panics first. No process scanning: only that one group is signalled.
+    #[cfg(unix)]
+    struct OwnGroup(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for OwnGroup {
+        fn drop(&mut self) {
+            let pid = std::fs::read_to_string(self.0.join("pid")).ok();
+            if let Some(pid) = pid.and_then(|p| p.trim().parse::<u32>().ok()) {
+                // Never signal group 0/1: `-0` is our own group, `-1` everything.
+                if pid <= 1 {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                    return;
+                }
+                let _ = sh(&format!("kill -KILL -- -{pid}")).status();
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_holding_descendant_is_cut_off_but_keeps_its_slot() {
+        use std::os::unix::process::CommandExt;
+        use std::sync::atomic::AtomicUsize;
+        static SLOTS: AtomicUsize = AtomicUsize::new(0);
+        let group = OwnGroup(table_dir("descendant"));
+        // `$$` is also the group id: the shell leads its own group.
+        let script = format!(
+            "echo $$ > '{}'; cat >/dev/null; sleep 30 & echo out",
+            group.0.join("pid").display()
+        );
+        let mut command = sh(&script);
+        command.process_group(0);
+        let started = Instant::now();
+        let result = run_bounded(
+            command,
+            b"a\n".to_vec(),
+            1024,
+            Duration::from_secs(2),
+            &SLOTS,
+        );
+        assert_eq!(result, None, "stdout never reached EOF");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "no unbounded join"
+        );
+        assert_eq!(
+            wait_for_slots(&SLOTS, 1),
+            1,
+            "the stuck reader holds a slot"
+        );
+        drop(group);
+        assert_eq!(wait_for_slots(&SLOTS, 0), 0, "freed once the pipe closes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_live_child_keeps_its_slot_after_closing_its_pipes() {
+        use std::os::unix::process::CommandExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SLOTS: AtomicUsize = AtomicUsize::new(0);
+        let group = OwnGroup(table_dir("closed-pipes"));
+        let ready = group.0.join("ready");
+        // Consume input, close both pipes, mark readiness, then stay alive as
+        // the direct child (`exec`) so run_bounded's kill reaps it.
+        let script = format!(
+            "echo $$ > '{}'; cat >/dev/null; exec 0<&- 1>&-; : > '{}'; exec sleep 30",
+            group.0.join("pid").display(),
+            ready.display()
+        );
+        let mut command = sh(&script);
+        command.process_group(0);
+        let run = std::thread::spawn(|| {
+            run_bounded(
+                command,
+                b"a\n".to_vec(),
+                1024,
+                Duration::from_secs(3),
+                &SLOTS,
+            )
+        });
+        let wait = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() && Instant::now() < wait {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let was_ready = ready.exists();
+        // Both pipe threads finish within this window; the child is alive.
+        let mut lowest = usize::MAX;
+        let watch = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < watch {
+            lowest = lowest.min(SLOTS.load(Ordering::SeqCst));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let result = run.join();
+        let after = wait_for_slots(&SLOTS, 0);
+        if result.is_ok() {
+            // run_bounded reaped the group's only member (`exec sleep`), so
+            // the group is empty and its id may be recycled: do not signal it.
+            let _ = std::fs::remove_file(group.0.join("pid"));
+        }
+        drop(group);
+        assert!(was_ready, "child closed its pipes");
+        assert_eq!(lowest, 1, "slot held while the child lives");
+        assert_eq!(result.ok(), Some(None), "deadline kills the hung child");
+        assert_eq!(after, 0, "freed once reaped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_busy_formatter_falls_back_without_spawning() {
+        use std::sync::atomic::AtomicUsize;
+        static SLOTS: AtomicUsize = AtomicUsize::new(0);
+        let held: Vec<_> = (0..MAX_TABLE_IN_FLIGHT)
+            .filter_map(|_| InFlight::claim(&SLOTS, MAX_TABLE_IN_FLIGHT))
+            .collect();
+        let run = || run_bounded(sh("cat"), b"a".to_vec(), 10, Duration::from_secs(2), &SLOTS);
+        assert_eq!(run(), None);
+        drop(held);
+        assert_eq!(run(), Some(b"a".to_vec()));
     }
 }

@@ -16,6 +16,11 @@ The Git footer keeps branch switching and sync one click away in every view and 
 from Settings.
 Common image formats render directly in the preview pane; videos show a poster frame when
 `ffmpeg` is available on `PATH`.
+When the optional `tidy-viewer` is on `PATH` (it is not installed automatically), `.csv`/`.tsv`
+previews start as a table fitted to the pane. The table is lossy, so press `t` to toggle to the
+exact source and back. The table uses the same 1 MiB / 5000-line preview limit, and any tidy
+failure or timeout shows the source instead. Table previews have been verified on Linux (WSL)
+only; on macOS and Windows they are untested and may fall back to source.
 To open clicked files in a terminal editor, configure "Custom editor…" in sidebar Settings, then
 enable "Use editor on click". Clicking an already-open file focuses its existing editor tab;
 keyboard Enter continues to use the built-in preview.

@@ -48,6 +48,10 @@ Use the mouse or press `1`, `2`, and `3`.
   same tab with **Preview opens in: pane**, or opt into experimental `replace` mode:
   working panes move to a temporary tab while you preview; Esc / `q` brings them back.
 - Preview text, Markdown, images, and—when `ffmpeg` is available—video poster frames.
+  With `tidy-viewer` on `PATH`, `.csv`/`.tsv` files open as a fitted table; the table is lossy
+  (numbers rounded, cells truncated), so `t` toggles to the exact source and back. If the tool
+  is missing, fails, times out (4s), or rejects the data, the source preview is shown instead.
+  Table previews have been verified on Linux (WSL) only.
   Read-only previews support mouse selection and clipboard copy, including OSC 52 over SSH,
   and reload on their own when the file changes on disk.
 - Find files with `Ctrl+P`; search project contents with `Ctrl+F` or `Ctrl+Shift+F`.
@@ -123,7 +127,8 @@ folder stays put until that pane changes directory again.
 
 Preview: drag to select (releasing copies, following herdr's `copy_on_select`),
 `Ctrl/Cmd+C` to copy, arrows/PageUp/PageDown or
-Space/`b` to scroll, `w` to toggle wrapping, and `q` or Esc to close.
+Space/`b` to scroll, `w` to toggle wrapping, `t` to switch a CSV/TSV table to its exact source
+and back, and `q` or Esc to close.
 
 Host keybindings can invoke the direct `show-explorer`, `show-search`, `show-git`, and
 `quick-open` actions. For example, bind `cmd+p` to:
@@ -172,8 +177,9 @@ Useful development actions:
 Use the `-windows` suffix for each direct action on Windows.
 
 All docking, metadata, pane creation, and preview control use herdr's socket API directly.
-The plugin is one Rust crate; optional external tools only enhance Markdown (`glow`), video
-posters (`ffmpeg`), and AI commit drafts (`claude`).
+The plugin is one Rust crate; optional external tools only enhance Markdown (`glow`), CSV/TSV
+tables (`tidy-viewer`), video posters (`ffmpeg`), and AI commit drafts (`claude`). None are
+installed automatically.
 
 <div align="center">
 <sub>Screenshots: herdr on Windows Terminal with a Nerd Font.</sub>

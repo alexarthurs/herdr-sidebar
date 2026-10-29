@@ -37,6 +37,13 @@ CI uses the LATEST stable toolchain (`dtolnay/rust-toolchain@stable`), so a stal
 `try_update`, which is also newer than our `rust-version = 1.89` MSRV — rewrite instead of
 renaming). Run `rustup update stable` (or `cargo +<latest> clippy`) before tagging a release.
 
+Run `cargo test` with a SHORT private `TMPDIR` outside the Git tree (e.g.
+`mktemp -d /tmp/hst.XXXX`):
+tests create scratch git repos and Unix sockets under the temp dir, so a temp dir nested in
+`target/` breaks git discovery and a long path overflows the Unix socket path limit. Also unset
+live `HERDR_*` session variables and point `HERDR_PLUGIN_STATE_DIR` / `XDG_STATE_HOME` /
+`XDG_CONFIG_HOME` at disposable dirs so tests never touch a real session or `state.json`.
+
 `plugins/herdr-sidebar/scripts/.gitattributes` pins every shell script to LF. The
 repository has Windows contributors and `core.autocrlf` is common, but these files are
 executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launcher runs.
@@ -1097,8 +1104,52 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   for a bounded first-frame PNG and render it through the same path; lookup resolves an absolute
   executable from PATH while rejecting relative/project-local entries (Windows process lookup
   otherwise searches cwd first), and extraction has a 4s timeout plus a 16 MiB output cap.
+  "Project-local" is not simply "under cwd": a Herdr preview inherits its spawn cwd, which is
+  often `$HOME` even while viewing a file in some project, so a plain under-cwd rule rejects a
+  user-installed `~/.local/bin/tidy-viewer` and CSV previews silently fall back to source. The
+  shared `program_in_path` therefore trusts exactly `~/.local/bin` and `~/.cargo/bin`
+  (`USERPROFILE` on Windows), only when cwd is the canonical home and only when each dir
+  canonicalizes to itself; the resolved executable is canonicalized and must lie outside cwd or
+  directly in a trusted dir, so dir or binary symlinks into a project stay rejected. Unit tests
+  cover this with a fake home (tidy-viewer and ffmpeg). Verified on WSL (Herdr 0.9.5) with a
+  release viewer whose cwd was `$HOME`: a CSV rendered as a table and `t` showed the exact
+  source values. macOS/Windows remain unverified.
   Images stop at 32 MiB encoded / 12 megapixels / 64 MiB decoder allocation. Without `ffmpeg`,
   the pane shows a capability message rather than launching an external app. Media stays read-only.
+- `.csv`/`.tsv` (case-insensitive, nothing else) optionally render through `tidy-viewer` — never
+  the `tv` alias, which collides with other tools. Fixed argv `-a -p -s <,|TAB> -n 5000 -g 7`
+  (`-c 5` on the light theme), no `-e`, so tidy fits the pane and names the columns it hid; the
+  already-read MAX_BYTES/MAX_LINES buffer (cut at a physical-line boundary, not a validated CSV
+  record) goes in on stdin; the file is never touched. `run_bounded` covers input delivery,
+  child exit and stdout EOF with one 4s deadline and an 8 MiB output cap, never joins pipe
+  threads (a grandchild can hold a pipe: crossterm may spawn `tput`), and caps those threads at
+  two groups via `InFlight` (run_bounded keeps its own slot Arc until the child is reaped, so a
+  child that closes its pipes and hangs still counts). Any failure, timeout, `-p` rejection
+  (ragged rows), or empty/ANSI-only output falls back to the normal source preview. `-p` is not
+  a full CSV validator: an unterminated quote `a,b\n1,"first line\n` exits 0 with a table.
+  tidy is lossy (`00123`→`123`, `123.456789012345`→`123.4567` even at `-g 7`, cells
+  truncated), so `t` swaps to the exact source; rows do not map, so a swap resets scroll and
+  selection. The choice is the doc's `source_view`, kept independently of whether a table exists
+  and applied when a load/refresh result lands, so it survives width reloads, a failed render and
+  the later recovery; an unchanged table still adopts a changed hidden source. A failed render has
+  no `render_width`, so nothing retries it: the fallback stays until the file's mtime/size changes
+  (the 2s file poll reloads) or the file is loaded again. A width reload that fails while the
+  source is chosen keeps that source's scroll and `w`. Docs without a table (glow markdown) keep
+  the original refresh carry-over of `w` and source line. Line-target opens never run tidy. A
+  user `tv.toml` can still override defaults (tidy has no config-disable flag).
+- tidy sizes itself from the terminal, not a width flag. With stdin/stdout captured and stderr
+  null it can still size from the pane's controlling tty, or through `tput` when `TERM` is set.
+  When terminal-size detection fails (no usable controlling tty and no fallback), it panics in
+  `size().unwrap()`, which falls back to source. A standalone subprocess in a real pane tty on
+  WSL (Herdr 0.9.5) rendered without `TERM`/`tput`; the viewer's no-`TERM` case is unverified.
+  A release `--preview` viewer on WSL (Herdr 0.9.5, isolated `HERDR_PLUGIN_STATE_DIR`, empty
+  `HERDR_PANE_ID`) verified: mixed-case `.CSV` and `.tsv` render as tables; `t` shows exact
+  values; `e` opens the original source for editing; an external edit
+  to a source-selected TSV refreshes within ~2s and stays on source; resizes keep table/toggle
+  working; ragged rows, a missing tidy, `.xlsx`, and line-target opens show source.
+  macOS/Windows are unverified, and Windows keeps CREATE_NO_WINDOW, so it may fall back to source.
+  Capture gotcha: `pane read --source visible --lines N` returns the TAIL of the visible screen,
+  so N below the pane height hides the top rows — read the full visible screen when asserting.
 
 ### Syntax highlighting (file preview)
 
