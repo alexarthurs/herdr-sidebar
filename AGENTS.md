@@ -714,6 +714,44 @@ HACKING.md — budget time for that before promising a patched build.
   button. The active view's selection chip always wins over hover.
   Hit zones come from each rendered glyph's actual width, so emoji and Nerd Font themes stay aligned.
 
+### Explorer drag and drop (`explorer_app.rs` press/drag code, `ghost.rs`, `tools/drag-ghost.swift`)
+
+- A left press on a FILE row is deferred (`PendingPress`): the configured click action runs
+  on release in place, and moving ≥ `DRAG_THRESHOLD` (2 cells) with the button held arms a
+  drag. Movement-only arming matters — a hold timer made slow clicks open a preview late.
+  Folder rows still toggle on press. Keys, a new press, an overlay taking the mouse, a plain
+  `Moved` with a press pending, and a folder change all end the drag (`end_drag` is the one
+  exit path; it also drops the native overlay and resets the pointer shape).
+- **herdr mouse routing, measured on 0.9.5 (macOS, Ghostty):** `Drag`/`Up` keep going to the
+  pane the press started in after the pointer leaves it, but the COLUMN is clamped to that
+  pane (a release left of a right-docked sidebar arrives as `col = 0`; right of a left-docked
+  one as `col = width-1`); the ROW stays real. A release pinned to the edge that faces other
+  panes therefore means "dropped over there" (`drop_direction`), and the target is the nearest
+  pane on that side whose rows cover `my.y + row` in `pane.layout` (`drop_target`). Our own
+  sidebar/preview panes (tokens `herdr-sidebar-*`, `hs-preview*`) never count as targets. The
+  sides that actually have panes come from the layout snapshot taken when the drag armed, with
+  the persisted dock side as fallback.
+- A drop into a Claude Code pane sends `@path ` via `pane.send_text` (quoted as `@"…"` when
+  the name needs it), any other pane a shell-single-quoted path; names containing control
+  characters are refused outright (they would be injected keystrokes). The pane is focused
+  afterwards with `pane.focus`.
+- A drop INSIDE the sidebar moves the file (`actions::move_into`): onto a folder row → that
+  folder, a file row → its parent, below the tree → the root. The receiving folder row is
+  filled in `accent_focus` with bold white text while held (header + tree edges for the root)
+  and the footer names the destination; same-folder and into-itself drops are no-ops.
+- **A pane cannot draw outside its own cells**, so the in-pane chip can only follow the pointer
+  vertically once it has left us. On macOS `ghost.rs` spawns a tiny AppKit helper (compiled by
+  `build.rs` with `swiftc`, embedded with `include_bytes!`, unpacked to the plugin state dir
+  under a content-hash name): a borderless, click-through, non-activating `NSPanel` at
+  `.screenSaver` level that follows `NSEvent.mouseLocation` at 60 Hz and quits when the left
+  button is released or its stdin closes. The in-pane chip is suppressed while it runs. It is
+  skipped over SSH, and on other OSes the embedded blob is empty (`build.rs` writes a stub).
+  `swiftc` absent on a macOS build host = build failure by design; CI's macOS leg has it.
+- OSC 22 (`\x1b]22;grabbing\x1b\\`) is sent for the pointer shape; whether herdr passes it
+  through to the host terminal is NOT verified — treat it as best-effort.
+- Debugging mouse routing: create `<state dir>/mouse-debug.log` before the sidebar starts and
+  every mouse event is appended with the pane size and pending-press state.
+
 ### Explorer git decorations & staging (`src/gitdeco.rs`, issues #19/#20)
 
 - The Explorer decorates rows from `Git::discover_all` (the SAME repo set the SCM view

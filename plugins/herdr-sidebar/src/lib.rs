@@ -10,6 +10,7 @@ pub mod diffview;
 pub mod editor;
 pub mod ensure;
 pub mod fontsetup;
+pub mod ghost;
 pub mod git;
 pub mod gitdeco;
 pub mod icons;

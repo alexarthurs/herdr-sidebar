@@ -63,6 +63,15 @@ Use the mouse or press `1`, `2`, and `3`.
 - The header keeps two folder buttons in view: 🏠 re-roots the tree on the neighbouring
   pane's live working directory (`C`), 📂 opens the native folder picker (`c`). Hover any
   chrome button for a tooltip.
+- Drag a file onto a folder row to move it there (a file row targets its parent, the
+  space below the tree targets the root). The receiving folder is filled in the accent
+  colour and the footer names it while you hold, so a wrong drop is visible before you
+  release; a drop into the folder it already lives in does nothing.
+- Drag a file into a neighbouring pane: press, move at least two cells, and release over
+  the pane. A Claude Code pane receives an `@path` mention, any other pane a shell-quoted
+  path, and the pane is focused. On macOS a native chip follows the pointer across panes.
+  herdr reports only the row once the pointer leaves the pane, so the drop lands in the
+  nearest pane on that side at that row.
 
 **Takeover caveat:** after a herdr restart or an incomplete restore, move any remaining
 working panes back manually. Third-party TUIs are not yet verified with takeover;

@@ -357,8 +357,17 @@ pub struct App {
     mouse_pos: Option<(u16, u16)>,
     /// Last left-click (row index, when) for double-click detection.
     last_click: Option<(usize, std::time::Instant)>,
+    /// A left button held down on a file row whose click action is deferred
+    /// until the button is released: a release in place runs the configured
+    /// click action, a release after dragging drops the file elsewhere.
+    press: Option<PendingPress>,
     /// Copy/Cut source awaiting a Paste: the path and whether it moves.
     clipboard: Option<(PathBuf, bool)>,
+    /// Native pointer-following overlay for the current drag (macOS).
+    ghost: Option<herdr_sidebar::ghost::Ghost>,
+    /// Raw mouse trace file, when `<state dir>/mouse-debug.log` existed at
+    /// startup (checked once; its presence is the switch).
+    mouse_log: Option<PathBuf>,
     /// Where the most recent preview landed, with its document key — so a
     /// double click pins that exact tab instead of re-opening it.
     last_preview: Option<(String, herdr_sidebar::viewer::PreviewTarget)>,
@@ -404,6 +413,192 @@ pub struct App {
 
 /// How long two clicks on the same row still count as a double click.
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(450);
+
+/// A press has to travel this many cells (either axis) before it becomes a
+/// drag — a slow or slightly wobbly click still opens the file.
+const DRAG_THRESHOLD: u16 = 2;
+
+/// The pane a dragged file lands on.
+#[derive(Debug, PartialEq, Eq)]
+struct DropTarget {
+    pane_id: String,
+    label: Option<String>,
+    cwd: Option<PathBuf>,
+    /// `pane.list`'s detected agent kind (`claude`, `codex`, …).
+    agent: Option<String>,
+}
+
+/// Ask the host terminal for a mouse pointer shape (xterm/Ghostty/kitty
+/// OSC 22, CSS cursor names). Hosts that do not implement it ignore the
+/// sequence; herdr may or may not forward it to the outer terminal.
+fn set_pointer_shape(shape: &str) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b]22;{shape}\x1b\\");
+    let _ = out.flush();
+}
+
+/// Does the tab have panes to the right / to the left of ours? Decides which
+/// clamped edge counts as "over a neighbour", whatever the dock setting or a
+/// user-rearranged layout says. Returns `(right, left)`.
+fn neighbour_sides(layout: &str, my_id: &str) -> (bool, bool) {
+    let Ok(layout) = serde_json::from_str::<serde_json::Value>(layout.trim_start_matches('\u{feff}'))
+    else {
+        return (false, false);
+    };
+    let Some(rects) = layout["result"]["layout"]["panes"].as_array() else {
+        return (false, false);
+    };
+    let xw = |p: &serde_json::Value| Some((p["rect"]["x"].as_u64()?, p["rect"]["width"].as_u64()?));
+    let Some(me) = rects
+        .iter()
+        .find(|p| p["pane_id"].as_str() == Some(my_id))
+        .and_then(xw)
+    else {
+        return (false, false);
+    };
+    let others = rects
+        .iter()
+        .filter(|p| p["pane_id"].as_str() != Some(my_id))
+        .filter_map(xw);
+    others.fold((false, false), |(r, l), (x, w)| (r || x >= me.0 + me.1, l || x + w <= me.0))
+}
+
+/// Which side of the sidebar a drag was released on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DropDirection {
+    Left,
+    Right,
+}
+
+/// The sibling pane a drag lands on: the nearest pane on `direction`'s side
+/// of ours whose rows cover the release row (reported in OUR pane-local
+/// cells; the column is clamped by herdr, so only the row is trusted).
+/// `layout` is `pane.layout` for our pane (global cell rects), `panes` is
+/// `pane.list` (labels, cwds, agents).
+fn drop_target(
+    layout: &str,
+    panes: &str,
+    my_id: &str,
+    direction: DropDirection,
+    row: u16,
+) -> Option<DropTarget> {
+    let layout: serde_json::Value = serde_json::from_str(layout.trim_start_matches('\u{feff}')).ok()?;
+    let rects = layout["result"]["layout"]["panes"].as_array()?;
+    let rect = |p: &serde_json::Value| -> Option<(u64, u64, u64, u64)> {
+        let r = &p["rect"];
+        Some((r["x"].as_u64()?, r["y"].as_u64()?, r["width"].as_u64()?, r["height"].as_u64()?))
+    };
+    let me = rects
+        .iter()
+        .find(|p| p["pane_id"].as_str() == Some(my_id))
+        .and_then(rect)?;
+    let gy = me.1 + u64::from(row);
+    let panes: serde_json::Value = serde_json::from_str(panes.trim_start_matches('\u{feff}')).ok()?;
+    let info_of = |id: &str| {
+        panes["result"]["panes"]
+            .as_array()
+            .and_then(|list| list.iter().find(|p| p["pane_id"].as_str() == Some(id)))
+    };
+    // Our own preview/editor/sidebar panes cannot take typed input usefully.
+    let ours = |id: &str| {
+        info_of(id).is_some_and(|p| {
+            p["tokens"].as_object().is_some_and(|t| {
+                t.keys().any(|k| k.starts_with("herdr-sidebar-") || k.starts_with("hs-preview"))
+            })
+        })
+    };
+    let hit = rects
+        .iter()
+        .filter(|p| p["pane_id"].as_str() != Some(my_id))
+        .filter_map(|p| rect(p).map(|r| (p, r)))
+        .filter(|(_, (_, y, _, h))| gy >= *y && gy < y + h)
+        .filter(|(_, (x, _, w, _))| match direction {
+            DropDirection::Left => x + w <= me.0,
+            DropDirection::Right => *x >= me.0 + me.2,
+        })
+        .min_by_key(|(_, (x, _, w, _))| match direction {
+            DropDirection::Left => me.0 - (x + w),
+            DropDirection::Right => x - (me.0 + me.2),
+        })?
+        .0;
+    let pane_id = hit["pane_id"].as_str()?.to_string();
+    // The nearest pane is one of our own previews/editors: the cursor is
+    // over it, so nothing further away may receive the text.
+    if ours(&pane_id) {
+        return None;
+    }
+    let info = info_of(&pane_id);
+    Some(DropTarget {
+        pane_id,
+        label: info.and_then(|p| p["label"].as_str()).map(str::to_string),
+        cwd: info
+            .and_then(|p| p["foreground_cwd"].as_str().or(p["cwd"].as_str()))
+            .map(PathBuf::from),
+        agent: info.and_then(|p| p["agent"].as_str()).map(str::to_string),
+    })
+}
+
+/// What to type into the target pane for a dropped file: the path relative
+/// to that pane's cwd when the file is inside it, else absolute. Claude Code
+/// panes get an `@` mention so the prompt attaches the file; other panes get
+/// a shell-quoted path. A trailing space separates it from what follows.
+/// `None` for a name carrying control characters — typed into a terminal
+/// those are keystrokes (Enter submits, ^C cancels), never a file name.
+fn drop_text(path: &Path, target: &DropTarget) -> Option<String> {
+    let shown = target
+        .cwd
+        .as_ref()
+        .and_then(|cwd| path.strip_prefix(cwd).ok())
+        .unwrap_or(path);
+    let shown = shown.display().to_string();
+    if shown.chars().any(char::is_control) {
+        return None;
+    }
+    let needs_quotes = shown.chars().any(|c| c.is_whitespace() || "\"'$`\\".contains(c));
+    Some(if target.agent.as_deref() == Some("claude") {
+        if needs_quotes {
+            format!("@\"{}\" ", shown.replace('\\', "\\\\").replace('"', "\\\""))
+        } else {
+            format!("@{shown} ")
+        }
+    } else if needs_quotes {
+        format!("'{}' ", shown.replace('\'', "'\\''"))
+    } else {
+        format!("{shown} ")
+    })
+}
+
+/// A left button press on a file row, waiting for its release.
+#[derive(Debug)]
+struct PendingPress {
+    path: PathBuf,
+    /// The press was the second click of a double click.
+    double: bool,
+    col: u16,
+    row: u16,
+    /// Cursor moved or the hold timer elapsed: the file is being dragged.
+    dragging: bool,
+    /// `pane.layout` / `pane.list` snapshots taken when the drag armed, so
+    /// the ghost can name the pane under the cursor without an API round
+    /// trip per mouse event.
+    layout: Option<String>,
+    panes: Option<String>,
+}
+
+impl PendingPress {
+    /// The pane a release would drop into right now (clamped-edge rule).
+    fn target_now(&self, my_id: &str, direction: DropDirection, row: u16) -> Option<DropTarget> {
+        drop_target(self.layout.as_deref()?, self.panes.as_deref()?, my_id, direction, row)
+    }
+}
+
+/// Where an in-sidebar drag would MOVE the file on release: the folder, and
+/// the visible row standing for it (`None` = the root, shown by the header).
+struct MoveTarget {
+    dir: PathBuf,
+    row: Option<usize>,
+}
 
 /// Activity-bar click zones from the last draw: the bar's row and the column
 /// ranges of the explorer / source-control icons.
@@ -498,7 +693,10 @@ impl App {
             last_mouse: None,
             mouse_pos: None,
             last_click: None,
+            press: None,
             clipboard: None,
+            ghost: None,
+            mouse_log: Some(herdr_sidebar::rundir::dir("mouse-debug.log")).filter(|p| p.is_file()),
             last_preview: None,
             last_beat: std::time::Instant::now(),
             picking: None,
@@ -842,6 +1040,259 @@ impl App {
         self.open_preview_at(path, None);
     }
 
+    /// The configured click action for a file row, run on button release.
+    fn click_file(&mut self, path: &Path, double: bool) {
+        if self.sidebar_state.custom_editor_on_click && actions::configured_editor().is_some() {
+            if !double {
+                self.open_custom_editor(path);
+            }
+        } else if double {
+            // Pin the tab the first click just opened. Re-opening here would
+            // race the viewer's first token stamp and spawn a second tab for
+            // the same file.
+            let doc_key = herdr_sidebar::viewer::doc_key_for_file(path);
+            match self.last_preview.as_ref() {
+                Some((key, target)) if *key == doc_key => {
+                    if !herdr_sidebar::viewer::pin_target(target, &doc_key) {
+                        self.notice = Some(
+                            "preview switch blocked; resolve unsaved changes in its tab".into(),
+                        );
+                    }
+                }
+                _ => self.open_preview(path),
+            }
+        } else {
+            // A click on a file previews it in the ephemeral tab.
+            self.open_preview(path);
+        }
+    }
+
+    /// Forget the press and tear down every drag affordance (overlay,
+    /// pointer shape). The single exit path for a drag, successful or not.
+    fn end_drag(&mut self) -> Option<PendingPress> {
+        let press = self.press.take();
+        self.ghost = None;
+        if press.as_ref().is_some_and(|p| p.dragging) {
+            set_pointer_shape("default");
+        }
+        press
+    }
+
+    /// Enter drag mode: snapshot the tab layout for live drop-target naming,
+    /// ask for a grab pointer, and announce it.
+    fn arm_drag(&mut self) {
+        let my_id = self.pane_ctl.as_ref().map(|c| c.pane_id.clone());
+        let Some(press) = self.press.as_mut() else { return };
+        press.dragging = true;
+        if let Some(my_id) = my_id {
+            press.layout =
+                ipc::call_text("pane.layout", serde_json::json!({ "pane_id": my_id })).ok();
+            press.panes = ipc::call_text("pane.list", serde_json::json!({})).ok();
+        }
+        // The press that started this drag must not pair with the next
+        // click into a double click.
+        self.last_click = None;
+        let name = self
+            .press
+            .as_ref()
+            .and_then(|p| p.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_default();
+        self.ghost = herdr_sidebar::ghost::start(&name);
+        set_pointer_shape("grabbing");
+        self.show_drag_notice();
+    }
+
+    /// While dragging, the footer notice names where a release would land.
+    fn update_drag_notice(&mut self, col: u16, row: u16) {
+        let Some(press) = self.press.as_ref().filter(|p| p.dragging) else { return };
+        let Some(direction) = self.drop_direction(press, col) else {
+            let name = press
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.notice = Some(match self.move_target(press, row) {
+                Ok(t) => format!("⇣ move {name} → {}/", self.folder_label(&t.dir)),
+                Err(why) => format!("⇣ {name}: {why} (release to cancel)"),
+            });
+            return;
+        };
+        let my_id = self.pane_ctl.as_ref().map(|c| c.pane_id.as_str()).unwrap_or("");
+        let name = press
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.notice = Some(match press.target_now(my_id, direction, row) {
+            Some(t) => format!("⇢ {name} → {}", t.label.unwrap_or(t.pane_id)),
+            None => format!("⇢ {name} → no agent/shell pane here"),
+        });
+    }
+
+    fn show_drag_notice(&mut self) {
+        let Some(press) = &self.press else { return };
+        let name = press
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.notice = Some(format!("⇢ {name}  (drop on a folder to move · on a pane to send)"));
+    }
+
+    /// The folder an in-sidebar release at pane row `row` would move the
+    /// dragged entry into: a folder row itself, a file row's parent, or the
+    /// root below the last row. `Err` names why the release would be a no-op.
+    fn move_target(&self, press: &PendingPress, row: u16) -> Result<MoveTarget, &'static str> {
+        let root = self.tree.root_path();
+        let (dir, index) = match self.row_at(row).and_then(|i| self.rows.get(i).map(|r| (i, r))) {
+            Some((i, r)) if r.is_dir => (r.path.clone(), Some(i)),
+            Some((_, r)) => {
+                let parent = r.path.parent().map(Path::to_path_buf).unwrap_or_else(|| root.clone());
+                let index = self.rows.iter().position(|x| x.path == parent);
+                (parent, index)
+            }
+            None => (root, None),
+        };
+        if press.path.parent() == Some(dir.as_path()) {
+            return Err("already in this folder");
+        }
+        if dir.starts_with(&press.path) {
+            return Err("cannot move a folder into itself");
+        }
+        Ok(MoveTarget { dir, row: index })
+    }
+
+    /// The in-sidebar move target under the pointer right now, if the drag
+    /// is inside the pane and the release would do something.
+    fn live_move_target(&self) -> Option<MoveTarget> {
+        let press = self.press.as_ref().filter(|p| p.dragging)?;
+        let (col, row) = self.mouse_pos?;
+        if self.drop_direction(press, col).is_some() {
+            return None;
+        }
+        self.move_target(press, row).ok()
+    }
+
+    /// A folder for notices: its path relative to the root, or the root's name.
+    fn folder_label(&self, dir: &Path) -> String {
+        match dir.strip_prefix(self.tree.root_path()) {
+            Ok(rel) if !rel.as_os_str().is_empty() => rel.display().to_string(),
+            _ => self.tree.root_name(),
+        }
+    }
+
+    /// Release inside the sidebar: move the dragged entry into the folder
+    /// under the pointer (see [`Self::move_target`]).
+    fn move_file(&mut self, press: &PendingPress, row: u16) {
+        let name = press
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let target = match self.move_target(press, row) {
+            Ok(t) => t,
+            Err(why) => {
+                self.notice = Some(format!("{name}: {why}"));
+                return;
+            }
+        };
+        match actions::move_into(&press.path, &target.dir) {
+            Ok(moved) => {
+                self.tree.expand(&target.dir);
+                self.reveal_created(&moved);
+                self.request_decorations(true);
+                self.notice = Some(format!("moved {name} → {}/", self.folder_label(&target.dir)));
+            }
+            Err(err) => self.notice = Some(format!("move failed: {err}")),
+        }
+    }
+
+    /// Did a drag end beyond our edge? herdr keeps routing a drag to the
+    /// pane it started in, but CLAMPS the column to our own cells (measured
+    /// on herdr 0.9.5: a release left of a right-docked sidebar arrives as
+    /// `col = 0`, the row stays real). So a dragged release pinned to the
+    /// edge that faces the other panes means "dropped over there".
+    fn drop_direction(&self, press: &PendingPress, col: u16) -> Option<DropDirection> {
+        if !press.dragging || self.last_width == 0 {
+            return None;
+        }
+        let my_id = self.pane_ctl.as_ref().map(|c| c.pane_id.as_str()).unwrap_or("");
+        let sides = press
+            .layout
+            .as_deref()
+            .map(|l| neighbour_sides(l, my_id))
+            .unwrap_or((!self.sidebar_state.dock_right, self.sidebar_state.dock_right));
+        // (right side has panes, left side has panes)
+        if col == 0 && sides.1 {
+            Some(DropDirection::Left)
+        } else if col + 1 >= self.last_width && sides.0 {
+            Some(DropDirection::Right)
+        } else {
+            None
+        }
+    }
+
+    /// Drop a dragged file onto the nearest pane in `direction` at the
+    /// release row: type its path into that pane and focus it. A Claude Code
+    /// pane gets an `@path` mention, anything else a shell-quoted path.
+    fn drop_file(&mut self, path: &Path, direction: DropDirection, row: u16) {
+        let Some(my_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) else { return };
+        let Ok(layout) = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": my_id }))
+        else {
+            self.notice = Some("drop failed: pane.layout".into());
+            return;
+        };
+        let Ok(panes) = ipc::call_text("pane.list", serde_json::json!({})) else {
+            self.notice = Some("drop failed: pane.list".into());
+            return;
+        };
+        let Some(target) = drop_target(&layout, &panes, &my_id, direction, row) else {
+            self.notice = Some("drop: no agent/shell pane on that side".into());
+            return;
+        };
+        let Some(text) = drop_text(path, &target) else {
+            self.notice = Some("drop refused: control characters in the file name".into());
+            return;
+        };
+        match ipc::call_text(
+            "pane.send_text",
+            serde_json::json!({ "pane_id": target.pane_id, "text": text }),
+        ) {
+            Ok(_) => {
+                let _ = ipc::call_text("pane.focus", serde_json::json!({ "pane_id": target.pane_id }));
+                self.notice = Some(format!(
+                    "dropped {} → {}",
+                    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                    target.label.as_deref().unwrap_or(&target.pane_id)
+                ))
+            }
+            Err(error) => self.notice = Some(format!("drop failed: {error}")),
+        }
+    }
+
+    /// Raw mouse event trace, enabled by creating the file
+    /// `<state dir>/mouse-debug.log` (its presence is the switch).
+    fn log_mouse(&self, mouse: &MouseEvent) {
+        let Some(path) = &self.mouse_log else { return };
+        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+            use std::io::Write as _;
+            let press = self.press.as_ref().map(|p| {
+                let name = p.path.file_name().map(|n| n.to_string_lossy().into_owned());
+                format!("{:?}@{},{} dragging={}", name.unwrap_or_default(), p.col, p.row, p.dragging)
+            });
+            let _ = writeln!(
+                file,
+                "{:?} col={} row={} size={}x{} press={}",
+                mouse.kind,
+                mouse.column,
+                mouse.row,
+                self.last_width,
+                self.last_height,
+                press.unwrap_or_else(|| "None".into())
+            );
+        }
+    }
+
     fn open_preview_at(&mut self, path: &Path, line: Option<usize>) {
         let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) else {
             self.notice = Some("preview needs a herdr pane".into());
@@ -1037,6 +1488,9 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return None;
         }
+        // Keys never arrive mid-drag from a real mouse; a pending press here
+        // is stale (lost release) and would otherwise linger.
+        self.end_drag();
         if key.code == KeyCode::Char('q')
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
@@ -1164,6 +1618,14 @@ impl App {
 
     /// `Some(exit)` ends the event loop, mirroring on_key.
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Exit> {
+        self.log_mouse(&mouse);
+        // A new press, or an overlay taking the mouse, ends any drag — no
+        // matter which early branch below handles the event.
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            || (self.overlay.is_some() && self.press.is_some())
+        {
+            self.end_drag();
+        }
         // Any mouse activity = "the mouse is over this pane": it shows the
         // hover title-bar buttons until the linger expires.
         self.last_mouse = Some(std::time::Instant::now());
@@ -1221,6 +1683,11 @@ impl App {
         match mouse.kind {
             MouseEventKind::Moved => {
                 self.hovered = self.row_at(mouse.row);
+                // A plain move with a press pending means the release went
+                // to another pane (or was lost): the drag is over.
+                if self.end_drag().is_some_and(|p| p.dragging) {
+                    self.notice = Some("drag ended outside".into());
+                }
             }
             MouseEventKind::ScrollUp => self.scroll_view(-3),
             MouseEventKind::ScrollDown => self.scroll_view(3),
@@ -1260,31 +1727,39 @@ impl App {
                     if folder_click_toggles(on_chevron, double) {
                         self.toggle();
                     }
-                } else if self.sidebar_state.custom_editor_on_click
-                    && actions::configured_editor().is_some()
-                {
-                    if !double {
-                        self.open_custom_editor(&path);
-                    }
-                } else if double {
-                    // Pin the tab the first click just opened. Re-opening
-                    // here would race the viewer's first token stamp and
-                    // spawn a second tab for the same file.
-                    let doc_key = herdr_sidebar::viewer::doc_key_for_file(&path);
-                    match self.last_preview.as_ref() {
-                        Some((key, target)) if *key == doc_key => {
-                            if !herdr_sidebar::viewer::pin_target(target, &doc_key) {
-                                self.notice = Some(
-                                    "preview switch blocked; resolve unsaved changes in its tab"
-                                        .into(),
-                                );
-                            }
-                        }
-                        _ => self.open_preview(&path),
-                    }
                 } else {
-                    // A click on a file previews it in the ephemeral tab.
-                    self.open_preview(&path);
+                    // A file's click action waits for the release: a plain
+                    // release runs it, a drag drops the file elsewhere.
+                    self.press = Some(PendingPress {
+                        path,
+                        double,
+                        col: mouse.column,
+                        row: mouse.row,
+                        dragging: false,
+                        layout: None,
+                        panes: None,
+                    });
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(press) = self.press.as_mut() {
+                    let moved = press.col.abs_diff(mouse.column) >= DRAG_THRESHOLD
+                        || press.row.abs_diff(mouse.row) >= DRAG_THRESHOLD;
+                    if moved && !press.dragging {
+                        self.arm_drag();
+                    }
+                    self.update_drag_notice(mouse.column, mouse.row);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(press) = self.end_drag() {
+                    match self.drop_direction(&press, mouse.column) {
+                        Some(direction) => self.drop_file(&press.path, direction, mouse.row),
+                        // A drag released back inside the sidebar moves the
+                        // entry into the folder under the pointer.
+                        None if press.dragging => self.move_file(&press, mouse.row),
+                        None => self.click_file(&press.path, press.double),
+                    }
                 }
             }
             MouseEventKind::Down(MouseButton::Right) => {
@@ -3036,6 +3511,7 @@ impl App {
             self.cwd_follower.borrow_mut().mark_manual_folder();
         }
         let cwd_follower = std::rc::Rc::clone(&self.cwd_follower);
+        self.end_drag();
         *self = App::new(root, cwd_follower);
         // Only confirm an explicit folder change; an automatic cwd-follow
         // re-root must not pop an unprompted "folder: …" notice.
@@ -3334,6 +3810,7 @@ impl App {
             let theme = self.theme;
             let hovered = self.hovered;
             let selected = self.selected;
+            let drop_row = self.live_move_target().map(|t| t.row);
             let items: Vec<ListItem> = self
                 .rows
                 .iter()
@@ -3346,6 +3823,7 @@ impl App {
                         theme,
                         hovered == Some(i),
                         selected == Some(i),
+                        drop_row == Some(Some(i)),
                         self.row_deco(r),
                         body.width,
                     )
@@ -3353,6 +3831,17 @@ impl App {
                 .collect();
             frame.render_widget(List::new(items), body);
             draw_scrollbar(frame, body, self.rows.len(), h, self.scroll);
+            // Dropping into the ROOT has no row to light up: frame the whole
+            // tree body instead so the target is still unmistakable.
+            if drop_row == Some(None) {
+                let style = drop_target_style();
+                frame.render_widget(Block::default().style(style), Rect::new(body.x, body.y, 1, body.height));
+                frame.render_widget(
+                    Block::default().style(style),
+                    Rect::new(body.x + body.width.saturating_sub(1), body.y, 1, body.height),
+                );
+                frame.render_widget(Block::default().style(style), header);
+            }
         }
         self.body = BodyGeom {
             top: body.y,
@@ -3470,14 +3959,15 @@ impl App {
             Some(Overlay::QuickOpen { .. }) => self.draw_quick_open(frame),
             _ => {}
         }
+        self.draw_drag_ghost(frame);
         self.draw_tooltip(frame);
     }
 
     /// One-line tooltip under whichever chrome button the pointer rests on
-    /// (header actions, ⚙, activity-bar icons), while the hover
-    /// approximation is live.
+    /// (header actions, ⚙, activity-bar icons). Only while the hover
+    /// approximation is live and no drag is in progress.
     fn draw_tooltip(&self, frame: &mut Frame) {
-        if !title_actions_visible(self.last_mouse) {
+        if !title_actions_visible(self.last_mouse) || self.press.is_some() {
             return;
         }
         let Some((mx, my)) = self.mouse_pos else { return };
@@ -3525,6 +4015,82 @@ impl App {
                 Style::default()
                     .bg(palette().keycap_bg)
                     .fg(palette().keycap_fg),
+            ))),
+            rect,
+        );
+    }
+
+    /// The dragged file's "ghost": a chip that rides along with the cursor
+    /// while the button is held. A terminal cannot restyle the host's mouse
+    /// pointer from inside a pane (OSC 22 is sent too, for hosts that honor
+    /// it), so the chip is the visible drag affordance. Pinned to the edge
+    /// facing the other panes — with an arrow — once the cursor has left us
+    /// (herdr clamps the column there, see [`Self::drop_direction`]).
+    fn draw_drag_ghost(&self, frame: &mut Frame) {
+        let Some(press) = self.press.as_ref().filter(|p| p.dragging) else { return };
+        let Some((col, row)) = self.mouse_pos else { return };
+        let area = frame.area();
+        if area.width < 4 || area.height == 0 {
+            return;
+        }
+        let name = press
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let outside = self.drop_direction(press, col);
+        let my_id = self.pane_ctl.as_ref().map(|c| c.pane_id.as_str()).unwrap_or("");
+        let target = outside.and_then(|d| press.target_now(my_id, d, row));
+        let target_name = target
+            .as_ref()
+            .map(|t| t.label.clone().unwrap_or_else(|| t.pane_id.clone()))
+            .unwrap_or_else(|| "no pane".into());
+        let label = match outside {
+            Some(DropDirection::Left) => format!("◀ {name} → {target_name} "),
+            Some(DropDirection::Right) => format!(" {target_name} ← {name} ▶"),
+            None => format!(" {} {name} ", icon(self.theme, &name, false, false).glyph),
+        };
+        // The cursor is over a neighbour: light the whole facing edge so the
+        // drop zone reads even though we cannot draw beyond our own cells.
+        if let Some(direction) = outside {
+            let edge_x = match direction {
+                DropDirection::Left => area.x,
+                DropDirection::Right => area.x + area.width - 1,
+            };
+            let bar_style = if target.is_some() {
+                Style::default().bg(palette().selection_bg)
+            } else {
+                Style::default().bg(Color::DarkGray)
+            };
+            frame.render_widget(
+                Block::default().style(bar_style),
+                Rect::new(edge_x, area.y, 1, area.height),
+            );
+        }
+        // With the native pointer-following overlay up, the in-pane chip
+        // would be a second, edge-pinned copy of it: skip it.
+        if self.ghost.is_some() {
+            return;
+        }
+        let max_w = usize::from(area.width);
+        let label = truncate_to(label, max_w);
+        let w = Span::raw(label.as_str()).width() as u16;
+        let x = match outside {
+            Some(DropDirection::Left) => area.x,
+            Some(DropDirection::Right) => area.x + area.width - w,
+            // Just right of the cursor, kept inside the pane.
+            None => (area.x + col + 1).min(area.x + area.width - w),
+        };
+        let y = (area.y + row).min(area.y + area.height - 1);
+        let rect = Rect::new(x, y, w, 1);
+        frame.render_widget(Clear, rect);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                label,
+                Style::default()
+                    .bg(palette().selection_bg)
+                    .fg(Color::White)
+                    .bold(),
             ))),
             rect,
         );
@@ -4774,14 +5340,24 @@ fn row_item(
     theme: IconTheme,
     hovered: bool,
     selected: bool,
+    drop_target: bool,
     deco: Option<char>,
     width: u16,
 ) -> ListItem<'static> {
     let item = ListItem::new(row_line(row, theme, deco, width));
+    if drop_target {
+        return item.style(drop_target_style());
+    }
     match row_bg(hovered, selected) {
         Some(style) => item.style(style),
         None => item,
     }
+}
+
+/// The folder about to receive a dragged file: a steady accent fill with
+/// bold white text, distinct from the grey selection and hover backgrounds.
+fn drop_target_style() -> Style {
+    Style::default().bg(palette().accent_focus).fg(Color::White).bold()
 }
 
 /// The selection / hover BACKGROUND for a row, if any. Kept apart from the
@@ -5562,5 +6138,102 @@ mod tests {
             search_toolbar_icons(IconTheme::Material),
             ("\u{eb37}", "\u{eabf}", "\u{ea7c}")
         );
+    }
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+
+    const LAYOUT: &str = r#"{"result":{"layout":{"panes":[
+        {"pane_id":"w1:p1","rect":{"x":0,"y":0,"width":100,"height":30}},
+        {"pane_id":"w1:p2","rect":{"x":100,"y":0,"width":117,"height":30}},
+        {"pane_id":"w1:p5","rect":{"x":0,"y":30,"width":217,"height":36}},
+        {"pane_id":"w1:p3","rect":{"x":217,"y":0,"width":38,"height":66}}
+    ]}}}"#;
+    const PANES: &str = r#"{"result":{"panes":[
+        {"pane_id":"w1:p1","label":"api","cwd":"/proj","foreground_cwd":"/proj","agent":"claude"},
+        {"pane_id":"w1:p2","label":"shell","cwd":"/proj","foreground_cwd":"/proj/sub"},
+        {"pane_id":"w1:p5","label":"codex","cwd":"/other","agent":"codex"},
+        {"pane_id":"w1:p3","label":"Sidebar","cwd":"/proj"}
+    ]}}"#;
+    const PREVIEW_LAYOUT: &str = r#"{"result":{"layout":{"panes":[
+        {"pane_id":"w1:p5","rect":{"x":0,"y":0,"width":217,"height":66}},
+        {"pane_id":"w1:p9","rect":{"x":217,"y":0,"width":38,"height":66}}
+    ]}}}"#;
+    const PREVIEW_PANES: &str = r#"{"result":{"panes":[
+        {"pane_id":"w1:p5","label":"README.md · preview","tokens":{"herdr-sidebar-preview":"1","hs-preview-path":"x"}},
+        {"pane_id":"w1:p9","label":"Sidebar","tokens":{"herdr-sidebar-explorer":"1"}}
+    ]}}"#;
+
+    #[test]
+    fn our_own_preview_pane_is_not_a_drop_target() {
+        assert!(drop_target(PREVIEW_LAYOUT, PREVIEW_PANES, "w1:p9", DropDirection::Left, 10).is_none());
+    }
+
+    #[test]
+    fn left_drop_picks_the_adjacent_pane_on_the_release_row() {
+        let top = drop_target(LAYOUT, PANES, "w1:p3", DropDirection::Left, 5).unwrap();
+        assert_eq!(top.pane_id, "w1:p2");
+        assert_eq!(top.label.as_deref(), Some("shell"));
+        assert_eq!(top.cwd.as_deref(), Some(Path::new("/proj/sub")));
+        let bottom = drop_target(LAYOUT, PANES, "w1:p3", DropDirection::Left, 40).unwrap();
+        assert_eq!(bottom.pane_id, "w1:p5");
+        assert_eq!(bottom.agent.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn no_pane_on_that_side_is_none() {
+        assert!(drop_target(LAYOUT, PANES, "w1:p3", DropDirection::Right, 5).is_none());
+        assert!(drop_target(LAYOUT, PANES, "w1:p1", DropDirection::Left, 5).is_none());
+        assert!(drop_target("not json", PANES, "w1:p3", DropDirection::Left, 5).is_none());
+    }
+
+    #[test]
+    fn drop_text_mentions_for_claude_and_quotes_for_shells() {
+        let claude = DropTarget {
+            pane_id: "p".into(),
+            label: None,
+            cwd: Some(PathBuf::from("/proj")),
+            agent: Some("claude".into()),
+        };
+        assert_eq!(drop_text(Path::new("/proj/src/a.rs"), &claude).unwrap(), "@src/a.rs ");
+        assert_eq!(drop_text(Path::new("/else/a.rs"), &claude).unwrap(), "@/else/a.rs ");
+        assert_eq!(
+            drop_text(Path::new("/proj/my file.md"), &claude).unwrap(),
+            "@\"my file.md\" "
+        );
+        let shell = DropTarget { agent: None, ..claude };
+        assert_eq!(drop_text(Path::new("/proj/src/a.rs"), &shell).unwrap(), "src/a.rs ");
+        assert_eq!(drop_text(Path::new("/proj/my file.md"), &shell).unwrap(), "'my file.md' ");
+        assert_eq!(drop_text(Path::new("/proj/it's.md"), &shell).unwrap(), "'it'\\''s.md' ");
+    }
+
+    #[test]
+    fn control_characters_in_a_name_refuse_the_drop() {
+        let shell = DropTarget { pane_id: "p".into(), label: None, cwd: None, agent: None };
+        assert!(drop_text(Path::new("/proj/a\rb.md"), &shell).is_none());
+        assert!(drop_text(Path::new("/proj/a\u{3}b.md"), &shell).is_none());
+        assert!(drop_text(Path::new("/proj/a\u{1b}[201~b.md"), &shell).is_none());
+    }
+
+    #[test]
+    fn a_preview_between_us_and_an_agent_blocks_the_drop() {
+        // sidebar(right) | preview | claude(left): the cursor is over the
+        // preview, so claude must not receive the text.
+        let layout = r#"{"result":{"layout":{"panes":[
+            {"pane_id":"w1:p1","rect":{"x":0,"y":0,"width":100,"height":66}},
+            {"pane_id":"w1:p5","rect":{"x":100,"y":0,"width":117,"height":66}},
+            {"pane_id":"w1:p3","rect":{"x":217,"y":0,"width":38,"height":66}}
+        ]}}}"#;
+        let panes = r#"{"result":{"panes":[
+            {"pane_id":"w1:p1","label":"claude","agent":"claude"},
+            {"pane_id":"w1:p5","label":"x · preview","tokens":{"herdr-sidebar-preview":"1"}},
+            {"pane_id":"w1:p3","label":"Sidebar"}
+        ]}}"#;
+        assert!(drop_target(layout, panes, "w1:p3", DropDirection::Left, 5).is_none());
+        assert_eq!(neighbour_sides(layout, "w1:p3"), (false, true));
+        assert_eq!(neighbour_sides(layout, "w1:p1"), (true, false));
+        assert_eq!(neighbour_sides("junk", "w1:p1"), (false, false));
     }
 }
