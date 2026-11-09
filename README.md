@@ -43,7 +43,11 @@ Use the mouse or press `1`, `2`, and `3`.
 </div>
 
 - Navigate a real expandable tree with file icons, hover actions, Git decorations, and
-  `m` / Ctrl+right-click context menus.
+  `m` / Ctrl+right-click context menus (set `[ui] right_click_passthrough_modifier = "ctrl"`
+  in herdr's config.toml for the mouse variant).
+- Copy, Cut, Paste, and Duplicate files or folders from that menu. Paste lands in the
+  targeted folder (or a file's parent, or the root from empty space); name clashes get a
+  VS Code-style `name copy.ext` suffix.
 - Click a file to reuse an ephemeral preview tab; double-click to pin it. Preview in the
   same tab with **Preview opens in: pane**, or opt into experimental `replace` mode:
   working panes move to a temporary tab while you preview; Esc / `q` brings them back.
@@ -56,6 +60,18 @@ Use the mouse or press `1`, `2`, and `3`.
 - Opt into a terminal editor for mouse clicks, while Enter keeps the built-in preview.
 - Press `e` in a text preview for the experimental editor with selection, find,
   clipboard actions, explicit save, and external-change protection.
+- The header keeps two folder buttons in view: 🏠 re-roots the tree on the neighbouring
+  pane's live working directory (`C`), 📂 opens the native folder picker (`c`). Hover any
+  chrome button for a tooltip.
+- Drag a file onto a folder row to move it there (a file row targets its parent, the
+  space below the tree targets the root). The receiving folder is filled in the accent
+  colour and the footer names it while you hold, so a wrong drop is visible before you
+  release; a drop into the folder it already lives in does nothing.
+- Drag a file into a neighbouring pane: press, move at least two cells, and release over
+  the pane. A Claude Code pane receives an `@path` mention, any other pane a shell-quoted
+  path, and the pane is focused. On macOS a native chip follows the pointer across panes.
+  herdr reports only the row once the pointer leaves the pane, so the drop lands in the
+  nearest pane on that side at that row.
 
 **Takeover caveat:** after a herdr restart or an incomplete restore, move any remaining
 working panes back manually. Third-party TUIs are not yet verified with takeover;
@@ -115,6 +131,7 @@ folder stays put until that pane changes directory again.
 | `Ctrl+P` | quick open | `A` | draft message |
 | `Ctrl+F` | content search | `S` | sync |
 | `.` | hidden files | `o` | open diff |
+| `c` / `C` | change folder / pane folder | | |
 | `r` | refresh | `r` | refresh |
 | `m` | context menu | `m` | context menu |
 | `s` | settings | `s` | settings |
