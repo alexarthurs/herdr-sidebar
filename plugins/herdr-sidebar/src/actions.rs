@@ -19,6 +19,8 @@ pub enum MenuAction {
     Reveal,
     ChangeFolder,
     ChangeFolderTyped,
+    /// Re-root on the neighbouring pane's live working directory.
+    PaneFolder,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -68,6 +70,7 @@ pub fn menu_entries(target: Option<bool>, in_repo: bool) -> Vec<MenuEntry> {
         MenuEntry::Separator,
         MenuEntry::Action(MenuAction::ChangeFolder, "Change Folder…"),
         MenuEntry::Action(MenuAction::ChangeFolderTyped, "Change Folder (Type Path)…"),
+        MenuEntry::Action(MenuAction::PaneFolder, "Reset to Pane Folder"),
     ]);
     entries
 }

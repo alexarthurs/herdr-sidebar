@@ -481,6 +481,15 @@ HACKING.md — budget time for that before promising a patched build.
   resets the baseline and immediately adopts the deterministic neighbour on the next beat.
 - Source Control pauses cwd-follow while any repository has a non-empty commit-message draft;
   rebuilding the app for another cwd would otherwise destroy that in-memory draft.
+- `C`, the always-visible 🏠 header button, and "Reset to Pane Folder" in the context menu
+  call `CwdFollower::force_follow`: it clears the manual override, picks the deterministic
+  sibling (focused → previously followed → first) from a fresh `pane.list`, and re-roots
+  once. It does NOT flip the persisted `follow_cwd` setting. The 🏠/📂 buttons are drawn
+  even when the hover title actions are hidden, because a user who re-rooted with `c` has
+  no other discoverable way back; the hover-only editing actions stay hover-only.
+- Chrome tooltips (`draw_tooltip`): one keycap-styled line under the hovered header action,
+  ⚙, or activity icon, shown only while `title_actions_visible` is live. Terminals report no
+  "pointer left", so the same 3s linger that hides the hover buttons hides the tooltip.
 
 ### Pane liveness (heartbeat tokens)
 

@@ -484,6 +484,10 @@ pub fn branch_icon(theme: IconTheme) -> &'static str {
 /// of a panel's title bar).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TitleAction {
+    /// Pick another root folder (native folder dialog).
+    ChangeFolder,
+    /// Re-root the Explorer on the neighbouring pane's live folder.
+    PaneFolder,
     NewFile,
     NewFolder,
     Refresh,
@@ -508,18 +512,36 @@ pub fn title_actions_visible(last_mouse: Option<std::time::Instant>) -> bool {
 /// otherwise.
 pub fn title_action_icon(theme: IconTheme, action: TitleAction) -> &'static str {
     match (theme, action) {
+        (IconTheme::Material, TitleAction::ChangeFolder) => "\u{eaf7}", //  cod-folder_opened
+        (IconTheme::Material, TitleAction::PaneFolder) => "\u{eb06}", //  cod-home
         (IconTheme::Material, TitleAction::NewFile) => "\u{ea7f}", //  cod-new_file
         (IconTheme::Material, TitleAction::NewFolder) => "\u{ea80}", //  cod-new_folder
         (IconTheme::Material, TitleAction::Refresh) => "\u{eb37}", //  cod-refresh
         (IconTheme::Material, TitleAction::CollapseAll) => "\u{eac5}", //  cod-collapse_all
         (IconTheme::Material, TitleAction::ViewAsTree) => "\u{eb86}", //  cod-list_tree
         (IconTheme::Material, TitleAction::ViewAsList) => "\u{eb84}", //  cod-list_flat
+        (IconTheme::Emoji, TitleAction::ChangeFolder) => "📂",
+        (IconTheme::Emoji, TitleAction::PaneFolder) => "🏠",
         (IconTheme::Emoji, TitleAction::NewFile) => "📄",
         (IconTheme::Emoji, TitleAction::NewFolder) => "📁",
         (IconTheme::Emoji, TitleAction::Refresh) => "⟳",
         (IconTheme::Emoji, TitleAction::CollapseAll) => "⊟",
         (IconTheme::Emoji, TitleAction::ViewAsTree) => "🌲",
         (IconTheme::Emoji, TitleAction::ViewAsList) => "☰",
+    }
+}
+
+/// Hover tooltip for a title-bar button.
+pub fn title_action_tip(action: TitleAction) -> &'static str {
+    match action {
+        TitleAction::ChangeFolder => "Change folder… (c)",
+        TitleAction::PaneFolder => "Reset to pane folder (C)",
+        TitleAction::NewFile => "New file…",
+        TitleAction::NewFolder => "New folder…",
+        TitleAction::Refresh => "Refresh (r)",
+        TitleAction::CollapseAll => "Collapse all folders",
+        TitleAction::ViewAsTree => "View as tree (t)",
+        TitleAction::ViewAsList => "View as list (t)",
     }
 }
 
