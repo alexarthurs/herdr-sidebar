@@ -593,6 +593,15 @@ HACKING.md — budget time for that before promising a patched build.
   and the liveness heartbeat would declare the pane a corpse after 20s. "Change Folder
   (Type Path)…" accepts absolute, relative, or ~-prefixed paths. A successful choice marks
   the shared cwd follower as manually overridden before rebuilding either view.
+- Copy / Cut / Paste / Duplicate (`actions::copy_into` / `move_into` / `duplicate`): the
+  "clipboard" is one in-process `(path, cut)` slot on the Explorer app, never the OS
+  clipboard (which carries text, and the OS file-clipboard formats are not portable). Paste
+  is only offered while that slot is filled; it targets the folder row, a file row's
+  parent, or the root. Collisions resolve with VS Code's `name copy.ext` / `name copy 2.ext`
+  (`unique_path`: the suffix goes before a FILE's extension; folders and dotfiles keep the
+  whole name as the stem). Pasting a folder into itself or a descendant is refused before
+  any copy starts, a cross-filesystem move falls back to copy + delete, and a cut is
+  forgotten after its first paste so a second paste cannot move it again.
 - "Open with Default App" (`actions::open_external`, in the Explorer menu for FILE rows
   only and in the SCM file menu unless the entry's status letter is `D`) hands the path to
   the OS shell association. Windows uses `explorer.exe <path>`, NOT `cmd /c start`: explorer

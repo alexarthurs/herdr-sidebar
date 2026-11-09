@@ -357,6 +357,8 @@ pub struct App {
     mouse_pos: Option<(u16, u16)>,
     /// Last left-click (row index, when) for double-click detection.
     last_click: Option<(usize, std::time::Instant)>,
+    /// Copy/Cut source awaiting a Paste: the path and whether it moves.
+    clipboard: Option<(PathBuf, bool)>,
     /// Where the most recent preview landed, with its document key — so a
     /// double click pins that exact tab instead of re-opening it.
     last_preview: Option<(String, herdr_sidebar::viewer::PreviewTarget)>,
@@ -496,6 +498,7 @@ impl App {
             last_mouse: None,
             mouse_pos: None,
             last_click: None,
+            clipboard: None,
             last_preview: None,
             last_beat: std::time::Instant::now(),
             picking: None,
@@ -1371,7 +1374,11 @@ impl App {
         let in_repo = target
             .as_ref()
             .is_some_and(|(path, _)| Git::owner_of(path).is_ok());
-        let entries = actions::menu_entries(target.as_ref().map(|(_, is_dir)| *is_dir), in_repo);
+        let entries = actions::menu_entries(
+            target.as_ref().map(|(_, is_dir)| *is_dir),
+            in_repo,
+            self.clipboard.is_some(),
+        );
         let selected = entries
             .iter()
             .position(|e| matches!(e, MenuEntry::Action(..)))
@@ -2825,6 +2832,27 @@ impl App {
                 let Some((path, is_dir)) = target else { return };
                 self.overlay = Some(Overlay::ConfirmDelete { path, is_dir });
             }
+            MenuAction::Copy | MenuAction::Cut => {
+                let Some((path, _)) = target else { return };
+                let cut = action == MenuAction::Cut;
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.notice = Some(format!(
+                    "{}: {name} — Paste from the menu",
+                    if cut { "cut" } else { "copied" }
+                ));
+                self.clipboard = Some((path, cut));
+            }
+            MenuAction::Paste => self.paste_into(&create_dir),
+            MenuAction::Duplicate => {
+                let Some((path, _)) = target else { return };
+                match actions::duplicate(&path) {
+                    Ok(created) => self.reveal_created(&created),
+                    Err(err) => self.notice = Some(format!("duplicate failed: {err}")),
+                }
+            }
             MenuAction::OpenExternal => {
                 let Some((path, _)) = target else { return };
                 let name = path
@@ -2847,6 +2875,45 @@ impl App {
             MenuAction::ChangeFolder => self.change_folder_dialog(),
             MenuAction::ChangeFolderTyped => self.change_folder_prompt(),
             MenuAction::PaneFolder => self.reset_to_pane_folder(),
+        }
+    }
+
+    /// "Paste": copy or move the remembered entry into `dir`. A cut entry is
+    /// forgotten once it has moved (pasting it twice would move it twice); a
+    /// copied one stays available for further pastes, like VS Code.
+    fn paste_into(&mut self, dir: &Path) {
+        let Some((src, cut)) = self.clipboard.clone() else {
+            self.notice = Some("nothing to paste".into());
+            return;
+        };
+        if !src.exists() {
+            self.clipboard = None;
+            self.notice = Some(format!("paste failed: {} no longer exists", src.display()));
+            return;
+        }
+        let result = if cut {
+            actions::move_into(&src, dir)
+        } else {
+            actions::copy_into(&src, dir)
+        };
+        match result {
+            Ok(created) => {
+                if cut {
+                    self.clipboard = None;
+                }
+                self.tree.expand(dir);
+                self.reveal_created(&created);
+                self.request_decorations(true);
+            }
+            Err(err) => self.notice = Some(format!("paste failed: {err}")),
+        }
+    }
+
+    /// Refresh the tree after a filesystem change and select `created`.
+    fn reveal_created(&mut self, created: &Path) {
+        self.refresh_tree();
+        if let Some(index) = self.rows.iter().position(|r| r.path == created) {
+            self.select(index);
         }
     }
 
@@ -4905,7 +4972,7 @@ mod tests {
 
     #[test]
     fn menu_navigation_skips_separators_and_clamps() {
-        let entries = actions::menu_entries(Some(false), true);
+        let entries = actions::menu_entries(Some(false), true, false);
         // First entry is an action; stepping up from it stays put.
         assert_eq!(step_menu(&entries, 0, -1), 0);
         // Stepping down over a separator lands on the next action.

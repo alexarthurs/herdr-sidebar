@@ -13,6 +13,14 @@ pub enum MenuAction {
     CopyRelativePath,
     Rename,
     Delete,
+    /// Remember the target for a later Paste (a copy).
+    Copy,
+    /// Remember the target for a later Paste (a move).
+    Cut,
+    /// Drop the remembered entry into the target folder.
+    Paste,
+    /// A sibling copy of the target (`name copy.ext`).
+    Duplicate,
     /// `git add` the target — the Explorer's staging entry (issue #20).
     Stage,
     OpenExternal,
@@ -36,8 +44,9 @@ pub enum MenuEntry {
 /// "Reveal in File Explorer" already does. `in_repo` adds "Stage Changes"
 /// (issue #20) — it stays out of the menu entirely when the target is not
 /// inside a git repository, so the entry never offers an action that can only
-/// fail.
-pub fn menu_entries(target: Option<bool>, in_repo: bool) -> Vec<MenuEntry> {
+/// fail. `can_paste` adds "Paste" once something has been copied or cut; a
+/// paste lands in the target folder, a file's parent, or the root.
+pub fn menu_entries(target: Option<bool>, in_repo: bool, can_paste: bool) -> Vec<MenuEntry> {
     let mut entries = vec![
         MenuEntry::Action(MenuAction::NewFile, "New File…"),
         MenuEntry::Action(MenuAction::NewFolder, "New Folder…"),
@@ -54,8 +63,21 @@ pub fn menu_entries(target: Option<bool>, in_repo: bool) -> Vec<MenuEntry> {
             MenuEntry::Action(MenuAction::Stage, "Stage Changes"),
         ]);
     }
+    if target.is_some() || can_paste {
+        entries.push(MenuEntry::Separator);
+    }
     if target.is_some() {
         entries.extend([
+            MenuEntry::Action(MenuAction::Copy, "Copy"),
+            MenuEntry::Action(MenuAction::Cut, "Cut"),
+        ]);
+    }
+    if can_paste {
+        entries.push(MenuEntry::Action(MenuAction::Paste, "Paste"));
+    }
+    if target.is_some() {
+        entries.extend([
+            MenuEntry::Action(MenuAction::Duplicate, "Duplicate"),
             MenuEntry::Separator,
             MenuEntry::Action(MenuAction::CopyPath, "Copy Path"),
             MenuEntry::Action(MenuAction::CopyRelativePath, "Copy Relative Path"),
@@ -121,6 +143,98 @@ pub fn delete(path: &Path, is_dir: bool) -> io::Result<()> {
     } else {
         std::fs::remove_file(path)
     }
+}
+
+/// `dir/<name>` if free, else VS Code's `name copy.ext`, `name copy 2.ext`, …
+/// The suffix goes before the extension of a FILE name; a folder (or a
+/// dotfile like `.env`) keeps its whole name as the stem.
+pub fn unique_path(dir: &Path, name: &str, is_dir: bool) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(dot) if !is_dir && dot > 0 => (&name[..dot], &name[dot..]),
+        _ => (name, ""),
+    };
+    let mut n = 1u32;
+    loop {
+        let candidate = if n == 1 {
+            format!("{stem} copy{ext}")
+        } else {
+            format!("{stem} copy {n}{ext}")
+        };
+        let path = dir.join(candidate);
+        if !path.exists() {
+            return path;
+        }
+        n += 1;
+    }
+}
+
+fn copy_tree(src: &Path, dest: &Path) -> io::Result<()> {
+    if src.is_dir() {
+        std::fs::create_dir(dest)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &dest.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(src, dest).map(|_| ())
+    }
+}
+
+fn name_of(path: &Path) -> io::Result<&str> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no usable name"))
+}
+
+/// Refuse to paste a folder into itself or one of its descendants: a copy
+/// would recurse forever and a move would detach the destination.
+fn check_not_inside(src: &Path, dest_dir: &Path) -> io::Result<()> {
+    let src = src.canonicalize()?;
+    let dest = dest_dir.canonicalize()?;
+    if src.is_dir() && dest.starts_with(&src) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot paste a folder into itself",
+        ));
+    }
+    Ok(())
+}
+
+/// Copy `src` into `dest_dir` under a free name; returns the new path.
+pub fn copy_into(src: &Path, dest_dir: &Path) -> io::Result<PathBuf> {
+    check_not_inside(src, dest_dir)?;
+    let dest = unique_path(dest_dir, name_of(src)?, src.is_dir());
+    copy_tree(src, &dest)?;
+    Ok(dest)
+}
+
+/// Move `src` into `dest_dir` under a free name (a plain rename, or a
+/// copy + delete when the rename crosses filesystems). Moving into the folder
+/// it already lives in is a no-op that returns the source unchanged.
+pub fn move_into(src: &Path, dest_dir: &Path) -> io::Result<PathBuf> {
+    if src.parent().map(|p| p.canonicalize().ok()) == Some(dest_dir.canonicalize().ok()) {
+        return Ok(src.to_path_buf());
+    }
+    check_not_inside(src, dest_dir)?;
+    let dest = unique_path(dest_dir, name_of(src)?, src.is_dir());
+    if std::fs::rename(src, &dest).is_err() {
+        copy_tree(src, &dest)?;
+        delete(src, src.is_dir())?;
+    }
+    Ok(dest)
+}
+
+/// A sibling copy of `path` named `name copy.ext`.
+pub fn duplicate(path: &Path) -> io::Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no parent directory"))?;
+    copy_into(path, parent)
 }
 
 /// Which path [`copy_to_clipboard`] took, so a caller can word its notice
@@ -868,10 +982,10 @@ mod tests {
 
     #[test]
     fn menu_shape_for_rows_and_root() {
-        let row = menu_entries(Some(false), true);
+        let row = menu_entries(Some(false), true, false);
         assert!(matches!(row[0], MenuEntry::Action(MenuAction::NewFile, _)));
         assert!(has(&row, MenuAction::Delete));
-        let root = menu_entries(None, true);
+        let root = menu_entries(None, true, false);
         assert!(!has(&root, MenuAction::Rename));
         assert!(has(&root, MenuAction::Reveal));
     }
@@ -879,40 +993,40 @@ mod tests {
     #[test]
     fn open_external_is_offered_for_files_only() {
         assert!(
-            has(&menu_entries(Some(false), true), MenuAction::OpenExternal),
+            has(&menu_entries(Some(false), true, false), MenuAction::OpenExternal),
             "file row"
         );
         assert!(
-            !has(&menu_entries(Some(true), true), MenuAction::OpenExternal),
+            !has(&menu_entries(Some(true), true, false), MenuAction::OpenExternal),
             "directory row"
         );
         assert!(
-            !has(&menu_entries(None, true), MenuAction::OpenExternal),
+            !has(&menu_entries(None, true, false), MenuAction::OpenExternal),
             "empty space"
         );
         // Directories keep everything else they had.
-        assert!(has(&menu_entries(Some(true), true), MenuAction::Rename));
+        assert!(has(&menu_entries(Some(true), true, false), MenuAction::Rename));
     }
 
     #[test]
     fn stage_is_offered_for_rows_inside_a_repo_only() {
         assert!(
-            has(&menu_entries(Some(false), true), MenuAction::Stage),
+            has(&menu_entries(Some(false), true, false), MenuAction::Stage),
             "file row"
         );
         assert!(
-            has(&menu_entries(Some(true), true), MenuAction::Stage),
+            has(&menu_entries(Some(true), true, false), MenuAction::Stage),
             "directory row"
         );
         assert!(
-            !has(&menu_entries(None, true), MenuAction::Stage),
+            !has(&menu_entries(None, true, false), MenuAction::Stage),
             "empty space"
         );
         assert!(
-            !has(&menu_entries(Some(false), false), MenuAction::Stage),
+            !has(&menu_entries(Some(false), false, false), MenuAction::Stage),
             "outside a repo"
         );
-        assert!(!has(&menu_entries(Some(true), false), MenuAction::Stage));
+        assert!(!has(&menu_entries(Some(true), false, false), MenuAction::Stage));
     }
 
     #[test]
@@ -1139,5 +1253,64 @@ mod tests {
         );
         assert_eq!(bytes, b"\x1b]52;c;aGVsbG8=\x07");
         assert!(write_osc52(Vec::new(), "").is_err());
+    }
+
+    #[test]
+    fn clipboard_entries_follow_target_and_clipboard() {
+        let row = menu_entries(Some(false), false, false);
+        assert!(has(&row, MenuAction::Copy));
+        assert!(has(&row, MenuAction::Cut));
+        assert!(has(&row, MenuAction::Duplicate));
+        assert!(!has(&row, MenuAction::Paste), "nothing copied yet");
+        assert!(has(&menu_entries(Some(true), false, true), MenuAction::Paste));
+        let root = menu_entries(None, false, true);
+        assert!(has(&root, MenuAction::Paste), "paste into the root from empty space");
+        assert!(!has(&root, MenuAction::Copy));
+        assert!(!has(&menu_entries(None, false, false), MenuAction::Paste));
+    }
+
+    #[test]
+    fn unique_path_adds_copy_suffix_before_extension() {
+        let dir = tmp("unique");
+        assert_eq!(unique_path(&dir, "a.txt", false), dir.join("a.txt"));
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, "a.txt", false), dir.join("a copy.txt"));
+        std::fs::write(dir.join("a copy.txt"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, "a.txt", false), dir.join("a copy 2.txt"));
+        std::fs::create_dir(dir.join("src")).unwrap();
+        assert_eq!(unique_path(&dir, "src", true), dir.join("src copy"));
+        std::fs::write(dir.join(".env"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, ".env", false), dir.join(".env copy"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_move_duplicate_round_trip() {
+        let dir = tmp("clip-roundtrip");
+        let src = dir.join("tree");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/f.txt"), b"hello").unwrap();
+        let out = dir.join("out");
+        std::fs::create_dir(&out).unwrap();
+
+        let copied = copy_into(&src, &out).unwrap();
+        assert_eq!(copied, out.join("tree"));
+        assert_eq!(std::fs::read(copied.join("sub/f.txt")).unwrap(), b"hello");
+        assert!(src.exists(), "copy keeps the source");
+
+        let dup = duplicate(&src.join("sub/f.txt")).unwrap();
+        assert_eq!(dup, src.join("sub/f copy.txt"));
+
+        assert!(
+            copy_into(&src, &src.join("sub")).is_err(),
+            "folder into its own descendant is refused"
+        );
+
+        let moved = move_into(&dup, &out).unwrap();
+        assert_eq!(moved, out.join("f copy.txt"));
+        assert!(!dup.exists(), "move removes the source");
+        // Pasting a cut entry back where it lives is a no-op.
+        assert_eq!(move_into(&moved, &out).unwrap(), moved);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

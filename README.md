@@ -43,7 +43,11 @@ Use the mouse or press `1`, `2`, and `3`.
 </div>
 
 - Navigate a real expandable tree with file icons, hover actions, Git decorations, and
-  `m` / Ctrl+right-click context menus.
+  `m` / Ctrl+right-click context menus (set `[ui] right_click_passthrough_modifier = "ctrl"`
+  in herdr's config.toml for the mouse variant).
+- Copy, Cut, Paste, and Duplicate files or folders from that menu. Paste lands in the
+  targeted folder (or a file's parent, or the root from empty space); name clashes get a
+  VS Code-style `name copy.ext` suffix.
 - Click a file to reuse an ephemeral preview tab; double-click to pin it. Preview in the
   same tab with **Preview opens in: pane**, or opt into experimental `replace` mode:
   working panes move to a temporary tab while you preview; Esc / `q` brings them back.
