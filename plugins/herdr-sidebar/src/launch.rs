@@ -92,6 +92,27 @@ impl CwdFollower {
         *self = Self::default();
     }
 
+    /// Explicit "back to the pane's folder": drop any manual override and
+    /// adopt the current sibling choice right away (focused sibling first,
+    /// then the one followed before, then the lowest id). Works even while
+    /// the follow setting is off — it is a one-shot re-root, not a mode.
+    pub fn force_follow(&mut self, pane_list_json: &str, my_pane_id: &str) -> Option<String> {
+        self.manual_override = false;
+        let siblings = sibling_cwds(pane_list_json, my_pane_id);
+        let picked = pick_sibling(
+            &siblings.iter().collect::<Vec<_>>(),
+            self.selected.as_deref(),
+        )?
+        .clone();
+        self.seen = siblings
+            .iter()
+            .map(|s| (s.pane_id.clone(), s.cwd.clone()))
+            .collect();
+        self.initialized = true;
+        self.selected = Some(picked.pane_id);
+        Some(picked.cwd)
+    }
+
     /// Return the next live cwd to follow, if this sample changes the chosen
     /// root according to the deterministic/manual-precedence rules above.
     pub fn next_cwd(&mut self, pane_list_json: &str, my_pane_id: &str) -> Option<String> {

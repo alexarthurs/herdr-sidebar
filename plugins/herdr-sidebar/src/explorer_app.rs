@@ -27,6 +27,7 @@ use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::tree::{Row, Tree};
 use herdr_sidebar::ui::{
     TitleAction, activity_button_style, activity_icons, chrome_button_style, draw_activity_caps,
+    title_action_tip,
     draw_scrollbar, gear_icon, hits, hits_activity_button, hits_collapse_button, hover_style,
     icon_style as ui_icon_style, input_tail, keep_visible_scroll, palette, selection_style,
     set_color_theme, sibling_panes_of, status_color, title_action_icon, title_action_spans,
@@ -356,6 +357,8 @@ pub struct App {
     mouse_pos: Option<(u16, u16)>,
     /// Last left-click (row index, when) for double-click detection.
     last_click: Option<(usize, std::time::Instant)>,
+    /// Copy/Cut source awaiting a Paste: the path and whether it moves.
+    clipboard: Option<(PathBuf, bool)>,
     /// Where the most recent preview landed, with its document key — so a
     /// double click pins that exact tab instead of re-opening it.
     last_preview: Option<(String, herdr_sidebar::viewer::PreviewTarget)>,
@@ -495,6 +498,7 @@ impl App {
             last_mouse: None,
             mouse_pos: None,
             last_click: None,
+            clipboard: None,
             last_preview: None,
             last_beat: std::time::Instant::now(),
             picking: None,
@@ -1147,6 +1151,7 @@ impl App {
             KeyCode::Char('i') => self.set_theme(self.theme.toggled()),
             KeyCode::Char('b') => self.hide(),
             KeyCode::Char('c') => self.change_folder_dialog(),
+            KeyCode::Char('C') => self.reset_to_pane_folder(),
             KeyCode::Char('m') => self.open_menu_for_selection(),
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
@@ -1294,6 +1299,8 @@ impl App {
     /// One of the hover title-bar buttons was clicked.
     fn title_action(&mut self, action: TitleAction) {
         match action {
+            TitleAction::ChangeFolder => self.change_folder_dialog(),
+            TitleAction::PaneFolder => self.reset_to_pane_folder(),
             TitleAction::NewFile => self.open_create_prompt(false),
             TitleAction::NewFolder => self.open_create_prompt(true),
             TitleAction::Refresh => self.refresh_tree(),
@@ -1367,7 +1374,11 @@ impl App {
         let in_repo = target
             .as_ref()
             .is_some_and(|(path, _)| Git::owner_of(path).is_ok());
-        let entries = actions::menu_entries(target.as_ref().map(|(_, is_dir)| *is_dir), in_repo);
+        let entries = actions::menu_entries(
+            target.as_ref().map(|(_, is_dir)| *is_dir),
+            in_repo,
+            self.clipboard.is_some(),
+        );
         let selected = entries
             .iter()
             .position(|e| matches!(e, MenuEntry::Action(..)))
@@ -2821,6 +2832,27 @@ impl App {
                 let Some((path, is_dir)) = target else { return };
                 self.overlay = Some(Overlay::ConfirmDelete { path, is_dir });
             }
+            MenuAction::Copy | MenuAction::Cut => {
+                let Some((path, _)) = target else { return };
+                let cut = action == MenuAction::Cut;
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.notice = Some(format!(
+                    "{}: {name} — Paste from the menu",
+                    if cut { "cut" } else { "copied" }
+                ));
+                self.clipboard = Some((path, cut));
+            }
+            MenuAction::Paste => self.paste_into(&create_dir),
+            MenuAction::Duplicate => {
+                let Some((path, _)) = target else { return };
+                match actions::duplicate(&path) {
+                    Ok(created) => self.reveal_created(&created),
+                    Err(err) => self.notice = Some(format!("duplicate failed: {err}")),
+                }
+            }
             MenuAction::OpenExternal => {
                 let Some((path, _)) = target else { return };
                 let name = path
@@ -2842,7 +2874,80 @@ impl App {
             }
             MenuAction::ChangeFolder => self.change_folder_dialog(),
             MenuAction::ChangeFolderTyped => self.change_folder_prompt(),
+            MenuAction::PaneFolder => self.reset_to_pane_folder(),
         }
+    }
+
+    /// "Paste": copy or move the remembered entry into `dir`. A cut entry is
+    /// forgotten once it has moved (pasting it twice would move it twice); a
+    /// copied one stays available for further pastes, like VS Code.
+    fn paste_into(&mut self, dir: &Path) {
+        let Some((src, cut)) = self.clipboard.clone() else {
+            self.notice = Some("nothing to paste".into());
+            return;
+        };
+        if !src.exists() {
+            self.clipboard = None;
+            self.notice = Some(format!("paste failed: {} no longer exists", src.display()));
+            return;
+        }
+        let result = if cut {
+            actions::move_into(&src, dir)
+        } else {
+            actions::copy_into(&src, dir)
+        };
+        match result {
+            Ok(created) => {
+                if cut {
+                    self.clipboard = None;
+                }
+                self.tree.expand(dir);
+                self.reveal_created(&created);
+                self.request_decorations(true);
+            }
+            Err(err) => self.notice = Some(format!("paste failed: {err}")),
+        }
+    }
+
+    /// Refresh the tree after a filesystem change and select `created`.
+    fn reveal_created(&mut self, created: &Path) {
+        self.refresh_tree();
+        if let Some(index) = self.rows.iter().position(|r| r.path == created) {
+            self.select(index);
+        }
+    }
+
+    /// `C` / the 🏠 title button / the context menu: re-root on the
+    /// neighbouring pane's live working directory right now, releasing any
+    /// manual folder choice. One-shot: it does not change the follow setting.
+    fn reset_to_pane_folder(&mut self) {
+        let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) else {
+            self.notice = Some("not inside a herdr pane".into());
+            return;
+        };
+        let Ok(panes) = ipc::call_text("pane.list", serde_json::json!({})) else {
+            self.notice = Some("pane.list failed".into());
+            return;
+        };
+        let target = self.cwd_follower.borrow_mut().force_follow(&panes, &pane_id);
+        let Some(target) = target else {
+            self.notice = Some("no neighbouring pane folder found".into());
+            return;
+        };
+        // Compare canonical forms: our root is `current_dir()` (resolved,
+        // e.g. /private/tmp/x) while herdr reports the pane's own spelling.
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let before = canon(&self.tree.root_path());
+        if canon(Path::new(&target)) == before {
+            self.notice = Some("already at the pane folder".into());
+            return;
+        }
+        self.change_folder_impl(&target, false);
+        if canon(&self.tree.root_path()) == before {
+            // change_folder_impl already explained (not a folder, …).
+            return;
+        }
+        self.notice = Some(format!("folder: {} (pane)", self.tree.root_name()));
     }
 
     /// `c` / the context menu: the NATIVE folder picker, on a background
@@ -3365,6 +3470,64 @@ impl App {
             Some(Overlay::QuickOpen { .. }) => self.draw_quick_open(frame),
             _ => {}
         }
+        self.draw_tooltip(frame);
+    }
+
+    /// One-line tooltip under whichever chrome button the pointer rests on
+    /// (header actions, ⚙, activity-bar icons), while the hover
+    /// approximation is live.
+    fn draw_tooltip(&self, frame: &mut Frame) {
+        if !title_actions_visible(self.last_mouse) {
+            return;
+        }
+        let Some((mx, my)) = self.mouse_pos else { return };
+        let area = frame.area();
+        let hit_title = self
+            .title_zones
+            .iter()
+            .find(|(rect, _)| hits(*rect, mx, my))
+            .map(|&(rect, action)| (rect, title_action_tip(action)));
+        let hit = hit_title.or_else(|| {
+            if hits(self.gear, mx, my) {
+                return Some((self.gear, "Settings (s)"));
+            }
+            if !self.merged() {
+                return None;
+            }
+            let z = self.activity;
+            [
+                (z.explorer, "Explorer (1)"),
+                (z.search, "Search (2 · ctrl+f)"),
+                (z.source_control, "Source Control (3)"),
+            ]
+            .into_iter()
+            .find(|&(range, _)| hits_activity_button(range, z.row, mx, my))
+            .map(|(range, tip)| (Rect::new(range.0, z.row, range.1 - range.0, 1), tip))
+        });
+        let Some((anchor, tip)) = hit else { return };
+        let text = format!(" {tip} ");
+        let w = (Span::raw(text.as_str()).width() as u16).min(area.width);
+        // Below the button, slid left so it stays inside the pane.
+        let x = (anchor.x + anchor.width / 2)
+            .saturating_sub(w / 2)
+            .min(area.x + area.width - w)
+            .max(area.x);
+        let y = if anchor.y + 1 < area.y + area.height {
+            anchor.y + 1
+        } else {
+            anchor.y.saturating_sub(1)
+        };
+        let rect = Rect::new(x, y, w, 1);
+        frame.render_widget(Clear, rect);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                text,
+                Style::default()
+                    .bg(palette().keycap_bg)
+                    .fg(palette().keycap_fg),
+            ))),
+            rect,
+        );
     }
 
     /// The workspace-name header (the root folder's name, uppercase like VS
@@ -3380,21 +3543,28 @@ impl App {
         });
         let gear_w = gear.as_ref().map(Span::width).unwrap_or(0) as u16;
         self.title_zones.clear();
-        let (action_spans, actions_w) = if title_actions_visible(self.last_mouse) {
-            let actions = [
+        // The 🏠 "back to the pane's folder" button stays visible — it is
+        // the way back after `c`/Change Folder re-rooted the tree, so it must
+        // be discoverable without hovering; the editing actions stay hover-only.
+        let actions: &[TitleAction] = if title_actions_visible(self.last_mouse) {
+            &[
+                TitleAction::PaneFolder,
+                TitleAction::ChangeFolder,
                 TitleAction::NewFile,
                 TitleAction::NewFolder,
                 TitleAction::Refresh,
                 TitleAction::CollapseAll,
-            ];
-            let w = title_actions_width(self.theme, &actions);
+            ]
+        } else {
+            &[TitleAction::PaneFolder, TitleAction::ChangeFolder]
+        };
+        let (action_spans, actions_w) = {
+            let w = title_actions_width(self.theme, actions);
             let ax = area.x + area.width.saturating_sub(gear_w + w);
             let (spans, zones) =
-                title_action_spans(self.theme, &actions, ax, area.y, self.mouse_pos);
+                title_action_spans(self.theme, actions, ax, area.y, self.mouse_pos);
             self.title_zones = zones;
             (spans, w)
-        } else {
-            (Vec::new(), 0)
         };
         // The name yields to the buttons and gear in narrow panes.
         let avail = usize::from(area.width.saturating_sub(gear_w + actions_w));
@@ -3446,6 +3616,7 @@ impl App {
             ("r", "refresh"),
             (".", "dotfiles"),
             ("c", "folder"),
+            ("C", "pane dir"),
             ("ctrl+p", "files"),
             ("ctrl+f", "text"),
             ("m", "menu"),
@@ -4801,7 +4972,7 @@ mod tests {
 
     #[test]
     fn menu_navigation_skips_separators_and_clamps() {
-        let entries = actions::menu_entries(Some(false), true);
+        let entries = actions::menu_entries(Some(false), true, false);
         // First entry is an action; stepping up from it stays put.
         assert_eq!(step_menu(&entries, 0, -1), 0);
         // Stepping down over a separator lands on the next action.
