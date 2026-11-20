@@ -544,8 +544,12 @@ HACKING.md — budget time for that before promising a patched build.
   lookup promptly. A busy publish lock leaves the lookup pending and the worker
   can retry after 1 s. The worker releases the lock before `pane.get`, so membership
   IPC cannot delay a focus hook's lock acquisition. A failed move lookup also
-  retries on the short cadence.
-  The idle membership fallback stays at 60 s and recovers missed invalidations.
+  retries on the short cadence, measured from when the lookup RETURNED (a slow failing
+  `pane.get` would otherwise be due again immediately), and a due focus check gets the
+  worker's next turn after each membership run so failing move retries cannot starve it.
+  The idle membership fallback stays at 60 s and recovers missed invalidations; each
+  sidebar's first idle check is offset by a stable per-pane hash within that interval, so
+  sidebars started together (server restart, redeploy) do not query in one burst.
   Marker writes, including move invalidations, retry once on failure.
 - With a usable marker, hidden sidebars issue zero periodic `pane.list` calls.
   Visible sidebars issue at most one full list every 300 ms while following

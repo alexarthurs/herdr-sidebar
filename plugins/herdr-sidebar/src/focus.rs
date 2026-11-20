@@ -304,6 +304,9 @@ pub struct SidebarActivity {
     move_pending: bool,
     last_membership_attempt: Option<Instant>,
     last_membership: Option<Instant>,
+    /// The previous worker run was a membership check: a due focus check
+    /// gets the next turn, so failing move retries cannot starve it.
+    membership_ran_last: bool,
     last_focus_check: Option<Instant>,
     startup_marker: Option<Marker>,
     last_read: Option<Instant>,
@@ -315,6 +318,16 @@ pub struct SidebarActivity {
     following: bool,
     poller: launch::FollowPoller<ActivitySample>,
     follower: launch::CwdFollower,
+}
+
+/// Spread the idle membership checks of sidebars started together (a server
+/// restart, a redeploy) across the interval, by a stable per-pane offset.
+fn staggered_start(now: Instant, pane_id: &str) -> Instant {
+    let token = crate::viewer::document_token(pane_id);
+    let spread =
+        u64::from_str_radix(&token[..8], 16).unwrap_or(0) % MEMBERSHIP_EVERY.as_millis() as u64;
+    now.checked_sub(Duration::from_millis(spread))
+        .unwrap_or(now)
 }
 
 impl SidebarActivity {
@@ -331,12 +344,13 @@ impl SidebarActivity {
         // under the session limit. A fresh publication wins on first read.
         let startup_marker = marker_path.as_deref().and_then(read_marker);
         let own = get_pane(&original_pane_id);
+        let last_membership = Some(staggered_start(Instant::now(), &original_pane_id));
         let mut activity = Self {
             startup_marker,
             pane_id: original_pane_id.clone(),
             original_pane_id,
             marker_path,
-            last_membership: Some(Instant::now()),
+            last_membership,
             ..Self::default()
         };
         if let Some(own) = &own {
@@ -441,6 +455,9 @@ impl SidebarActivity {
     }
 
     fn apply_membership_check(&mut self, now: Instant, check: MembershipCheck) {
+        // Retry from completion, not from the start: a slow failing lookup
+        // would otherwise be due again the moment it returns.
+        self.last_membership_attempt = Some(now);
         if let MembershipCheck::Fetched(own) = check {
             self.last_membership = Some(now);
             if let Some(own) = own {
@@ -459,8 +476,8 @@ impl SidebarActivity {
     }
 
     fn request_sample(&mut self, now: Instant, follow: bool, needs_focus: bool) {
-        let membership_due = self.membership_due(now);
         let focus_due = self.focus_check_due(now, follow);
+        let membership_due = self.membership_due(now) && !(focus_due && self.membership_ran_last);
         if membership_due || focus_due {
             let Some(dir) = self.marker_path.as_deref().and_then(Path::parent) else {
                 return;
@@ -473,12 +490,14 @@ impl SidebarActivity {
                     Some(ActivitySample::Membership(check))
                 }) {
                     self.last_membership_attempt = Some(now);
+                    self.membership_ran_last = true;
                 }
             } else if self.poller.maybe_start(now, Duration::ZERO, move || {
                 let _ = recheck_focus(&dir, SystemTime::now, current_focus);
                 Some(ActivitySample::Focus)
             }) {
                 self.last_focus_check = Some(now);
+                self.membership_ran_last = false;
             }
         } else if let Some(every) = self.visibility.cadence(follow, needs_focus) {
             let marker = self.last_marker.clone();
@@ -855,5 +874,18 @@ mod tests {
         assert_eq!(own.pane_id, "w2:p6");
         assert_eq!(own.workspace_id(), Some("w2"));
         assert_eq!(own.original_pane_id, "w1:p1");
+    }
+
+    #[test]
+    fn idle_membership_checks_are_staggered_within_the_interval() {
+        let now = Instant::now() + MEMBERSHIP_EVERY;
+        let starts: std::collections::BTreeSet<_> = ["w1:p1", "w1:p2", "w2:p7", "w9:pA3"]
+            .iter()
+            .map(|pane| staggered_start(now, pane))
+            .collect();
+        assert!(starts.len() > 1, "sidebars started together spread out");
+        for start in starts {
+            assert!(start <= now && now - start < MEMBERSHIP_EVERY);
+        }
     }
 }
