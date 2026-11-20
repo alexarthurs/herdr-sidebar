@@ -44,6 +44,38 @@ pub struct Status {
     pub has_upstream: bool,
 }
 
+/// The checkout and tracking ref the user approved for Sync.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncTarget {
+    root: PathBuf,
+    pub branch: String,
+    upstream: String,
+}
+
+impl SyncTarget {
+    fn from_refs(root: &Path, refs: &str) -> Option<Self> {
+        let mut lines = refs.lines();
+        let branch = lines.next()?.strip_prefix("refs/heads/")?;
+        let upstream = lines.next()?.strip_prefix("refs/")?;
+        if branch.is_empty() || upstream.is_empty() || lines.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            root: root.to_path_buf(),
+            branch: branch.into(),
+            upstream: upstream.into(),
+        })
+    }
+
+    fn validate(&self, current: Option<&Self>) -> Result<(), String> {
+        if current == Some(self) {
+            Ok(())
+        } else {
+            Err("Sync cancelled: repository, branch, or upstream changed. Open Sync again.".into())
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Git {
     root: PathBuf,
@@ -125,6 +157,22 @@ impl Git {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| self.root.display().to_string())
+    }
+
+    /// One bounded ref lookup, with no worktree scan.
+    pub fn sync_target(&self) -> Result<SyncTarget, String> {
+        let refs = run_read_in_with_timeout(
+            &self.root,
+            &["rev-parse", "--symbolic-full-name", "HEAD", "@{upstream}"],
+            std::time::Duration::from_secs(2),
+        )?;
+        SyncTarget::from_refs(&self.root, &refs)
+            .ok_or_else(|| "No tracking branch to sync.".to_string())
+    }
+
+    pub fn sync_confirmed(&self, approved: &SyncTarget) -> Result<String, String> {
+        approved.validate(self.sync_target().as_ref().ok())?;
+        self.sync()
     }
 
     /// VS Code's Sync Changes: pull (rebase, autostash) then push. Returns a
@@ -418,7 +466,13 @@ impl Git {
         let n = format!("-{limit}");
         lines(run_drawer(
             &self.root,
-            &["log", "--graph", "--oneline", "--decorate=short", &n],
+            &[
+                "log",
+                "--graph",
+                "--format=%H%x09%h%d %s",
+                "--decorate=short",
+                &n,
+            ],
         )?)
     }
 
@@ -426,7 +480,13 @@ impl Git {
         let n = format!("-{limit}");
         lines(run_drawer(
             &self.root,
-            &["log", "--oneline", "--decorate=short", "--date=short", &n],
+            &[
+                "log",
+                "--format=%H%x09%h%d %s",
+                "--decorate=short",
+                "--date=short",
+                &n,
+            ],
         )?)
     }
 
@@ -434,7 +494,7 @@ impl Git {
         let n = format!("-{limit}");
         lines(run_drawer(
             &self.root,
-            &["log", "--oneline", "--follow", &n, "--", path],
+            &["log", "--format=%H%x09%h %s", "--follow", &n, "--", path],
         )?)
     }
 
@@ -591,7 +651,17 @@ impl Git {
     }
 
     pub fn stashes(&self) -> Result<Vec<String>, String> {
-        lines(run_drawer(&self.root, &["stash", "list"])?)
+        lines(run_drawer(
+            &self.root,
+            &["stash", "list", "--format=%gd%x09%H%x09%gs"],
+        )?)
+    }
+
+    pub fn stash_selector(&self, object: &str) -> Result<String, String> {
+        let list = run_drawer(&self.root, &["stash", "list", "--format=%gd%x09%H"])?;
+        stash_selector(&list, object)
+            .map(str::to_owned)
+            .ok_or_else(|| "The selected stash no longer exists.".to_string())
     }
 
     pub fn tags(&self) -> Result<Vec<String>, String> {
@@ -609,6 +679,13 @@ impl Git {
     pub fn raw(&self, args: &[&str]) -> Result<String, String> {
         run_in(&self.root, args)
     }
+}
+
+fn stash_selector<'a>(list: &'a str, object: &str) -> Option<&'a str> {
+    list.lines().find_map(|line| {
+        let (selector, id) = line.split_once('\t')?;
+        (id == object).then_some(selector)
+    })
 }
 
 fn lines(out: String) -> Result<Vec<String>, String> {
@@ -1192,6 +1269,39 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn stash_selector_follows_the_object_after_insertion_and_refuses_removed_objects() {
+        let list = "stash@{0}\tnew\nstash@{1}\tselected\nstash@{2}\tolder\n";
+        assert_eq!(stash_selector(list, "selected"), Some("stash@{1}"));
+        assert_eq!(stash_selector(list, "removed"), None);
+        assert_eq!(stash_selector(list, "select"), None);
+    }
+
+    #[test]
+    fn confirmed_sync_requires_same_repository_branch_and_upstream() {
+        let root = Path::new("repo");
+        let refs = "refs/heads/main\nrefs/remotes/origin/main\n";
+        let approved = SyncTarget::from_refs(root, refs).unwrap();
+        assert!(
+            approved
+                .validate(SyncTarget::from_refs(root, refs).as_ref())
+                .is_ok()
+        );
+        for (other_root, other_refs) in [
+            (Path::new("other"), refs),
+            (root, "refs/heads/topic\nrefs/remotes/origin/main\n"),
+            (root, "refs/heads/main\nrefs/remotes/backup/main\n"),
+            (root, "HEAD\nrefs/remotes/origin/main\n"),
+            (root, "refs/heads/main\n"),
+        ] {
+            assert!(
+                approved
+                    .validate(SyncTarget::from_refs(other_root, other_refs).as_ref())
+                    .is_err()
+            );
+        }
     }
 
     #[test]

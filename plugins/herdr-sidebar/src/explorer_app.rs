@@ -19,8 +19,8 @@ use unicode_width::UnicodeWidthChar;
 
 use herdr_sidebar::actions::{self, MenuAction, MenuEntry};
 use herdr_sidebar::branch_ui::{BranchPicker, FooterZones, PickerAction, draw_git_footer};
-use herdr_sidebar::git::{Git, Status};
-use herdr_sidebar::gitconfirm::{self, GitOp};
+use herdr_sidebar::git::{Git, Status, SyncTarget};
+use herdr_sidebar::gitconfirm;
 use herdr_sidebar::gitdeco::{Decorations, RepoStatus};
 use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::state::{self as sidebar, View};
@@ -198,6 +198,7 @@ enum Overlay {
     },
     /// The opt-in y/N before the Git footer's Sync (`confirm_git_ops`).
     ConfirmSync {
+        target: SyncTarget,
         prompt: String,
     },
     /// The ⚙ settings modal: mouse-toggleable panel settings.
@@ -1434,7 +1435,7 @@ impl App {
             AdjustWidth(bool),
             AdjustAutoHide(bool),
             DeleteConfirmed(PathBuf, bool),
-            SyncConfirmed,
+            SyncConfirmed(SyncTarget),
             Picker(PickerAction),
         }
         let settings = self.settings_rows();
@@ -1764,8 +1765,8 @@ impl App {
                 }
                 _ => Cmd::Close,
             },
-            Some(Overlay::ConfirmSync { .. }) => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => Cmd::SyncConfirmed,
+            Some(Overlay::ConfirmSync { target, .. }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => Cmd::SyncConfirmed(target.clone()),
                 _ => Cmd::Close,
             },
             None => Cmd::Nothing,
@@ -1801,10 +1802,10 @@ impl App {
                     Err(err) => self.notice = Some(format!("delete failed: {err}")),
                 }
             }
-            Cmd::SyncConfirmed => {
+            Cmd::SyncConfirmed(target) => {
                 // Resume a Search overlay parked under the prompt (else → tree).
                 self.overlay = self.suspended_search.take();
-                self.start_git_footer_sync();
+                self.start_git_footer_sync(Some(target));
             }
             Cmd::Picker(action) => self.handle_picker_action(action),
         }
@@ -1981,27 +1982,30 @@ impl App {
         let Some(status) = &self.git_footer_status else {
             return;
         };
-        if !status.has_upstream {
-            self.notice = Some("no upstream to sync with".into());
-            return;
-        }
-        let op = GitOp::Sync {
-            branch: &status.branch,
-            ahead: status.ahead,
-            behind: status.behind,
-        };
-        if op.needs_confirm(self.sidebar_state.confirm_git_ops) {
-            let prompt = op.prompt();
+        if self.sidebar_state.confirm_git_ops {
+            let Some(git) = self.repos.first() else {
+                return;
+            };
+            let target = match git.sync_target() {
+                Ok(target) => target,
+                Err(error) => {
+                    self.notice = Some(error);
+                    return;
+                }
+            };
+            let prompt = target.prompt(status);
             // A notice would mask the prompt (footer_message shows it first).
             self.notice = None;
             self.suspend_search_for_modal();
-            self.overlay = Some(Overlay::ConfirmSync { prompt });
-            return;
+            self.overlay = Some(Overlay::ConfirmSync { target, prompt });
+        } else if status.has_upstream {
+            self.start_git_footer_sync(None);
+        } else {
+            self.notice = Some("no upstream to sync with".into());
         }
-        self.start_git_footer_sync();
     }
 
-    fn start_git_footer_sync(&mut self) {
+    fn start_git_footer_sync(&mut self, target: Option<SyncTarget>) {
         if self.git_syncing.is_some() {
             return;
         }
@@ -2010,7 +2014,11 @@ impl App {
         };
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(git.sync());
+            let result = match target {
+                Some(target) => git.sync_confirmed(&target),
+                None => git.sync(),
+            };
+            let _ = tx.send(result);
         });
         self.git_syncing = Some(rx);
     }
@@ -3719,7 +3727,7 @@ impl App {
                 palette().deleted,
             ));
         }
-        if let Some(Overlay::ConfirmSync { prompt }) = &self.overlay {
+        if let Some(Overlay::ConfirmSync { prompt, .. }) = &self.overlay {
             return Some((prompt.clone(), palette().deleted));
         }
         None

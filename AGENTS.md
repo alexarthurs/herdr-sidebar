@@ -222,9 +222,11 @@ executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launch
   persisted session — all workspaces and panes respawn. Handy for exercising plugin hooks
   from a script; test in throwaway workspaces and close them after.
 - Creation hooks dock into their event scope even when `workspace create --no-focus` or
-  `tab create --no-focus` targets the background. After docking they re-read `pane.list` and
-  restore the previously focused pane only if the split/swap itself focused the new sidebar;
-  a concurrent intended focus transition must win.
+  `tab create --no-focus` targets the background. After docking they recheck focus and
+  restore the previously focused pane only if the split/swap itself focused the new sidebar.
+  Creation repair reads the cheap `pane.current` after layout changes and immediately before
+  `pane.focus`. Herdr has no conditional focus operation, so navigation between those two
+  requests can still be overwritten (#121).
 - Drive the live TUI for verification with `pane send-keys <id> s` (⚙ Settings) etc., then
   `pane read <id> --source visible` to assert on the rendered modal.
 
@@ -529,17 +531,21 @@ HACKING.md — budget time for that before promising a patched build.
   `rundir`, keyed by socket hash like snooze. A sidebar resolves its membership with
   `pane.get` at startup and checks a pre-existing marker against `pane.current` once.
   Missing, unreadable, malformed, or startup-mismatched markers use one shared slow
-  sample every 5 s when cwd or focus is needed. A valid marker has no time expiry
+  sample every 5 s when cwd or focus is needed. A startup mismatch also retries
+  publication on the worker, which clears the fallback after the host responds.
+  A valid marker has no time expiry
   because the focused tab may sit idle indefinitely. Visibility follows Herdr's
-  session-wide default pane. An attached client independently displaying a second
-  tab has no focus marker of its own. A missed focus-hook burst may leave the last
-  observation in use until the next hook.
+  session-wide default pane. Herdr 0.9.5 tracks displayed tabs privately in
+  `src/server/headless/client_views.rs`. Its public API schema offers no per-client
+  visibility list, and `session.snapshot` exposes one focused tab. A second client's
+  tab catches up on its next focus event.
 - `pane.moved` writes an invalidation for the sidebar's stable terminal id. The
   sidebar resolves its new tab and canonical pane id with one `pane.get` using its
   original environment id, which Herdr 0.9.5 aliases after a cross-workspace move.
-  This keeps normal background membership checks local. Older hosts without the
-  event may discover a move in a subsequent pane sample. Move markers are small
-  per-terminal files and are reused if the same terminal moves again.
+  The existing single-flight worker handles the lookup. One fallback `pane.get`
+  per 30 s recovers missed or failed move invalidations, including when cwd follow
+  is off. Move markers are small per-terminal files and are reused on subsequent
+  moves. Marker writes, including move invalidations, retry once on failure.
 - With a usable marker, hidden sidebars issue zero periodic `pane.list` calls.
   Visible sidebars issue at most one full list every 300 ms while following
   (first request due when the tab becomes visible). Explorer keeps its 2 s
@@ -549,12 +555,17 @@ HACKING.md — budget time for that before promising a patched build.
   or 5 s hidden, plus separate global lists about every 2 s for Explorer
   decorations or on due SCM status reads. Herdr supports workspace-scoped lists,
   but the follow sample stays session-wide for the #119 capability check.
-- The ~5 s identity metadata stamp remains the only steady-state socket call
-  for a hidden sidebar, and the 20 s stale rule is unchanged. Root-label retries
-  wait while the tab is hidden. A preview heartbeat sends only the metadata
-  stamp. Document, mode, or pin changes compare labels before renaming;
-  dedicated preview heartbeats previously made four calls (metadata, pane rename,
-  global list, tab rename), and inline previews made two. Herdr's token-only
+- Hidden sidebars revalidate with at most one `pane.current` per 10 s on the
+  same worker. The publish lock covers the read and conditional replacement, so
+  a missed focus hook is repaired without rewriting an agreeing marker. The
+  other steady-state calls are the ~5 s identity heartbeat and the 30 s
+  membership fallback above. The 20 s stale rule is unchanged. Root-label retries
+  wait while the tab is hidden. On each ~5 s heartbeat, a dedicated preview sends
+  its metadata stamp and uses one `pane.get` to detect a move even when the document
+  is unchanged. The applied tab label is cached by (tab id, label), so a move
+  relabels its destination and a failed rename retries on the next heartbeat.
+  A steady inline preview sends only metadata. Document, mode, or pin changes
+  compare labels before renaming. Herdr's token-only
   metadata handler increments the pane revision and emits `pane.updated` when
   tokens change. It does not dirty the session or schedule a save, but headless
   `request_changes_ui` classifies metadata reports as UI-changing. Both rename
@@ -679,21 +690,24 @@ HACKING.md — budget time for that before promising a patched build.
   - It takes the shared `LaunchLock` BLOCKING (a discrete event; a skipped reap would wait for
     some unrelated pane to close). Holding it also hides every transient layout of our own
     launch / refresh / takeover / unified-toggle flows, which all mutate under that lock.
-  - `launch::lonely_sidebar_tabs` scans EVERY tab (`pane.closed` has no tab) and picks tabs
-    whose every pane is a sidebar: an Explorer / Source Control token, or one of our labels
+  - Reap uses the exiting pane's tab from the hook context for `pane.exited`. For
+    `pane.closed`, Herdr has already removed the pane, so reap is limited to the event's
+    workspace. An event without a usable scope does nothing. Reap re-lists before each
+    request to verify the tab is still sidebar-only and the pane's close policy still applies.
+    Each remaining pane must be a sidebar: an Explorer / Source Control token, or one of our labels
     without one. Any other pane — shell, agent, preview / editor viewer (token or label),
     an id that is not flag-safe — keeps the tab. Null token values count as absent.
   - Live TUIs get Ctrl+Q only (save drafts, close own pane, no snooze marker); a draft that
     cannot be saved keeps the pane open with its notice, and nothing waits for or kills it.
     Only panes that cannot hold TUI state are `pane.close`d directly: `herdr-sidebar-starting`,
-    label-only server-resume corpses, and stale heartbeats (the same corpses ensure REPLACEs).
+    and label-only server-resume corpses with no tokens. A stale or malformed sidebar
+    heartbeat still gets Ctrl+Q. A blocked TUI may have an unsaved draft.
   - Tabs named by a THIS-session (or session-less legacy) takeover journal — previewed tab
     and parking tab — are skipped (`takeover::journaled_tabs`); the restore owns them. After an
     abandoned restore the journal is gone, so a previewed tab left with only its sidebar is
     reaped like any other.
   - Idempotent and cheap: each self-close emits `pane.closed`, which re-runs the reap over a
-    snapshot without that tab (one `pane.list`, plus a journal-dir read only when something is
-    lonely). Refresh / redeploy close sidebars only in tabs that keep other panes, so they never
+    snapshot without that pane (a journal-dir read is needed only when a scoped tab is lonely). Refresh / redeploy close sidebars only in tabs that keep other panes, so they never
     create a lonely tab; refresh's "sidebar is the tab's only pane" report now mostly concerns
     users who turned the setting off.
 - Every Settings action uses `state::update_state`, a lock-protected read-modify-write.
@@ -919,8 +933,12 @@ HACKING.md — budget time for that before promising a patched build.
   rows (`Row::selectable()`). The ✧ suggest / S sync keys act on the ACTIVE repo — the one
   the selection is in (named in the panel header).
 - **Git drawers** (title-case names, incl. Worktrees): drawer lines carry parsed
-  refs (`DrawerRef` — commit hash / stash index / branch / remote / tag / worktree path,
-  see `parse_drawer_ref`). Click or ⏎ shows the ref
+  refs (`DrawerRef` — full commit or stash object ID / branch / remote / tag / worktree
+  path, see `parse_drawer_ref`). An open menu keeps its repository root, ref and
+  file-history path even when status replaces the rows. Confirmation keeps the same
+  root. Stash apply/pop/drop look up the current selector by object ID immediately
+  before invoking Git, including after y/N, and refuse a missing stash. Git has no
+  atomic selector check and mutation. Click or ⏎ shows the ref
   via colored `git show --stat --patch` in the SAME preview pane (`show/<root>/<spec>[/<path>]`
   control requests; FILE HISTORY narrows to the followed file). Ctrl+right-click opens
   per-type menus (checkout / merge / cherry-pick / revert / reset / stash apply-pop-drop /
@@ -941,7 +959,11 @@ HACKING.md — budget time for that before promising a patched build.
   calls `start_sync`; the Explorer footer's `sync_git_footer` → `start_git_footer_sync` the
   same way, parking a live Search overlay like the branch picker does. Never start a sync
   worker except through those, or the setting silently stops covering that button. Sync runs
-  on a worker, not `run_git`, so it has its own `ConfirmSync` overlay; the drawer ops reuse
+  on a worker, not `run_git`, so it has its own `ConfirmSync` overlay. It captures the
+  root, branch and full upstream ref with a bounded ref lookup when the prompt opens.
+  The worker re-reads them immediately before pull and refuses if the checkout or upstream
+  changed. Git has no transaction covering check, pull and push, so keep the recheck next
+  to the operation. The drawer ops reuse
   `ConfirmGit{args}` through `run_git_guarded`. Deliberately NOT guarded: Fetch (only moves
   remote-tracking refs), stash apply / stash push (the stash entry or the work survives),
   and the branch picker (already a deliberate open → choose two-step). Destructive ops
@@ -969,6 +991,10 @@ HACKING.md — budget time for that before promising a patched build.
     `request_refresh()`, which bumps the generation: an in-flight read predates the change, so
     its result is DROPPED and one coalesced follow-up read starts when it returns (never a
     second concurrent worker). An App rebuild (re-root/cwd-follow) gets a fresh channel.
+    A repo is current only after its own successful read in the current generation.
+    A failed or timed-out read keeps its old rows, marks them stale, and flashes the error
+    once per consecutive identical failure. The next read retries on the existing schedule.
+    The empty-staged-list commit guard trusts only current status and otherwise lets Git decide.
   - Periodic reads come from `tick()` only when nothing is running or queued and
     max(1.5s, 3x the last read's duration) has passed since it returned; the focus backoff and
     the `HERDR_SIDEBAR_BACKGROUND_REFRESH` bypass still gate them.

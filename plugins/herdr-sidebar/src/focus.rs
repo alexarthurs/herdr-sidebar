@@ -1,5 +1,5 @@
 //! The focus hooks publish one small snapshot per Herdr session. Sidebar
-//! processes can then share the host's focus decision without polling it.
+//! processes share that decision, with bounded checks for missed hooks.
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{ipc, launch, rundir};
+
+const HIDDEN_FOCUS_EVERY: Duration = Duration::from_secs(10);
+const MEMBERSHIP_EVERY: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 struct Focus {
@@ -88,6 +91,10 @@ fn write_local(path: &Path, text: &str) -> std::io::Result<()> {
     result
 }
 
+fn retry_once<T, E>(mut attempt: impl FnMut() -> Result<T, E>) -> Result<T, E> {
+    attempt().or_else(|_| attempt())
+}
+
 fn pane_reply(response: &str) -> Option<launch::Pane> {
     #[derive(Deserialize)]
     struct Reply {
@@ -101,9 +108,21 @@ fn pane_reply(response: &str) -> Option<launch::Pane> {
     Some(reply.result.pane)
 }
 
-fn current_focus() -> std::io::Result<Option<Focus>> {
+pub(crate) fn current_pane() -> std::io::Result<Option<launch::Pane>> {
     let reply = ipc::call_text("pane.current", json!({}))?;
-    Ok(pane_reply(&reply).as_ref().and_then(Focus::from_pane))
+    if let Some(pane) = pane_reply(&reply) {
+        return Ok(Some(pane));
+    }
+    let value: Value = serde_json::from_str(launch::strip_bom(&reply))?;
+    if value["error"]["code"] == "pane_not_found" {
+        Ok(None)
+    } else {
+        Err(std::io::Error::other("invalid pane.current response"))
+    }
+}
+
+fn current_focus() -> std::io::Result<Option<Focus>> {
+    Ok(current_pane()?.as_ref().and_then(Focus::from_pane))
 }
 
 /// Herdr starts hooks on separate threads and provides no event sequence, so
@@ -113,7 +132,11 @@ pub(crate) fn publish_focus() -> std::io::Result<()> {
     let Some(dir) = session_dir() else {
         return Ok(());
     };
-    prepare_dir(&dir)?;
+    update_focus(&dir, true)
+}
+
+fn update_focus(dir: &Path, force: bool) -> std::io::Result<()> {
+    prepare_dir(dir)?;
     let lock = File::options()
         .read(true)
         .write(true)
@@ -122,17 +145,27 @@ pub(crate) fn publish_focus() -> std::io::Result<()> {
         .open(dir.join("publish.lock"))?;
     lock.lock()?;
     let path = dir.join("current.json");
+    let previous = read_marker(&path);
     let Some(focus) = current_focus()? else {
         // A missing marker lets older hosts keep following at the idle cadence.
-        let _ = fs::remove_file(path);
+        return retry_once(|| match fs::remove_file(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        });
+    };
+    let Some(marker) = next_marker(previous.as_ref(), focus, force) else {
         return Ok(());
     };
-    let generation =
-        read_marker(&path).map_or(1, |marker| marker.generation.wrapping_add(1).max(1));
-    write_local(
-        &path,
-        &serde_json::to_string(&Marker { generation, focus })?,
-    )
+    let text = serde_json::to_string(&marker)?;
+    retry_once(|| write_local(&path, &text))
+}
+
+fn next_marker(previous: Option<&Marker>, focus: Focus, force: bool) -> Option<Marker> {
+    if !force && previous.is_some_and(|marker| marker.focus == focus) {
+        return None;
+    }
+    let generation = previous.map_or(1, |marker| marker.generation.wrapping_add(1).max(1));
+    Some(Marker { generation, focus })
 }
 
 fn move_path(dir: &Path, terminal_id: &str) -> PathBuf {
@@ -162,10 +195,9 @@ pub(crate) fn publish_move(event_json: &str) -> std::io::Result<()> {
     prepare_dir(&dir)?;
     // An invalidation is enough. The pane resolves its own current tab, so
     // two moves dispatched out of order cannot restore old tab membership.
-    write_local(
-        &move_path(&dir, id),
-        &format!("{:?}-{}", SystemTime::now(), std::process::id()),
-    )
+    let path = move_path(&dir, id);
+    let stamp = format!("{:?}-{}", SystemTime::now(), std::process::id());
+    retry_once(|| write_local(&path, &stamp))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -203,6 +235,15 @@ fn stale_at_startup(marker: Option<Marker>, snapshot: Option<&Focus>) -> Option<
     marker.filter(|marker| Some(&marker.focus) != snapshot)
 }
 
+enum ActivitySample {
+    Panes(String),
+    Revalidated(Option<launch::Pane>),
+}
+
+fn sample_due(last: Option<Instant>, now: Instant, every: Duration) -> bool {
+    last.is_none_or(|at| now.saturating_duration_since(at) >= every)
+}
+
 /// The two views share one focus reader and one single-flight pane sample,
 /// including across an in-process view switch or a cwd-triggered rebuild.
 #[derive(Default)]
@@ -213,14 +254,17 @@ pub struct SidebarActivity {
     terminal_id: Option<String>,
     marker_path: Option<PathBuf>,
     move_path: Option<PathBuf>,
+    observed_move: Option<String>,
     last_move: Option<String>,
+    last_membership: Option<Instant>,
+    last_focus_check: Option<Instant>,
     startup_marker: Option<Marker>,
     last_read: Option<Instant>,
     visibility: Visibility,
     pane_focused: bool,
     fallback_focused: bool,
     following: bool,
-    poller: launch::FollowPoller,
+    poller: launch::FollowPoller<ActivitySample>,
     follower: launch::CwdFollower,
 }
 
@@ -245,6 +289,8 @@ impl SidebarActivity {
             pane_id: original_pane_id.clone(),
             original_pane_id,
             marker_path,
+            last_membership: Some(Instant::now()),
+            last_focus_check: Some(Instant::now()),
             ..Self::default()
         };
         if let Some(own) = &own {
@@ -295,52 +341,93 @@ impl SidebarActivity {
                 self.poller.break_confirmation();
             }
         }
-        let cadence = self.visibility.cadence(follow, needs_focus);
         let mut target = None;
         if let Some(sample) = self.poller.take() {
-            if let Some(panes) = sample.and_then(|json| launch::parse_panes(&json)) {
-                if let Some(own) = panes.iter().find(|pane| {
-                    pane.pane_id.as_deref() == Some(&self.pane_id)
-                        || self.terminal_id.is_some() && pane.terminal_id == self.terminal_id
-                }) {
-                    self.update_membership(own);
+            match sample {
+                Some(ActivitySample::Revalidated(own)) => {
+                    if let Some(own) = own {
+                        self.fallback_focused = own.focused;
+                        self.update_membership(&own);
+                    }
+                    self.read_focus();
                 }
-                self.fallback_focused = panes
-                    .iter()
-                    .any(|pane| pane.focused && pane.pane_id.as_deref() == Some(&self.pane_id));
-                if follow && cadence.is_some() {
-                    target = self
-                        .poller
-                        .accept(&panes, &self.pane_id, &mut self.follower);
+                Some(ActivitySample::Panes(json)) => {
+                    if let Some(panes) = launch::parse_panes(&json) {
+                        if let Some(own) = panes.iter().find(|pane| {
+                            pane.pane_id.as_deref() == Some(&self.pane_id)
+                                || self.terminal_id.is_some()
+                                    && pane.terminal_id == self.terminal_id
+                        }) {
+                            self.update_membership(own);
+                            self.read_focus();
+                        }
+                        self.fallback_focused = panes.iter().any(|pane| {
+                            pane.focused && pane.pane_id.as_deref() == Some(&self.pane_id)
+                        });
+                        if follow && self.visibility.cadence(follow, needs_focus).is_some() {
+                            target = self
+                                .poller
+                                .accept(&panes, &self.pane_id, &mut self.follower);
+                        }
+                    }
                 }
-            } else {
-                self.fallback_focused = false;
-                self.poller.break_confirmation();
+                None => {
+                    self.fallback_focused = false;
+                    self.poller.break_confirmation();
+                }
             }
         }
         if self.visibility == Visibility::Unknown {
             self.pane_focused = self.fallback_focused;
         }
-        if let Some(every) = cadence {
-            self.poller
-                .maybe_start(now, every, || ipc::call_text("pane.list", json!({})).ok());
-        }
+        self.request_sample(now, follow, needs_focus);
         target
     }
 
-    fn read_focus(&mut self) {
-        let moved = self.move_path.as_deref().and_then(read_local);
-        if moved.is_some() && moved != self.last_move {
-            self.last_move = moved;
-            // The original pane id remains an API alias across workspaces.
-            // The reply contains the canonical id used by focus and list.
-            if let Some(pane) = get_pane(&self.original_pane_id) {
-                self.update_membership(&pane);
-            } else {
-                self.tab.clear();
+    fn membership_due(&self, now: Instant) -> bool {
+        (self.observed_move.is_some() && self.observed_move != self.last_move)
+            || sample_due(self.last_membership, now, MEMBERSHIP_EVERY)
+    }
+
+    fn request_sample(&mut self, now: Instant, follow: bool, needs_focus: bool) {
+        let membership_due = self.membership_due(now);
+        let startup_retry = self.startup_marker.is_some();
+        let focus_due = (startup_retry || self.visibility == Visibility::Hidden)
+            && sample_due(self.last_focus_check, now, HIDDEN_FOCUS_EVERY);
+        if membership_due || focus_due {
+            let dir = self
+                .marker_path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf);
+            let id = self.original_pane_id.clone();
+            let started = self.poller.maybe_start(now, Duration::ZERO, move || {
+                if focus_due && let Some(dir) = dir {
+                    let _ = update_focus(&dir, startup_retry);
+                }
+                let own = if membership_due { get_pane(&id) } else { None };
+                Some(ActivitySample::Revalidated(own))
+            });
+            if started {
+                if membership_due {
+                    self.last_move.clone_from(&self.observed_move);
+                    self.last_membership = Some(now);
+                }
+                if focus_due {
+                    self.last_focus_check = Some(now);
+                }
             }
-            self.poller.reset();
+        } else if let Some(every) = self.visibility.cadence(follow, needs_focus) {
+            self.poller.maybe_start(now, every, || {
+                ipc::call_text("pane.list", json!({}))
+                    .ok()
+                    .map(ActivitySample::Panes)
+            });
         }
+    }
+
+    fn read_focus(&mut self) {
+        self.observed_move = self.move_path.as_deref().and_then(read_local);
         let marker = self.marker_path.as_deref().and_then(read_marker);
         self.apply_marker(marker.as_ref());
     }
@@ -364,6 +451,9 @@ impl SidebarActivity {
 
     fn update_membership(&mut self, own: &launch::Pane) {
         if let (Some(id), Some(tab)) = (&own.pane_id, &own.tab_id) {
+            if self.pane_id != *id || self.tab != *tab {
+                self.poller.reset();
+            }
             self.pane_id.clone_from(id);
             self.tab.clone_from(tab);
             if self.terminal_id.is_none()
@@ -470,6 +560,51 @@ mod tests {
     }
 
     #[test]
+    fn hidden_revalidation_repairs_only_a_disagreeing_marker_and_retries_once() {
+        let now = Instant::now();
+        assert!(!sample_due(
+            Some(now),
+            now + Duration::from_secs(9),
+            HIDDEN_FOCUS_EVERY
+        ));
+        assert!(sample_due(
+            Some(now),
+            now + HIDDEN_FOCUS_EVERY,
+            HIDDEN_FOCUS_EVERY
+        ));
+        let old = marker(1, "w1:t1", "w1:p1");
+        let mut own = SidebarActivity {
+            tab: "w1:t2".into(),
+            ..Default::default()
+        };
+        own.apply_marker(Some(&old));
+        assert!(own.tab_is_hidden());
+        assert_eq!(next_marker(Some(&old), old.focus.clone(), false), None);
+
+        let current = Focus::new("w1", "w1:t2", "w1:p2").unwrap();
+        let fixed = next_marker(Some(&old), current.clone(), false).unwrap();
+        own.apply_marker(Some(&fixed));
+        assert!(!own.tab_is_hidden());
+        assert_eq!(
+            fixed,
+            Marker {
+                generation: 2,
+                focus: current
+            }
+        );
+
+        let mut attempts = 0;
+        assert_eq!(
+            retry_once(|| {
+                attempts += 1;
+                Err::<(), _>("busy")
+            }),
+            Err("busy")
+        );
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
     fn moves_are_keyed_by_terminal_across_public_pane_id_changes() {
         let event = json!({"data": {
             "previous_pane_id": "w1:p1",
@@ -496,6 +631,17 @@ mod tests {
             tab: "w1:t1".into(),
             ..Default::default()
         };
+        // Recover membership even if no invalidation arrived.
+        let now = Instant::now();
+        own.last_membership = Some(now);
+        assert!(!own.membership_due(now));
+        assert!(own.membership_due(now + MEMBERSHIP_EVERY));
+        own.observed_move = Some("move".into());
+        assert!(
+            own.membership_due(now),
+            "a published invalidation skips the wait"
+        );
+
         own.update_membership(&panes[0]);
         assert_eq!(own.pane_id, "w2:p6");
         assert_eq!(own.workspace_id(), Some("w2"));

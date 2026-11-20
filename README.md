@@ -136,6 +136,10 @@ sidebar comes back at the next pane, tab or workspace focus. A sidebar you hid w
 stays hidden, and one you open yourself in a narrow tab stays open until the tab has been
 wide again. With separate panes, only Explorer auto-hides.
 
+When multiple Herdr clients display different tabs, sidebar folder following and
+automatic refresh use the session's focused tab. A second client's tab catches
+up on its next focus event.
+
 The sidebar follows a neighbouring pane's working directory by default. A manually chosen
 folder stays put until that pane changes directory again.
 

@@ -99,6 +99,23 @@ impl GitOp<'_> {
     }
 }
 
+impl crate::git::SyncTarget {
+    pub fn prompt(&self, status: &crate::git::Status) -> String {
+        // The last status can belong to a branch that was just checked out.
+        let (ahead, behind) = if self.branch == status.branch {
+            (status.ahead, status.behind)
+        } else {
+            (0, 0)
+        };
+        GitOp::Sync {
+            branch: &self.branch,
+            ahead,
+            behind,
+        }
+        .prompt()
+    }
+}
+
 /// The free-function form of [`GitOp::needs_confirm`].
 pub fn needs_confirm(op: &GitOp<'_>, enabled: bool) -> bool {
     op.needs_confirm(enabled)

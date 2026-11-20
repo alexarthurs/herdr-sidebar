@@ -96,27 +96,37 @@ pub const FOLLOW_CWD_IDLE: std::time::Duration = std::time::Duration::from_secs(
 /// agree. Fast sampling otherwise catches transient `foreground_cwd` values
 /// (a tool that briefly runs elsewhere), and each one would re-root the view
 /// and release a manual folder choice that 5 s sampling used to miss.
-#[derive(Debug, Default)]
-pub(crate) struct FollowPoller {
-    inflight: Option<std::sync::mpsc::Receiver<Option<String>>>,
+#[derive(Debug)]
+pub(crate) struct FollowPoller<T> {
+    inflight: Option<std::sync::mpsc::Receiver<Option<T>>>,
     last_start: Option<std::time::Instant>,
     last_sample: Option<Vec<SiblingCwd>>,
 }
 
-impl FollowPoller {
+impl<T> Default for FollowPoller<T> {
+    fn default() -> Self {
+        Self {
+            inflight: None,
+            last_start: None,
+            last_sample: None,
+        }
+    }
+}
+
+impl<T: Send + 'static> FollowPoller<T> {
     /// Start a background sample when one is due and none is running.
     pub fn maybe_start(
         &mut self,
         now: std::time::Instant,
         every: std::time::Duration,
-        fetch: impl FnOnce() -> Option<String> + Send + 'static,
-    ) {
+        fetch: impl FnOnce() -> Option<T> + Send + 'static,
+    ) -> bool {
         if self.inflight.is_some()
             || self
                 .last_start
                 .is_some_and(|started| now.saturating_duration_since(started) < every)
         {
-            return;
+            return false;
         }
         self.last_start = Some(now);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -128,11 +138,14 @@ impl FollowPoller {
             .is_ok()
         {
             self.inflight = Some(rx);
+            true
+        } else {
+            false
         }
     }
 
     /// A finished sample, without blocking: `Some(None)` is a failed one.
-    pub fn take(&mut self) -> Option<Option<String>> {
+    pub fn take(&mut self) -> Option<Option<T>> {
         let rx = self.inflight.as_ref()?;
         let sample = match rx.try_recv() {
             Ok(sample) => sample.filter(|_| self.last_start.is_some()),
@@ -486,7 +499,7 @@ pub enum ReapClose {
     /// A live TUI: Ctrl+Q, so it saves its drafts and closes its own pane.
     Graceful,
     /// No TUI state can exist (still starting, a label-only server-resume
-    /// corpse, or a stale heartbeat the launcher would REPLACE anyway):
+    /// corpse):
     /// `pane.close` directly, since nothing would answer Ctrl+Q.
     Direct,
 }
@@ -504,7 +517,7 @@ pub struct LonelyTab {
 /// server-resume corpse). Anything else in the tab — a shell, an agent, a
 /// preview / editor viewer (which may hold unsaved edits), an unidentifiable
 /// pane — keeps the whole tab. Unparsable input yields nothing.
-pub fn lonely_sidebar_tabs(pane_list_json: &str, now: u64) -> Vec<LonelyTab> {
+pub fn lonely_sidebar_tabs(pane_list_json: &str) -> Vec<LonelyTab> {
     let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
         return Vec::new();
     };
@@ -517,7 +530,7 @@ pub fn lonely_sidebar_tabs(pane_list_json: &str, now: u64) -> Vec<LonelyTab> {
         let entry = tabs
             .entry(tab.to_string())
             .or_insert_with(|| Some(Vec::new()));
-        match (pane.reap_close(now), pane.pane_id.as_deref()) {
+        match (pane.reap_close(), pane.pane_id.as_deref()) {
             (Some(how), Some(id)) if is_flag_safe(id) => {
                 if let Some(sidebars) = entry {
                     sidebars.push((id.to_string(), how));
@@ -536,7 +549,7 @@ pub fn lonely_sidebar_tabs(pane_list_json: &str, now: u64) -> Vec<LonelyTab> {
 
 impl Pane {
     /// `Some` when this pane is one of our sidebars, saying how to close it.
-    fn reap_close(&self, now: u64) -> Option<ReapClose> {
+    fn reap_close(&self) -> Option<ReapClose> {
         // A cleared token is reported as null; never read one as present,
         // or a cleared starting marker would hard-close a live draft.
         let has = |key: &str| self.tokens.get(key).is_some_and(|value| !value.is_null());
@@ -545,22 +558,17 @@ impl Pane {
         if viewer {
             return None;
         }
-        let explorer = has(METADATA_SOURCE);
-        let git = has(SC_METADATA_SOURCE);
-        if !explorer && !git {
-            let ours = matches!(
-                self.label.as_deref(),
-                Some(PANE_LABEL | SIDEBAR_LABEL | SC_PANE_LABEL)
-            );
-            return ours.then_some(ReapClose::Direct);
+        if has(STARTING_TOKEN) {
+            return Some(ReapClose::Direct);
         }
-        let stale = (explorer && token_stale(&self.tokens, METADATA_SOURCE, now))
-            || (git && token_stale(&self.tokens, SC_METADATA_SOURCE, now));
-        if has(STARTING_TOKEN) || stale {
-            Some(ReapClose::Direct)
-        } else {
-            Some(ReapClose::Graceful)
+        if has(METADATA_SOURCE) || has(SC_METADATA_SOURCE) {
+            return Some(ReapClose::Graceful);
         }
+        let ours = matches!(
+            self.label.as_deref(),
+            Some(PANE_LABEL | SIDEBAR_LABEL | SC_PANE_LABEL)
+        );
+        (ours && self.tokens.values().all(serde_json::Value::is_null)).then_some(ReapClose::Direct)
     }
 }
 
@@ -1573,7 +1581,7 @@ mod tests {
             .unwrap()
         };
         let mut follower = CwdFollower::default();
-        let mut poll = FollowPoller::default();
+        let mut poll = FollowPoller::<String>::default();
         assert_eq!(poll.accept(&at("/one"), "w1:p3", &mut follower), None);
         assert_eq!(
             poll.accept(&at("/one"), "w1:p3", &mut follower).as_deref(),
@@ -1596,7 +1604,7 @@ mod tests {
     #[test]
     fn the_poller_discards_an_inflight_sample_on_visibility_transition() {
         let now = std::time::Instant::now();
-        let mut poll = FollowPoller::default();
+        let mut poll = FollowPoller::<String>::default();
         let (tx, rx) = std::sync::mpsc::channel();
         poll.inflight = Some(rx);
         poll.last_start = Some(now);
@@ -1615,7 +1623,7 @@ mod tests {
                {"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"/one"},
                {"pane_id":"w1:p4","tab_id":"w1:t2","focused":true}"#,
         );
-        let mut poll = FollowPoller::default();
+        let mut poll = FollowPoller::<String>::default();
         let now = std::time::Instant::now();
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let json = unfocused.clone();
@@ -2079,10 +2087,11 @@ mod tests {
             {{"pane_id":"w1:pg","tab_id":"w1:custom-editor","label":"vim","tokens":{{"hs-editor-path":"abc"}}}},
             {{"pane_id":"--x","tab_id":"w1:unsafe","tokens":{{"herdr-sidebar-explorer":"{live}"}}}},
             {{"pane_id":"w1:ph","tab_id":"w1:unsafe","tokens":{{"herdr-sidebar-explorer":"{live}"}}}},
-            {{"pane_id":"w1:pi","label":"Sidebar"}}
+            {{"pane_id":"w1:pi","label":"Sidebar"}},
+            {{"pane_id":"w1:pj","tab_id":"w1:foreign","label":"Sidebar","tokens":{{"foreign":"1"}}}}
         ]}}}}"#
         );
-        let lonely = lonely_sidebar_tabs(&json, now);
+        let lonely = lonely_sidebar_tabs(&json);
         let tab = |id: &str, panes: &[(&str, ReapClose)]| LonelyTab {
             tab: id.into(),
             panes: panes.iter().map(|(p, how)| (p.to_string(), *how)).collect(),
@@ -2092,12 +2101,12 @@ mod tests {
             lonely,
             vec![
                 tab("w1:alone", &[("w1:p3", Graceful)]),
-                tab("w1:corpses", &[("w1:pb", Direct), ("w1:pc", Direct)]),
+                tab("w1:corpses", &[("w1:pb", Direct), ("w1:pc", Graceful)]),
                 tab("w1:pair", &[("w1:p8", Graceful), ("w1:p9", Graceful)]),
                 tab("w1:young", &[("w1:pa", Direct)]),
             ]
         );
-        assert!(lonely_sidebar_tabs("not json", now).is_empty());
-        assert!(lonely_sidebar_tabs(r#"{"error":{"code":"x"}}"#, now).is_empty());
+        assert!(lonely_sidebar_tabs("not json").is_empty());
+        assert!(lonely_sidebar_tabs(r#"{"error":{"code":"x"}}"#).is_empty());
     }
 }

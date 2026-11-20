@@ -1964,8 +1964,7 @@ fn read_control_file(control: &Path) -> Option<Request> {
     parse_request(&buf)
 }
 
-/// Stamp liveness and the document routing tokens. The steady-state heartbeat
-/// only calls this function, so it never dirties the session with a rename.
+/// Stamp liveness and document routing independently of label maintenance.
 fn report_tokens(doc_key: Option<&str>, control: &Path) {
     let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else {
         return;
@@ -2001,7 +2000,7 @@ fn report_tokens(doc_key: Option<&str>, control: &Path) {
 #[derive(Default)]
 struct ViewerLabels {
     pane: Option<String>,
-    tab_doc: Option<String>,
+    tab: Option<(String, String)>,
 }
 
 fn label_changed(previous: Option<&str>, desired: &str) -> bool {
@@ -2016,11 +2015,9 @@ impl ViewerLabels {
 
     fn update(&mut self, mode: &ViewMode, doc_key: Option<&str>) {
         let pane_label = mode_pane_label(mode);
-        let tab_doc = doc_key
-            .filter(|_| !runs_inline())
-            .map(|key| tab_label(key, false));
-        let (pane_changed, tab_changed) = self.changes(&pane_label, tab_doc.as_deref());
-        if !pane_changed && !tab_changed {
+        let pane_changed = label_changed(self.pane.as_deref(), &pane_label);
+        let doc_key = doc_key.filter(|_| !runs_inline());
+        if !pane_changed && doc_key.is_none() {
             return;
         }
         let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else {
@@ -2039,21 +2036,28 @@ impl ViewerLabels {
         {
             self.pane = Some(pane_label);
         }
-        if let Some(key) = doc_key.filter(|_| tab_changed)
+        if let Some(key) = doc_key
             && let Some(tab_id) = pane["tab_id"].as_str()
         {
-            let pinned = pane["tokens"].get(TOKEN_PINNED).is_some();
-            if rename_tab_if_changed(tab_id, &tab_label(key, pinned)) {
-                self.tab_doc = tab_doc;
-            }
+            let pinned = pane["tokens"][TOKEN_PINNED].is_string();
+            let label = tab_label(key, pinned);
+            self.update_tab(tab_id, &label, rename_tab_if_changed);
         }
     }
 
-    fn changes(&self, pane: &str, tab: Option<&str>) -> (bool, bool) {
-        (
-            label_changed(self.pane.as_deref(), pane),
-            tab.is_some_and(|label| label_changed(self.tab_doc.as_deref(), label)),
-        )
+    fn update_tab(&mut self, tab_id: &str, label: &str, rename: impl FnOnce(&str, &str) -> bool) {
+        if self
+            .tab
+            .as_ref()
+            .is_some_and(|(id, applied)| id == tab_id && applied == label)
+        {
+            return;
+        }
+        if rename(tab_id, label) {
+            self.tab = Some((tab_id.to_owned(), label.to_owned()));
+        } else {
+            self.tab = None;
+        }
     }
 }
 
@@ -2786,7 +2790,11 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         // after a resume the viewer would wait out the rest of its interval
         // while recovery code already reads the old stamp as stale.
         if heartbeat_due(last_heartbeat, crate::state::unix_now()) {
-            report_tokens(current.as_ref().map(Request::doc_key).as_deref(), control);
+            let doc_key = current.as_ref().map(Request::doc_key);
+            report_tokens(doc_key.as_deref(), control);
+            // A dedicated preview can move without a document change.
+            // Recheck membership and retry failed writes once per heartbeat.
+            labels.update(&mode, doc_key.as_deref());
             // Settings live in a shared file another pane may rewrite; the
             // heartbeat is the sidebar's own re-read cadence. Chrome, diff
             // tints and selection follow immediately — an already-highlighted
@@ -5224,24 +5232,31 @@ mod tests {
     }
 
     #[test]
-    fn preview_renames_only_changed_display_labels() {
-        let pane = preview_pane_label("main.rs");
+    fn preview_relabels_a_new_tab_and_retries_a_failed_rename() {
         let tab = tab_label("/a/main.rs", false);
         let mut labels = ViewerLabels::default();
-        assert_eq!(labels.changes(&pane, Some(&tab)), (true, true));
-        labels.pane = Some(pane.clone());
-        labels.tab_doc = Some(tab.clone());
-        assert_eq!(labels.changes(&pane, Some(&tab)), (false, false));
-        assert_eq!(
-            labels.changes(&pane, Some(&tab_label("/b/main.rs", false))),
-            (false, false)
-        );
-        assert_eq!(
-            labels.changes("main.rs · editor", Some(&tab)),
-            (true, false)
-        );
-        assert_eq!(labels.changes(&pane, None), (false, false));
-        assert!(label_changed(Some(&tab), &tab_label("/a/main.rs", true)));
+        let renamed = |id: &str, label: &str| {
+            assert!(matches!(id, "w1:t1" | "w2:t2"));
+            assert_eq!(label, tab);
+            true
+        };
+        labels.update_tab("w1:t1", &tab, renamed);
+        labels.update_tab("w1:t1", &tab, |_, _| panic!("unchanged tab and label"));
+
+        labels.update_tab("w2:t2", &tab, |id, _| {
+            assert_eq!(id, "w2:t2");
+            false
+        });
+        assert!(labels.tab.is_none());
+        labels.update_tab("w2:t2", &tab, renamed);
+        assert_eq!(labels.tab.as_ref().unwrap().0, "w2:t2");
+
+        let pinned = tab_label("/a/main.rs", true);
+        labels.update_tab("w2:t2", &pinned, |_, label| {
+            assert_eq!(label, "main.rs");
+            true
+        });
+        assert_eq!(labels.tab, Some(("w2:t2".into(), pinned)));
     }
 
     #[test]
