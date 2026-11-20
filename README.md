@@ -109,12 +109,19 @@ Settings persist across tabs and restarts. Configure:
 - Hidden files, Git decorations, Git footer, and footer hotkeys
 - Auto-open, strict open/close toggle, focus-on-open, and live folder following
 - Confirm risky Git ops (off by default; see below)
+- Close emptied tabs (on by default; see below)
 
 **Confirm risky Git ops** asks y/N before Git actions that rewrite history or touch the
 remote: Sync (from `S`, the sync buttons, a repository row, the Git footer in any view, or
 the commit button when it reads Sync), and the history menus' Checkout, Merge, Cherry-Pick,
 Revert, and Pop Stash. Fetch, Apply Stash, Stash, and the branch picker never ask. Discard,
 reset, and deleting a branch, tag, stash, or worktree always ask, whatever the setting.
+
+**Close emptied tabs** closes a tab once only the sidebar is left in it: exit the last shell
+with `Ctrl+D`, or close the last other pane, and the tab goes away as it would without the
+plugin. The sidebar saves any unfinished commit message first; if it cannot, it stays open
+and shows why. Tabs that still hold a preview or editor are kept. Turn it off to keep a
+sidebar-only tab.
 
 **Auto-hide below** hides the sidebar while the tab is at most that many columns wide
 (64–200, or off), like herdr's own `ui.mobile_width_threshold`. The width is the tab area,

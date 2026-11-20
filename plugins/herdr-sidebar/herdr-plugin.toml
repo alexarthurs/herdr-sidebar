@@ -242,3 +242,30 @@ command = ["./target/release/herdr-sidebar", "--ensure"]
 on = "tab.focused"
 platforms = ["windows"]
 command = [".\\target\\release\\herdr-sidebar-ensure.exe"]
+
+# Close a tab left holding only sidebars once its last other pane goes away
+# (issue #108), the way herdr closes a tab whose last pane exits. A shell
+# exit (Ctrl+D) emits pane.exited; a herdr close emits pane.closed. Both
+# payloads name only the vanished pane, so the reap scans every tab. It waits
+# for the launcher lock (a discrete event, never skipped) and asks each
+# sidebar to close itself with Ctrl+Q so drafts are saved; ⚙ "Close emptied
+# tabs" turns it off.
+[[events]]
+on = "pane.exited"
+platforms = ["linux", "macos"]
+command = ["./target/release/herdr-sidebar", "--reap"]
+
+[[events]]
+on = "pane.exited"
+platforms = ["windows"]
+command = [".\target\release\herdr-sidebar-ensure.exe", "--reap"]
+
+[[events]]
+on = "pane.closed"
+platforms = ["linux", "macos"]
+command = ["./target/release/herdr-sidebar", "--reap"]
+
+[[events]]
+on = "pane.closed"
+platforms = ["windows"]
+command = [".\target\release\herdr-sidebar-ensure.exe", "--reap"]

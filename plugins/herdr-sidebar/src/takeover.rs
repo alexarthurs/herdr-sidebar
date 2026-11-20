@@ -677,6 +677,26 @@ fn recover_from_hook(env: &mut impl Env, tab: &str) -> Result<(), String> {
     restore_with(env, &plan, Trigger::Recover).map(drop)
 }
 
+/// Tabs a takeover journal of this session is responsible for: the previewed
+/// tab and its parking tab. While a journal exists either one may be left
+/// holding only the sidebar on purpose (working panes parked, the viewer
+/// gone before its restore ran), so the lonely-tab reap must leave them to
+/// the restore. A journal without a session (pre-session format) counts too:
+/// skipping a reap is harmless, closing a tab a restore needs is not.
+pub fn journaled_tabs() -> BTreeSet<String> {
+    journaled_tabs_with(&mut RealEnv)
+}
+
+fn journaled_tabs_with(env: &mut impl Env) -> BTreeSet<String> {
+    let session = env.session();
+    env.plans()
+        .into_iter()
+        .filter(|plan| plan.session.is_empty() || plan.session == session)
+        .flat_map(|plan| [plan.tab, plan.parking_tab])
+        .filter(|tab| !tab.is_empty())
+        .collect()
+}
+
 /// Journals of this session whose previewed tab no longer exists (tab closed,
 /// or ids changed across a server restart) can never apply: abandon them.
 fn sweep_with(env: &mut impl Env, panes_json: &str) {
@@ -1596,6 +1616,34 @@ mod tests {
         sweep_with(&mut fake, r#"{"result":{"panes":[]}}"#);
         sweep_with(&mut fake, "not json");
         assert!(fake.plans.contains_key("w9:gone"));
+    }
+
+    /// The lonely-tab reap (#108) must never close the previewed tab or its
+    /// parking tab while this session's journal still owes them a restore.
+    #[test]
+    fn journaled_tabs_name_both_tabs_of_this_sessions_journals() {
+        let (mut fake, _) = fake_with_takeover(false);
+        let ours = plan(&fake);
+        let mut foreign = ours.clone();
+        foreign.tab = "w9:other".into();
+        foreign.parking_tab = "w9:other-parking".into();
+        foreign.session = "session-b".into();
+        fake.plans.insert(foreign.tab.clone(), foreign);
+        let mut legacy = ours.clone();
+        legacy.tab = "w7:legacy".into();
+        legacy.parking_tab = String::new();
+        legacy.session = String::new();
+        fake.plans.insert(legacy.tab.clone(), legacy);
+        assert_eq!(
+            journaled_tabs_with(&mut fake),
+            BTreeSet::from([
+                "w1:main".to_string(),
+                ours.parking_tab.clone(),
+                "w7:legacy".to_string(),
+            ])
+        );
+        fake.plans.clear();
+        assert!(journaled_tabs_with(&mut fake).is_empty());
     }
 
     #[test]
