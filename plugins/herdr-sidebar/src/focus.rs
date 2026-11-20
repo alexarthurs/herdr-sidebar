@@ -134,7 +134,7 @@ pub(crate) fn publish_focus() -> std::io::Result<()> {
     };
     let lock = publish_lock(&dir)?;
     lock.lock()?;
-    write_focus(&dir, None, true, current_focus)
+    write_focus(&dir, current_focus)
 }
 
 fn publish_lock(dir: &Path) -> std::io::Result<File> {
@@ -149,7 +149,6 @@ fn publish_lock(dir: &Path) -> std::io::Result<File> {
 
 fn recheck_focus(
     dir: &Path,
-    startup_marker: Option<&Marker>,
     clock: impl FnOnce() -> SystemTime,
     fetch: impl FnOnce() -> std::io::Result<Option<Focus>>,
 ) -> std::io::Result<()> {
@@ -168,7 +167,7 @@ fn recheck_focus(
     }
     // Reserve the session's interval before IPC, even if the host times out.
     retry_once(|| write_local(&checked, &now.to_string()))?;
-    write_focus(dir, startup_marker, false, fetch)
+    write_focus(dir, fetch)
 }
 
 fn recheck_membership(dir: &Path, id: &str) -> Option<launch::Pane> {
@@ -179,8 +178,6 @@ fn recheck_membership(dir: &Path, id: &str) -> Option<launch::Pane> {
 
 fn write_focus(
     dir: &Path,
-    startup_marker: Option<&Marker>,
-    force: bool,
     fetch: impl FnOnce() -> std::io::Result<Option<Focus>>,
 ) -> std::io::Result<()> {
     let path = dir.join("current.json");
@@ -192,20 +189,16 @@ fn write_focus(
             result => result,
         });
     };
-    let refresh_startup = startup_marker.is_some() && startup_marker == previous.as_ref();
-    let Some(marker) = next_marker(previous.as_ref(), focus, force || refresh_startup) else {
-        return Ok(());
-    };
+    // Publish even when focus agrees: another sidebar may still hold a
+    // pane.list result older than this successful session-wide recheck.
+    let marker = next_marker(previous.as_ref(), focus);
     let text = serde_json::to_string(&marker)?;
     retry_once(|| write_local(&path, &text))
 }
 
-fn next_marker(previous: Option<&Marker>, focus: Focus, force: bool) -> Option<Marker> {
-    if !force && previous.is_some_and(|marker| marker.focus == focus) {
-        return None;
-    }
+fn next_marker(previous: Option<&Marker>, focus: Focus) -> Marker {
     let generation = previous.map_or(1, |marker| marker.generation.wrapping_add(1).max(1));
-    Some(Marker { generation, focus })
+    Marker { generation, focus }
 }
 
 fn move_path(dir: &Path, terminal_id: &str) -> PathBuf {
@@ -440,10 +433,9 @@ impl SidebarActivity {
             };
             let dir = dir.to_path_buf();
             let id = self.original_pane_id.clone();
-            let startup = self.startup_marker.clone();
             let started = self.poller.maybe_start(now, Duration::ZERO, move || {
                 if focus_due {
-                    let _ = recheck_focus(&dir, startup.as_ref(), SystemTime::now, current_focus);
+                    let _ = recheck_focus(&dir, SystemTime::now, current_focus);
                 }
                 let own = if membership_due {
                     recheck_membership(&dir, &id)
@@ -653,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_revalidation_repairs_only_a_disagreeing_marker_and_retries_once() {
+    fn hidden_revalidation_repairs_a_disagreeing_marker_and_retries_once() {
         let now = Instant::now();
         assert!(!sample_due(
             Some(now),
@@ -672,10 +664,9 @@ mod tests {
         };
         own.apply_marker(Some(&old));
         assert!(own.tab_is_hidden());
-        assert_eq!(next_marker(Some(&old), old.focus.clone(), false), None);
 
         let current = Focus::new("w1", "w1:t2", "w1:p2").unwrap();
-        let fixed = next_marker(Some(&old), current.clone(), false).unwrap();
+        let fixed = next_marker(Some(&old), current.clone());
         own.apply_marker(Some(&fixed));
         assert!(!own.tab_is_hidden());
         assert_eq!(
@@ -709,21 +700,37 @@ mod tests {
         let dir = root.join("session");
         let hook = publish_lock(&dir).unwrap();
         hook.lock().unwrap();
-        recheck_focus(&dir, None, || start, || panic!("focus hook holds the lock")).unwrap();
+        recheck_focus(&dir, || start, || panic!("focus hook holds the lock")).unwrap();
         assert!(recheck_membership(&dir, "w1:p2").is_none());
         drop(hook);
 
         let fetch = || Ok(Some(Focus::new("w1", "w1:t2", "w1:p2").unwrap()));
-        recheck_focus(&dir, None, || start, fetch).unwrap();
+        recheck_focus(&dir, || start, fetch).unwrap();
         let current = read_marker(&dir.join("current.json")).unwrap();
         recheck_focus(
             &dir,
-            Some(&current),
             || start + FOCUS_CHECK_EVERY - Duration::from_millis(1),
             || panic!("another sidebar already checked"),
         )
         .unwrap();
-        recheck_focus(&dir, Some(&current), || start + FOCUS_CHECK_EVERY, fetch).unwrap();
+        let mut sidebar = SidebarActivity {
+            pane_id: current.focus.pane_id.clone(),
+            tab: current.focus.tab_id.clone(),
+            ..Default::default()
+        };
+        sidebar.apply_marker(Some(&current));
+        sidebar.observe_list_focus(Some(&current), false);
+        assert!(!sidebar.pane_is_focused());
+
+        recheck_focus(&dir, || start + FOCUS_CHECK_EVERY, fetch).unwrap();
+        let confirmed = read_marker(&dir.join("current.json")).unwrap();
+        assert_eq!(confirmed.focus, current.focus);
+        assert_eq!(confirmed.generation, current.generation + 1);
+        sidebar.apply_marker(Some(&confirmed));
+        assert!(
+            sidebar.pane_is_focused(),
+            "a successful agreeing recheck beats the old list"
+        );
         assert_eq!(
             read_marker(&dir.join("current.json")).unwrap().generation,
             2
