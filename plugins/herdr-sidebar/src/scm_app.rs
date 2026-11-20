@@ -815,14 +815,14 @@ fn reselect(
 /// Apply fresh statuses, matched by repo ROOT (the repo set can change while
 /// a read runs). Replaces status data only: commit drafts, cursors and
 /// collapse state are view state and are never touched. Returns whether any
-/// status changed, and the last error.
+/// status changed, and any errors newly reported by the affected repos.
 fn apply_repo_statuses(
     repos: &mut [Repo],
     generation: u64,
     results: Vec<(PathBuf, Result<Status, String>)>,
 ) -> (bool, Option<String>) {
     let mut changed = false;
-    let mut error = None;
+    let mut errors = Vec::new();
     for (root, result) in results {
         let Some(repo) = repos.iter_mut().find(|r| r.git.root() == root) else {
             continue;
@@ -841,12 +841,12 @@ fn apply_repo_statuses(
                 changed |= !repo.loaded;
                 repo.loaded = true;
                 if let Some(first) = repo.freshness.failed(e) {
-                    error = Some(first);
+                    errors.push(first);
                 }
             }
         }
     }
-    (changed, error)
+    (changed, (!errors.is_empty()).then(|| errors.join(" | ")))
 }
 
 /// List rows; the first index on the repo-scoped variants is the repo.

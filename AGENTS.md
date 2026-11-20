@@ -531,7 +531,9 @@ HACKING.md — budget time for that before promising a patched build.
   `rundir`, keyed by socket hash like snooze. A sidebar resolves its membership with
   `pane.get` at startup and checks a pre-existing marker against `pane.current` once.
   Missing, unreadable, malformed, or startup-mismatched markers use one shared slow
-  sample every 5 s when cwd or focus is needed. A valid marker has no time expiry
+  sample every 5 s when cwd or focus is needed. A startup mismatch also retries
+  publication on the worker, which clears the fallback after the host responds.
+  A valid marker has no time expiry
   because the focused tab may sit idle indefinitely. Visibility follows Herdr's
   session-wide default pane. Herdr 0.9.5 tracks displayed tabs privately in
   `src/server/headless/client_views.rs`. Its public API schema offers no per-client

@@ -384,10 +384,15 @@ impl SidebarActivity {
         target
     }
 
+    fn membership_due(&self, now: Instant) -> bool {
+        (self.observed_move.is_some() && self.observed_move != self.last_move)
+            || sample_due(self.last_membership, now, MEMBERSHIP_EVERY)
+    }
+
     fn request_sample(&mut self, now: Instant, follow: bool, needs_focus: bool) {
-        let membership_due = (self.observed_move.is_some() && self.observed_move != self.last_move)
-            || sample_due(self.last_membership, now, MEMBERSHIP_EVERY);
-        let focus_due = self.visibility == Visibility::Hidden
+        let membership_due = self.membership_due(now);
+        let startup_retry = self.startup_marker.is_some();
+        let focus_due = (startup_retry || self.visibility == Visibility::Hidden)
             && sample_due(self.last_focus_check, now, HIDDEN_FOCUS_EVERY);
         if membership_due || focus_due {
             let dir = self
@@ -398,7 +403,7 @@ impl SidebarActivity {
             let id = self.original_pane_id.clone();
             let started = self.poller.maybe_start(now, Duration::ZERO, move || {
                 if focus_due && let Some(dir) = dir {
-                    let _ = update_focus(&dir, false);
+                    let _ = update_focus(&dir, startup_retry);
                 }
                 let own = if membership_due { get_pane(&id) } else { None };
                 Some(ActivitySample::Revalidated(own))
@@ -626,6 +631,17 @@ mod tests {
             tab: "w1:t1".into(),
             ..Default::default()
         };
+        // Recover membership even if no invalidation arrived.
+        let now = Instant::now();
+        own.last_membership = Some(now);
+        assert!(!own.membership_due(now));
+        assert!(own.membership_due(now + MEMBERSHIP_EVERY));
+        own.observed_move = Some("move".into());
+        assert!(
+            own.membership_due(now),
+            "a published invalidation skips the wait"
+        );
+
         own.update_membership(&panes[0]);
         assert_eq!(own.pane_id, "w2:p6");
         assert_eq!(own.workspace_id(), Some("w2"));
