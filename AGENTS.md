@@ -549,8 +549,9 @@ HACKING.md — budget time for that before promising a patched build.
 - With a usable marker, hidden sidebars issue zero periodic `pane.list` calls.
   Visible sidebars issue at most one full list every 300 ms while following
   (first request due when the tab becomes visible). Explorer keeps its 2 s
-  decoration refresh and SCM its adaptive worker schedule, both reading pane
-  focus from the marker. SCM's explicit background-refresh bypass still runs
+  decoration refresh and SCM its adaptive worker schedule. Visible sidebars use
+  their pane's focus from the existing cwd list until a newer hook publication
+  arrives. A visible sidebar with cwd follow off uses the 10 s focus check. SCM's explicit background-refresh bypass still runs
   local Git. Before this change, each sidebar sampled cwd every 300 ms visible
   or 5 s hidden, plus separate global lists about every 2 s for Explorer
   decorations or on due SCM status reads. Herdr supports workspace-scoped lists,

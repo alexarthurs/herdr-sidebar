@@ -236,7 +236,10 @@ fn stale_at_startup(marker: Option<Marker>, snapshot: Option<&Focus>) -> Option<
 }
 
 enum ActivitySample {
-    Panes(String),
+    Panes {
+        json: String,
+        marker: Option<Marker>,
+    },
     Revalidated(Option<launch::Pane>),
 }
 
@@ -262,6 +265,8 @@ pub struct SidebarActivity {
     last_read: Option<Instant>,
     visibility: Visibility,
     pane_focused: bool,
+    last_marker: Option<Marker>,
+    visible_list_focus: Option<bool>,
     fallback_focused: bool,
     following: bool,
     poller: launch::FollowPoller<ActivitySample>,
@@ -351,7 +356,7 @@ impl SidebarActivity {
                     }
                     self.read_focus();
                 }
-                Some(ActivitySample::Panes(json)) => {
+                Some(ActivitySample::Panes { json, marker }) => {
                     if let Some(panes) = launch::parse_panes(&json) {
                         if let Some(own) = panes.iter().find(|pane| {
                             pane.pane_id.as_deref() == Some(&self.pane_id)
@@ -360,10 +365,8 @@ impl SidebarActivity {
                         }) {
                             self.update_membership(own);
                             self.read_focus();
+                            self.observe_list_focus(marker.as_ref(), own.focused);
                         }
-                        self.fallback_focused = panes.iter().any(|pane| {
-                            pane.focused && pane.pane_id.as_deref() == Some(&self.pane_id)
-                        });
                         if follow && self.visibility.cadence(follow, needs_focus).is_some() {
                             target = self
                                 .poller
@@ -389,11 +392,17 @@ impl SidebarActivity {
             || sample_due(self.last_membership, now, MEMBERSHIP_EVERY)
     }
 
+    fn focus_check_due(&self, now: Instant, follow: bool) -> bool {
+        (self.startup_marker.is_some()
+            || self.visibility == Visibility::Hidden
+            || self.visibility == Visibility::Visible && !follow)
+            && sample_due(self.last_focus_check, now, HIDDEN_FOCUS_EVERY)
+    }
+
     fn request_sample(&mut self, now: Instant, follow: bool, needs_focus: bool) {
         let membership_due = self.membership_due(now);
         let startup_retry = self.startup_marker.is_some();
-        let focus_due = (startup_retry || self.visibility == Visibility::Hidden)
-            && sample_due(self.last_focus_check, now, HIDDEN_FOCUS_EVERY);
+        let focus_due = self.focus_check_due(now, follow);
         if membership_due || focus_due {
             let dir = self
                 .marker_path
@@ -418,10 +427,10 @@ impl SidebarActivity {
                 }
             }
         } else if let Some(every) = self.visibility.cadence(follow, needs_focus) {
-            self.poller.maybe_start(now, every, || {
-                ipc::call_text("pane.list", json!({}))
-                    .ok()
-                    .map(ActivitySample::Panes)
+            let marker = self.last_marker.clone();
+            self.poller.maybe_start(now, every, move || {
+                let json = ipc::call_text("pane.list", json!({})).ok()?;
+                Some(ActivitySample::Panes { json, marker })
             });
         }
     }
@@ -442,16 +451,33 @@ impl SidebarActivity {
             self.visibility = next;
             self.poller.reset();
         }
-        if let Some(marker) = marker {
-            self.pane_focused = next == Visibility::Visible && marker.focus.pane_id == self.pane_id;
-        } else {
-            self.pane_focused = self.fallback_focused;
+        if marker != self.last_marker.as_ref() {
+            self.last_marker = marker.cloned();
+            self.visible_list_focus = None;
+        }
+        self.pane_focused = match (next, marker) {
+            (Visibility::Visible, Some(marker)) => self
+                .visible_list_focus
+                .unwrap_or(marker.focus.pane_id == self.pane_id),
+            (Visibility::Unknown, _) => self.fallback_focused,
+            _ => false,
+        };
+    }
+
+    fn observe_list_focus(&mut self, marker: Option<&Marker>, focused: bool) {
+        self.fallback_focused = focused;
+        // A hook can publish while a list is in flight. Its marker wins
+        // until a sample started against that publication comes back.
+        if self.visibility == Visibility::Visible && marker == self.last_marker.as_ref() {
+            self.visible_list_focus = Some(focused);
+            self.pane_focused = focused;
         }
     }
 
     fn update_membership(&mut self, own: &launch::Pane) {
         if let (Some(id), Some(tab)) = (&own.pane_id, &own.tab_id) {
             if self.pane_id != *id || self.tab != *tab {
+                self.visible_list_focus = None;
                 self.poller.reset();
             }
             self.pane_id.clone_from(id);
@@ -557,6 +583,39 @@ mod tests {
             Some(launch::FOLLOW_CWD_IDLE)
         );
         assert_eq!(Visibility::Unknown.cadence(false, false), None);
+    }
+
+    #[test]
+    fn visible_sidebar_uses_list_focus_until_a_new_marker_and_checks_without_a_list() {
+        let shell = marker(1, "w1:t2", "w1:p1");
+        let newer = marker(2, "w1:t2", "w1:p1");
+        let mut own = SidebarActivity {
+            pane_id: "w1:p2".into(),
+            tab: "w1:t2".into(),
+            ..Default::default()
+        };
+        own.apply_marker(Some(&shell));
+        assert!(!own.pane_is_focused());
+        own.observe_list_focus(Some(&shell), true);
+        own.apply_marker(Some(&shell));
+        assert!(
+            own.pane_is_focused(),
+            "rereading the old marker preserves the sample"
+        );
+        own.observe_list_focus(Some(&shell), false);
+        assert!(!own.pane_is_focused());
+        own.apply_marker(Some(&newer));
+        own.observe_list_focus(Some(&shell), true);
+        assert!(
+            !own.pane_is_focused(),
+            "a newer hook wins over an in-flight list"
+        );
+
+        let now = Instant::now();
+        own.last_focus_check = Some(now);
+        assert!(!own.focus_check_due(now, false));
+        assert!(own.focus_check_due(now + HIDDEN_FOCUS_EVERY, false));
+        assert!(!own.focus_check_due(now + HIDDEN_FOCUS_EVERY, true));
     }
 
     #[test]
