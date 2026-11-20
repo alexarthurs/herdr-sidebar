@@ -540,10 +540,13 @@ HACKING.md — budget time for that before promising a patched build.
 - `pane.moved` writes an invalidation for the sidebar's stable terminal id and
   discards in-flight cwd samples. Membership is resolved by the next good cwd
   list or a worker `pane.get` using the original environment id, which Herdr
-  0.9.5 aliases across workspace moves. Each sidebar attempts at most one
-  membership recheck per 60 s, including after a move, and skips if the publish
-  lock is busy. The same fallback recovers missed invalidations. Marker writes,
-  including move invalidations, retry once on failure.
+  0.9.5 aliases across workspace moves. A delivered invalidation schedules a
+  lookup promptly. A busy publish lock leaves the lookup pending and the worker
+  can retry after 1 s. The worker releases the lock before `pane.get`, so membership
+  IPC cannot delay a focus hook's lock acquisition. A failed move lookup also
+  retries on the short cadence.
+  The idle membership fallback stays at 60 s and recovers missed invalidations.
+  Marker writes, including move invalidations, retry once on failure.
 - With a usable marker, hidden sidebars issue zero periodic `pane.list` calls.
   Visible sidebars issue at most one full list every 300 ms while following
   (first request due when the tab becomes visible). Explorer keeps its 2 s
@@ -558,7 +561,8 @@ HACKING.md — budget time for that before promising a patched build.
   entire session, shared by hidden panes, startup validation and visible panes
   with cwd follow off. The worker try-locks publication and skips if busy. Under
   the lock, a sibling timestamp reserves the interval before IPC, even on failed
-  reads, and a changed focus is published before unlock. Only real focus hooks
+  reads. Each successful recheck publishes a fresh generation before unlock,
+  even when focus agrees, so all sidebars can discard an older cwd list result. Only real focus hooks
   wait for the lock. Each sidebar still sends its ~5 s identity heartbeat and may
   use the 60 s membership fallback. The 20 s stale rule is unchanged. Root-label retries
   wait while the tab is hidden. On each ~5 s heartbeat, a dedicated preview sends
@@ -940,7 +944,8 @@ HACKING.md — budget time for that before promising a patched build.
   file-history path even when status replaces the rows. Confirmation keeps the same
   root. Stash apply/pop/drop look up the current selector by object ID immediately
   before invoking Git, including after y/N, and refuse a missing stash. Selector
-  lookup uses the same 2 s bound as the Sync prompt lookup. Pop and Drop
+  lookup uses the same 2 s bound as the Sync prompt lookup. Both run on the
+  input thread and can pause keyboard and mouse input up to that bound. Pop and Drop
   refuse when the object appears multiple times in the stash reflog. A concurrent
   stash operation from another process can still shift the selector between
   lookup and mutation because Git has no atomic check-and-mutate operation. Click or ⏎ shows the ref
