@@ -32,6 +32,10 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
+When running tests with `TEMP` inside a worktree, set `GIT_CEILING_DIRECTORIES` to the
+absolute scratch directory. Otherwise the repository-discovery fixtures can walk up into
+the real worktree and report it as an extra repository.
+
 CI uses the LATEST stable toolchain (`dtolnay/rust-toolchain@stable`), so a stale local
 `stable` can pass clippy while CI fails on a newly deprecated API (v0.15.1: `fetch_update` →
 `try_update`, which is also newer than our `rust-version = 1.89` MSRV — rewrite instead of
@@ -218,9 +222,11 @@ executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launch
   persisted session — all workspaces and panes respawn. Handy for exercising plugin hooks
   from a script; test in throwaway workspaces and close them after.
 - Creation hooks dock into their event scope even when `workspace create --no-focus` or
-  `tab create --no-focus` targets the background. After docking they re-read `pane.list` and
-  restore the previously focused pane only if the split/swap itself focused the new sidebar;
-  a concurrent intended focus transition must win.
+  `tab create --no-focus` targets the background. After docking they recheck focus and
+  restore the previously focused pane only if the split/swap itself focused the new sidebar.
+  Creation repair reads the cheap `pane.current` after layout changes and immediately before
+  `pane.focus`. Herdr has no conditional focus operation, so navigation between those two
+  requests can still be overwritten (#121).
 - Drive the live TUI for verification with `pane send-keys <id> s` (⚙ Settings) etc., then
   `pane read <id> --source visible` to assert on the rendered modal.
 
@@ -258,7 +264,12 @@ Pane geometry & CLI semantics:
   `overlay|popup|split|tab|zoomed` — plugins cannot add workspace-level chrome (e.g. a real
   sidebar next to herdr's own); the closest approximation is a per-tab dock via event hooks.
   There is also no way to insert a pane at a tab's layout root: a full-height left column is
-  only achievable by docking while the tab still has a single pane.
+  only achievable by docking while the tab still has a single pane. The ensure hook's
+  full-height repair (`launch::repair_step`) therefore only re-parents a pane under the
+  sidebar when it spans EXACTLY the sidebar plus its neighbour — the lower half of the pane
+  the sidebar was split from. Moving the panes of a separate bottom row ("1 top + N bottom")
+  restacked that row into a column, and closing the sidebar cannot move them back (#114);
+  those layouts keep a partial-height sidebar.
 
 Manifest `[[events]]` hooks (undocumented in CLI help; see herdr `src/api/schema/events.rs`):
 
@@ -281,6 +292,15 @@ Manifest `[[events]]` hooks (undocumented in CLI help; see herdr `src/api/schema
   fall back to the focused tab.
 - A launcher that hooks `pane.*` and also creates panes must pre-stamp identity while holding
   the shared launcher lock; otherwise its own layout/focus events form a duplicate-pane loop.
+- Pane removal (read in herdr 0.9.5 source): a shell exit (`Ctrl+D`) emits ONLY
+  `pane.exited`, and an API/UI close (`pane.close`, the client's close-pane key/menu) emits
+  ONLY `pane.closed`; both are hookable. `pane.exited` is emitted before the pane is removed,
+  but in the same `&mut App` handler that removes it, and API requests are served by that same
+  App, so a hook's `pane.list` always sees the post-removal layout. Hook context is computed at
+  emit time: `pane.exited` still resolves the dying pane's tab, but `pane.closed` (emitted after
+  removal) carries only `pane_id` + `workspace_id` — a hook reacting to it must scan tabs, not
+  scope. Closing a tab's last pane through `pane.close` closes the tab (the workspace, if it
+  was its last tab); `pane.move` emits neither event.
 
 Pane environment: `HERDR_PANE_ID` is set inside every pane; `HERDR_BIN_PATH` is injected for
 **actions/hooks but not panes** — fall back to `herdr` on PATH. A binary started via terminal input
@@ -344,8 +364,9 @@ through — `ColorTheme::next()` is a rotation, not a toggle):
   `DarkGray`, `Color::Yellow` advisories, and `LightBlue` glyphs. Add new colors to `Palette`,
   never as a module const.
 - `syntect`'s themes are foregrounds only, so a dark grammar theme on white is exactly the
-  washed-out case: `syntax::assets()` loads base16-ocean.dark AND InspiredGitHub and
-  `syntaxes_and_theme()` picks per `ui::is_light()`. An already-highlighted preview keeps its
+  washed-out case: `syntax::assets()` loads every bundled theme and `syntaxes_and_theme()`
+  picks the configured dark or light one per `ui::is_light()` (defaults base16-ocean.dark /
+  InspiredGitHub). An already-highlighted preview keeps its
   colors until it reloads; diffs re-render on their own ~2s refresh.
 - **A named color is the terminal profile's color, so it is not safe on a filled button**:
   `accent_fg: Color::White` emits ANSI 15, which a light profile draws as a pale grey — ✓ Commit
@@ -463,24 +484,113 @@ HACKING.md — budget time for that before promising a patched build.
 
 ### Following the neighbour pane's folder
 
-- A pane's `cwd` is its SPAWN directory; only `foreground_cwd` is live after a shell
-  `cd` or an agent project switch. Following therefore requires `foreground_cwd` and
-  deliberately has NO fallback to `cwd`: an absent live value is safer than silently
-  re-rooting to a stale directory.
+- Herdr 0.9.5 emits `foreground_cwd` only on Unix and omits the field when it has no
+  value. Issue #119 uses `cwd` only if the field is absent from the ENTIRE session
+  snapshot. Any field presence (including explicit null) keeps the strict rule, so
+  a missing observation on one pane cannot silently redirect the sidebar to an old cwd.
+- Windows `cwd` can be live. Herdr's `pane_metadata` reads `Tab::cwd_for_pane`, which
+  prefers a usable terminal-reported absolute directory (e.g. OSC 7), then reads
+  the native child shell's process cwd, and finally falls back to terminal state
+  seeded at spawn. It can follow native shell `cd` when that cwd is observable.
+  A WSL guest `cd` may never change the Windows launcher cwd or produce a Windows
+  path report. Following then tracks Herdr's available spawn/reported UNC directory
+  and sibling focus. Plain UNC paths such as `\\wsl.localhost\Ubuntu\repo` are kept,
+  and a verbatim UNC prefix is normalized to a UNC root.
 - "Follow pane folder" is persisted as `follow_cwd` in `state.json` and defaults on,
-  including for state files written before the field existed. Both views sample on the
-  existing ~5s heartbeat and share one process-local `CwdFollower`, so precedence survives
-  an app rebuild and unified-view switch.
+  including for state files written before the field existed. Both views share one
+  process-local `CwdFollower` and sampler, so precedence survives an app rebuild and
+  unified-view switch. Both live views re-read the setting along with their shared settings.
+- Sampling (#104) stays on `launch::FollowPoller`'s single-flight worker. A synchronous
+  `pane.list` (5 s IPC timeout) would stall input several times a second on a busy server.
+  A sample reaches the follower only when two consecutive samples agree. Fast sampling
+  otherwise catches transient cwd values that would re-root the view (SCM rebuilds
+  its whole app) and release a manual folder choice.
 - Multi-pane precedence is deterministic: focused eligible sibling, then the previously
   followed sibling, then lexical pane id. Candidate lists are sorted before selection;
   `pane.list` response order is never treated as meaningful. Explorer, Source Control,
   Sidebar, and Preview panes are ineligible so plugin panes cannot chase each other.
 - A successful typed/native folder choice is a manual override. Focus changes, response
   reordering, and newly-created panes do not overwrite it; following resumes only when an
-  already-observed eligible pane's `foreground_cwd` changes. Turning following back on
-  resets the baseline and immediately adopts the deterministic neighbour on the next beat.
+  already-observed eligible pane's observed cwd changes. Turning following back on
+  resets the baseline and makes the first eligible sample due immediately.
 - Source Control pauses cwd-follow while any repository has a non-empty commit-message draft;
   rebuilding the app for another cwd would otherwise destroy that in-memory draft.
+
+### Session focus and idle socket traffic (#125)
+
+- Herdr 0.9.5's `tab.focused` payload identifies the workspace and tab. The
+  `workspace.focused` payload contains the workspace and its plugin context resolves
+  the active tab. The `pane.focused` payload contains the pane and workspace, and its
+  context resolves the pane's tab. Herdr injects `HERDR_TAB_ID` and `HERDR_PANE_ID`
+  from that context. Keep using the event scope for docking and focus repair. For
+  visibility, hook children run concurrently and the event envelope has no sequence
+  or client id. An independent per-session file lock serializes `pane.current` and
+  marker publication so a delayed hook observes current focus instead of publishing
+  obsolete event data. Publication runs before auto-open and the launch lock.
+- `focus.rs` atomically replaces a small workspace/tab/pane JSON marker in the private
+  `rundir`, keyed by socket hash like snooze. A sidebar resolves its membership with
+  `pane.get` at startup. A pre-existing marker is provisionally ignored until a
+  new publication or a coalesced worker check validates it. Missing, unreadable,
+  malformed, or unvalidated startup markers use a slow sample every 5 s when
+  cwd or focus is needed. Validated markers have no expiry while the tab sits idle. Visibility follows Herdr's
+  session-wide default pane. Herdr 0.9.5 tracks displayed tabs privately in
+  `src/server/headless/client_views.rs`. Its public API schema offers no per-client
+  visibility list, and `session.snapshot` exposes one focused tab. A second client's
+  tab catches up on its next focus event.
+- `pane.moved` writes an invalidation for the sidebar's stable terminal id and
+  discards in-flight cwd samples. Membership is resolved by the next good cwd
+  list or a worker `pane.get` using the original environment id, which Herdr
+  0.9.5 aliases across workspace moves. A delivered invalidation schedules a
+  lookup promptly. A busy publish lock leaves the lookup pending and the worker
+  can retry after 1 s. The worker releases the lock before `pane.get`, so membership
+  IPC cannot delay a focus hook's lock acquisition. A failed move lookup also
+  retries on the short cadence, measured from when the lookup RETURNED (a slow failing
+  `pane.get` would otherwise be due again immediately), and a due focus check gets the
+  worker's next turn after each membership run so failing move retries cannot starve it.
+  The idle membership fallback stays at 60 s and recovers missed invalidations; each
+  sidebar's first idle check is offset by a stable per-pane hash within that interval, so
+  sidebars started together (server restart, redeploy) do not query in one burst.
+  Marker writes, including move invalidations, retry once on failure.
+- With a usable marker, hidden sidebars issue zero periodic `pane.list` calls.
+  Visible sidebars issue at most one full list every 300 ms while following
+  (first request due when the tab becomes visible). Explorer keeps its 2 s
+  decoration refresh and SCM its adaptive worker schedule. Visible sidebars use
+  their pane's focus from the existing cwd list until a newer hook publication
+  arrives. A visible sidebar with cwd follow off uses the 10 s focus check. SCM's explicit background-refresh bypass still runs
+  local Git. Before this change, each sidebar sampled cwd every 300 ms visible
+  or 5 s hidden, plus separate global lists about every 2 s for Explorer
+  decorations or on due SCM status reads. Herdr supports workspace-scoped lists,
+  but the follow sample stays session-wide for the #119 capability check.
+- Opportunistic focus checks use at most one `pane.current` per 10 s across the
+  entire session, shared by hidden panes, startup validation and visible panes
+  with cwd follow off. The worker try-locks publication and skips if busy. Under
+  the lock, a sibling timestamp reserves the interval before IPC, even on failed
+  reads. Each successful recheck publishes a fresh generation before unlock,
+  even when focus agrees, so all sidebars can discard an older cwd list result. Only real focus hooks
+  wait for the lock. Each sidebar still sends its ~5 s identity heartbeat and may
+  use the 60 s membership fallback. The 20 s stale rule is unchanged. Root-label retries
+  wait while the tab is hidden. On each ~5 s heartbeat, a dedicated preview sends
+  its metadata stamp and uses one `pane.get` to detect a move even when the document
+  is unchanged. The applied tab label is cached by (tab id, label), so a move
+  relabels its destination and a failed rename retries on the next heartbeat.
+  A steady inline preview sends only metadata. Document, mode, or pin changes
+  compare labels before renaming. Herdr's token-only
+  metadata handler increments the pane revision and emits `pane.updated` when
+  tokens change. It does not dirty the session or schedule a save, but headless
+  `request_changes_ui` classifies metadata reports as UI-changing. Both rename
+  handlers dirty or schedule session persistence even for unchanged names.
+- A healthy ensure hook that takes the launch lock uses one full pane snapshot
+  (previously at least two); a live takeover viewer is checked against that
+  snapshot. Keep fresh reads after any possible recovery/corpse mutation and
+  the before/after focus-repair reads for docking. Absorbing separated panes
+  now checks only requested sibling IDs via `pane.get` at a bounded cadence
+  during the explicit close handshake, preserving the draft-save and timeout paths.
+- Windows manifest paths in TOML basic strings need doubled backslashes.
+  The two reap entries on the integration base used single backslashes and
+  made the manifest unparsable. Keep the move and reap hooks on the GUI sidecar.
+  For offline tests whose scratch dir is inside the worktree, set
+  `GIT_CEILING_DIRECTORIES` to the worktree root. Otherwise Git discovers the
+  outer repository in fixtures that intentionally start outside any repo.
 
 ### Pane liveness (heartbeat tokens)
 
@@ -510,7 +620,12 @@ HACKING.md — budget time for that before promising a patched build.
   `tab_created`; manifest hook names remain dotted (`tab.created`). Creation hooks still dock
   their event scope when it is in the background, then conditionally repair focus only when the
   new sidebar stole it, so `--no-focus` remains authoritative without reopening issue #32's
-  missed-preview-tab race. Ordinary focus hooks restore the scoped pane because their first
+  missed-preview-tab race. `pane.swap` focuses the new sidebar's workspace even when the
+  worktree was opened with `--no-focus`; its displaced pane belongs to that background
+  workspace, not necessarily the previously focused one. Re-read focus just before swapping
+  and restore that pane when the sidebar is still focused afterward. A failed pre-swap read
+  falls back to the entry snapshot; use the displaced pane only when the chosen snapshot
+  has no focused pane. Ordinary focus hooks restore the scoped pane because their first
   global snapshot can still point at the tab/workspace the client just left.
 - A crashing startup must never create an unbounded `REPLACE` loop. Quiet hooks persist a
   per-tab replacement budget in the private runtime directory: three attempts per minute, then
@@ -541,9 +656,9 @@ HACKING.md — budget time for that before promising a patched build.
   no flash — the terminal session is held across switches). The old two-crate host/guest
   process-swap protocol is gone.
 - User-facing wording is **"Unified sidebar: on/off"**, toggled in the ⚙ Settings modal
-  (`s` key or the gear button) — never "merge"/"detach" in UI text, and the toggle is
-  silent (the layout change is the feedback). Off spawns a second pane of the same binary
-  pinned with `--view`, and each pane pins to its own view.
+  (`F8`, `s` with letter shortcuts enabled, or the gear button) — never "merge"/"detach" in
+  UI text, and the toggle is silent (the layout change is the feedback). Off spawns a second
+  pane of the same binary pinned with `--view`, and each pane pins to its own view.
 - The sticky setting lives in `HERDR_PLUGIN_STATE_DIR/state.json` (resolves to
   `%LOCALAPPDATA%\herdr\plugins\herdr-sidebar\` here) per the herdr plugin docs; herdr
   injects that env for hooks/actions but NOT panes, so every `pane.split` we issue
@@ -554,6 +669,57 @@ HACKING.md — budget time for that before promising a patched build.
   a frozen split ratio. A change to the whole tab area re-applies it through the ratio-aware
   resize path; a pane-only divider resize is respected for the current layout instead of
   snapping back. The existing 15%–50% share bounds still win at extreme tab widths.
+- Auto-hide below N columns (`auto_hide_below`, 0 = off, 64–200 in 8-column steps;
+  `src/autohide.rs`, #109). The sidebar TUI closes itself from `on_resize` when the tab
+  `area.width` is ≤ N, through the ordinary `close(false)` path (SCM drafts saved first, no
+  snooze marker). The quiet ensure hook declines to dock into a tab that narrow
+  (`auto_hide_allows_open`, measured through any pane of the RESOLVED tab — a workspace scope
+  with several tabs has no single focused pane) and docks again at the first focus event once
+  `area.width` > N. No hysteresis needed: `area.width` is the whole tab, which the sidebar
+  opening or closing does not change. A sidebar that is its tab's ONLY pane never auto-hides:
+  closing the last pane closes the tab (a sidebar left alone in a preview tab).
+  As submitted, the PR also wrote a per-tab marker and, on unix, spawned a `setsid`-detached
+  `--autohide-watch` poller per hidden tab so the sidebar came back without a focus event.
+  Dropped in review: herdr lets plugins hook neither `layout.updated` nor resize, so it needed
+  one process per hidden tab polling `pane.list` every second, the marker was cleared on only
+  some open paths (with `auto_open` off, or the setting turned off, the watcher ran a full
+  `--ensure` every second forever), and it was the plugin's only `unsafe pre_exec`.
+  Panes in background tabs DO get the PTY resize and hide too (verified live by the author,
+  herdr 0.9.3). A user snooze always wins (checked first). A pane that starts in an
+  already-narrow tab (an explicit toggle) starts disarmed (`autohide::Latch`) and only
+  auto-hides after the tab has been > N. A standalone Source Control pane never auto-hides,
+  because ensure never reopens one. herdr's own `ui.mobile_width_threshold` compares the
+  CLIENT terminal width and swaps to a single-column layout; it does not collapse anything,
+  so the two thresholds don't line up exactly.
+- **Close emptied tabs** (`close_lonely_tab`, default ON — files without the field read true;
+  issue #108). Stock herdr closes a tab when its last pane exits; with a docked sidebar the
+  tab used to survive as a full-width sidebar. `pane.exited` + `pane.closed` hooks run
+  `ensure::Mode::Reap` (`--reap` on both the unix main binary and the Windows sidecar).
+  Invariants:
+  - It takes the shared `LaunchLock` BLOCKING (a discrete event; a skipped reap would wait for
+    some unrelated pane to close). Holding it also hides every transient layout of our own
+    launch / refresh / takeover / unified-toggle flows, which all mutate under that lock.
+  - Reap uses the exiting pane's tab from the hook context for `pane.exited`. For
+    `pane.closed`, Herdr has already removed the pane, so reap is limited to the event's
+    workspace. A close can therefore also reap a sidebar-only sibling tab in that workspace,
+    consistent with Close emptied tabs. An event without a usable scope does nothing. Reap re-lists before each
+    request to verify the tab is still sidebar-only and the pane's close policy still applies.
+    Each remaining pane must be a sidebar: an Explorer / Source Control token, or one of our labels
+    without one. Any other pane — shell, agent, preview / editor viewer (token or label),
+    an id that is not flag-safe — keeps the tab. Null token values count as absent.
+  - Live TUIs get Ctrl+Q only (save drafts, close own pane, no snooze marker); a draft that
+    cannot be saved keeps the pane open with its notice, and nothing waits for or kills it.
+    Only label-only server-resume corpses with no tokens are closed directly. A starting
+    token may survive the first full metadata report failing after the TUI takes input,
+    so starting panes get Ctrl+Q too, along with stale or malformed sidebar heartbeats.
+  - Tabs named by a THIS-session (or session-less legacy) takeover journal — previewed tab
+    and parking tab — are skipped (`takeover::journaled_tabs`); the restore owns them. After an
+    abandoned restore the journal is gone, so a previewed tab left with only its sidebar is
+    reaped like any other.
+  - Idempotent and cheap: each self-close emits `pane.closed`, which re-runs the reap over a
+    snapshot without that pane (a journal-dir read is needed only when a scoped tab is lonely). Refresh / redeploy close sidebars only in tabs that keep other panes, so they never
+    create a lonely tab; refresh's "sidebar is the tab's only pane" report now mostly concerns
+    users who turned the setting off.
 - Every Settings action uses `state::update_state`, a lock-protected read-modify-write.
   State/tree/SCM/root writers use persistent sibling `.lock` files with OS-backed locks; the
   kernel releases ownership on process death, so do not poll, age, or delete those files.
@@ -563,6 +729,14 @@ HACKING.md — budget time for that before promising a patched build.
   including `color_theme`, `strict_toggle`, and `focus_on_open`; theme changes also update
   the process palette immediately. The Settings modal scrolls to keep its selected row visible
   when the pane is too short for all rows and hotkey hints.
+- **Letter shortcuts** (`letter_hotkeys`, defaults to true, #130) applies to the Explorer tree,
+  Search results, and SCM list. Both apps re-read the shared value on tick and call
+  `ui::ignore_letter_hotkey` before handling list shortcuts. Explorer must filter Search's
+  results-focus digits before its global view-switch dispatch. Input fields (including AltGr
+  input), open overlays, and F9–F12 transport keys keep their existing handlers. The notice is
+  shown once per pane, including across in-process app rebuilds. Search draws its notice above
+  its dedicated Git/collapse footer. `F8` opens Settings in each view and uses the standard
+  VT sequence `ESC [ 19 ~`, which avoids reliance on modified punctuation being transmitted.
 - `git_footer` (default true) keeps a one-line branch + sync strip at the bottom of Explorer,
   Search, and Source Control whenever the root belongs to a repository. The normal
   compact `m / ctrl+rclick for menus` hint stays dark-gray and right-aligned directly above it when
@@ -571,6 +745,8 @@ HACKING.md — budget time for that before promising a patched build.
   Explorer gets its branch/ahead/behind state
   from the same one-at-a-time background status worker as decorations, but status polling stays
   available when decorations are disabled; ignored-path scans do not.
+- `diff_side_by_side` in the same state file (default false) is the diff preview's
+  layout; `v` writes it through `update_state`, and each new diff reads it on load.
 - `dock_right` in the same state file (default false) drives the “Dock on the right” Settings
   row. Launch target/ratio/swap, resize direction, and full-height repair all mirror from that
   one persisted choice. Preview tabs inherit it when the `tab.created` hook docks their sidebar.
@@ -614,9 +790,10 @@ HACKING.md — budget time for that before promising a patched build.
   other mobile herdr clients have no right-click at all, and `pane send-keys` can't send
   one either). It routes through the same builder ctrl+right-click uses, so the menus
   can never drift apart; the explorer anchors the popup under the selected row via
-  `selection_anchor`, the SCM view via its existing `row_y`. The footer hint reads
-  `m / ctrl+rclick: menu` — same width as the old `ctrl+rclick for menus`, so it still
-  fits a ~34-col pane.
+  `selection_anchor`, the SCM view via its existing `row_y`. The footer hint
+  (`ui::fit_menu_hint`, #103) is the longest of `m / ctrl+rclick for menus`,
+  `m / ctrl+rclick: menu` and `m: menu` that fits beside the « button, or nothing, so a
+  24-column sidebar never clips it.
 - Gotcha: after the ✧ suggestion lands, panel focus moves to the message box — letter keys
   then type text instead of triggering actions (Esc returns to the list).
 - Explorer Quick Open is `Ctrl+P` and reuses the normal preview client rather than inventing
@@ -766,8 +943,16 @@ HACKING.md — budget time for that before promising a patched build.
   rows (`Row::selectable()`). The ✧ suggest / S sync keys act on the ACTIVE repo — the one
   the selection is in (named in the panel header).
 - **Git drawers** (title-case names, incl. Worktrees): drawer lines carry parsed
-  refs (`DrawerRef` — commit hash / stash index / branch / remote / tag / worktree path,
-  see `parse_drawer_ref`). Click or ⏎ shows the ref
+  refs (`DrawerRef` — full commit or stash object ID / branch / remote / tag / worktree
+  path, see `parse_drawer_ref`). An open menu keeps its repository root, ref and
+  file-history path even when status replaces the rows. Confirmation keeps the same
+  root. Stash apply/pop/drop look up the current selector by object ID immediately
+  before invoking Git, including after y/N, and refuse a missing stash. Selector
+  lookup uses the same 2 s bound as the Sync prompt lookup. Both run on the
+  input thread and can pause keyboard and mouse input up to that bound. Pop and Drop
+  refuse when the object appears multiple times in the stash reflog. A concurrent
+  stash operation from another process can still shift the selector between
+  lookup and mutation because Git has no atomic check-and-mutate operation. Click or ⏎ shows the ref
   via colored `git show --stat --patch` in the SAME preview pane (`show/<root>/<spec>[/<path>]`
   control requests; FILE HISTORY narrows to the followed file). Ctrl+right-click opens
   per-type menus (checkout / merge / cherry-pick / revert / reset / stash apply-pop-drop /
@@ -778,6 +963,30 @@ HACKING.md — budget time for that before promising a patched build.
 - **Sync Changes** (`S` or the ⇅ button, shown only when ahead/behind ≠ 0): `pull --rebase
   --autostash` then `push`, on a background thread polled from tick(). Ahead/behind parse
   from the porcelain `## branch...upstream [ahead N, behind M]` header.
+- **Confirm risky Git ops** (`confirm_git_ops` in state.json, default false, issue #118; a
+  Settings row in BOTH views, re-read on tick like the other shared settings) puts a y/N in
+  front of one-click ops that rewrite history or touch the remote: Sync from EVERY entry point
+  and drawer Checkout / Merge / Cherry-Pick / Revert / Pop Stash. The decision and the
+  prompt text are one pure table, `gitconfirm::GitOp` (`needs_confirm`, `prompt`), shared by
+  both apps. Every SCM sync path (`S`, ⇅, Git footer, multi-repo header ⟳, the primary button
+  when `sync_is_primary`, Enter/Space on it) funnels through `sync_repo`, which asks and then
+  calls `start_sync`; the Explorer footer's `sync_git_footer` → `start_git_footer_sync` the
+  same way, parking a live Search overlay like the branch picker does. Never start a sync
+  worker except through those, or the setting silently stops covering that button. Sync runs
+  on a worker, not `run_git`, so it has its own `ConfirmSync` overlay. It captures the
+  root, branch and full upstream ref with a 2 s ref lookup when the prompt opens.
+  The worker re-reads them immediately before pull and refuses if the checkout or upstream
+  changed. Git has no transaction covering check, pull and push, so keep the recheck next
+  to the operation. Push uses Git's current configuration, so changing
+  `branch.<name>.pushRemote` between opening the prompt and confirming can redirect it. The drawer ops reuse
+  `ConfirmGit{args}` through `run_git_guarded`. Deliberately NOT guarded: Fetch (only moves
+  remote-tracking refs), stash apply / stash push (the stash entry or the work survives),
+  and the branch picker (already a deliberate open → choose two-step). Destructive ops
+  (discard, reset, delete branch/tag, stash drop, remove worktree) confirm regardless. The
+  setting row label is kept to 21 chars so `label + value + 5` fits the default 32-col pane;
+  prompts clear any flash/notice first, because the Explorer's `footer_message` shows a
+  pending notice INSTEAD of an overlay's confirm prompt (SCM's `footer_lines` prefers the
+  prompt, but a stale flash would reappear after the answer).
 - Branch labels are actions, not decoration: clicking the Source Control panel header, a
   multi-repo header's branch label, or either view's Git footer opens the shared `BranchPicker`.
   Local choices use a normal checkout; a remote choice creates its local tracking branch.
@@ -788,6 +997,41 @@ HACKING.md — budget time for that before promising a patched build.
   hidden pane never strands completed background work. A pane launched with
   `HERDR_SIDEBAR_BACKGROUND_REFRESH=1` (read once at startup, `state::BACKGROUND_REFRESH_ENV`)
   skips only that focus guard, for passive monitor panes; Explorer is unaffected.
+- **Status never runs on the UI thread** (issue #97: `status -uall` in a 239k-file repo froze
+  input and starved the heartbeat into a corpse REPLACE). ONE single-flight worker per SCM App
+  (`RefreshGate` + `status_rx`) reads every repo's status plus the active repo's expanded
+  drawers; the event loop collects it every iteration (`collect_status`) and polls at
+  `ANIMATION_FRAME` while a read is in flight. Rules:
+  - Every git action, `r`/Refresh, a finished sync, and a newly discovered repo set call
+    `request_refresh()`, which bumps the generation: an in-flight read predates the change, so
+    its result is DROPPED and one coalesced follow-up read starts when it returns (never a
+    second concurrent worker). An App rebuild (re-root/cwd-follow) gets a fresh channel.
+    A repo is current only after its own successful read in the current generation.
+    A failed or timed-out read keeps its old rows, marks them stale, and flashes the error
+    once per consecutive identical failure. The next read retries on the existing schedule.
+    The empty-staged-list commit guard trusts only current status and otherwise lets Git decide.
+  - Periodic reads come from `tick()` only when nothing is running or queued and
+    max(1.5s, 3x the last read's duration) has passed since it returned; the focus backoff and
+    the `HERDR_SIDEBAR_BACKGROUND_REFRESH` bypass still gate them.
+  - Applying a result replaces STATUS DATA ONLY, matched by repo root: commit drafts/cursors,
+    collapse sets and focus are untouched. The selection is captured by `row_stable_id` BEFORE
+    the status it indexes is replaced, then re-found (`reselect`), falling back to the old
+    index when that row is gone. An unchanged result does not rebuild. Drawer lines apply only
+    while the same repo is active, FILE HISTORY follows the same file, and the drawer is still
+    expanded.
+  - `App::new` does no status read: it draws at once ("loading…" header, `…` repo branches)
+    and restores the saved selection/scroll when the first current result applies; a close
+    before that persists the saved values instead of "nothing selected".
+  - Status (120s — a bound a huge `-uall` worktree could never meet would mean the view never
+    loads) and drawer queries (10s) go through the bounded `run_read_in_with_timeout`
+    (`GIT_OPTIONAL_LOCKS=0`, Job Object tree-kill on Windows), so a hung git cannot strand the
+    worker. Its poll naps start at 1ms so fast reads are not taxed 25ms each.
+  - Between an action and its follow-up read the displayed status is stale (`stale()`):
+    Commit then skips its "no staged changes" pre-check and lets git decide, because a
+    just-staged file is not visible yet. Still synchronous on the UI thread, deliberately: the
+    mutating git actions themselves; drawer reloads on a drawer toggle, active-repo switch or
+    FILE HISTORY target change (one bounded query set, immediate feedback); `stage_under` /
+    `unstage_under`'s own status read; repo discovery; and ✧'s `diff_for_message`.
 - Hotkey hints render as keycap chips (`wrap_hints` takes `(key, label)` pairs, shared in
   `ui.rs`). They live in the ⚙ Settings modal; the FOOTER copy is opt-in via the
   "Footer hotkeys" setting (persisted as `hotkeys` in the state file, default hidden —
@@ -796,7 +1040,14 @@ HACKING.md — budget time for that before promising a patched build.
 - There is NO collapse-to-sliver mode anymore (herdr's 10% ratio floor made the sliver
   a wide empty strip — user-rejected). « bottom-right / `b` HIDE the sidebar instead:
   per-tab snooze marker + `pane.close` of its own pane (`hide()` in both apps,
-  `src/snooze.rs` shared with the ensure hook, `launch::tab_of`). The herdr keybinding
+  `src/snooze.rs` shared with the ensure hook, `launch::tab_of`). Markers live in one
+  subdirectory per herdr SESSION (hash of the socket path, #115): tab ids like `w1:t1`
+  repeat across sessions, so a shared directory let one session honor — and its sweep
+  delete — another's markers. Sweep only against a `pane.list` that parsed
+  (`launch::live_tabs` returns `None` for an error reply, which has no tabs). Pre-#115 flat
+  markers are adopted only for this session's live tabs; the shared root is never swept.
+  The replace budget (`rundir("launch")`) is still shared across sessions — harmless, it is
+  time-swept. The herdr keybinding
   `prefix+b` (config.toml `[[keys.command]]` → the toggle action, like the other plugin
   binds) brings it back — or hides it again when it's focused.
 - **Esc must never exit a sidebar TUI** — a stray Esc used to drop the pane back to the
@@ -1018,6 +1269,31 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   receiver cannot cancel a thread blocked in the kernel, so at most `MAX_REFRESH_IN_FLIGHT` (2)
   refresh workers may exist; new refreshes pause while both are stuck, and a refresh unanswered
   for 30s is abandoned so the same document can retry within that cap.
+- **herdr forwards terminal focus reporting** (verified live, herdr 0.9.3 on macOS): a pane app
+  that enables `?1004h` gets `CSI I` when its pane is focused and `CSI O` when the user leaves.
+  The viewer (`EnableFocusChange`) runs the same stamp check immediately on `FocusGained`
+  instead of waiting for the 2s tick; edit mode runs `poll_external`. `r` requests a refresh
+  that ignores the stamp (coarse mtimes and same-size rewrites can leave it unchanged) and
+  reports `reloaded` / `no changes`; it waits for a refresh already in flight rather than being
+  dropped, and `git show` answers `nothing to reload` because its output is immutable.
+
+- **Side-by-side diffs** (`v`, persisted as `diff_side_by_side`, default off):
+  `diffview::render_split` lays the same parsed, highlighted events out in two columns —
+  old left, new right, `│` between — pairing each run of deletions with the additions
+  that follow it (leftovers get an empty other side, no tint). It needs the pane width,
+  so a diff `Doc` keeps the parsed, ALREADY HIGHLIGHTED `diffview::StyledDiff`
+  (`Doc::diff`, built by `diffview::style` in `load_diff` on the load worker) and `relayout`
+  calls `render_split_styled` instead of `build_rows`; `rows_key` includes the layout so a
+  toggle or a resize rebuilds. Never keep the raw text and re-parse in `relayout`: that runs
+  syntect over the whole diff on the UI thread on every width change, so a resize drag over
+  a large diff stalled input (review finding on #110). Each column wraps on its own (`wrap::wrap_line` per side, continuations
+  get a blank gutter, the shorter side is padded with its tint), and `w` off clips each
+  column instead. Every row comes back exactly `width` wide with per-side tints on the
+  spans, so `build_rows`' full-width padding is not involved. Rows are tagged with the
+  unified line index they start at (one unified line per parsed event), which is what
+  lets `v` re-anchor via `pending_src` like `w`. Below `MIN_SPLIT_WIDTH` (60 columns)
+  the pane silently renders unified and the footer says `side by side (too narrow)`.
+  `git show` previews stay unified (they go through `ansi.rs`, not `diffview`).
 
 ### Long-line wrapping in the preview (`src/wrap.rs`)
 
@@ -1090,6 +1366,21 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
 - `glow` receives the actual preview-body width and the configured light/dark color mode. Its
   terminal-formatted output bypasses the generic text wrapper; first-load and resize mismatches
   schedule one background reload at the new width while preserving the reader's scroll offset.
+- `.html` / `.htm` render in-process through `html2text` (rich mode) at the same body width and
+  ride the same `glow_width` reload path. It only parses: scripts never run, nothing is fetched,
+  and `<script>` / `<style>` bodies are dropped. html2text marks a heading ONLY by its `#`
+  prefix (no annotation), so `html_line` styles a line that opens with one, except inside
+  `<pre>` / `<code>` where `# ` is usually a shell comment. Keep `unicode_strikeout(false)`:
+  the default combining U+0336 marks double up with the crossed-out style and land in copied
+  text. Link targets come out as numbered footnotes. A page with no visible text (built by
+  scripts) falls back to highlighted source, as does any line-target request. Unlike glow it
+  runs inside the viewer, so a panic in it would leave the `loading preview…` frame up (the
+  worker's channel just disconnects), the same exposure the in-process image decoder has.
+  html2text's layout cost grows with the SQUARE of element nesting (its size estimate is
+  recursive): a 1 MiB file of nested `<div>`s pinned a core for ~2 minutes in review, and a
+  load worker cannot be cancelled — every resize started another. Documents over 256 KiB, or
+  whose cheap tag pre-scan (`html_nesting_exceeds`) passes 1024 levels, show their source
+  instead; measured in release at those bounds: depth 1000 ≈ 3 ms, a 256 KiB table ≈ 70 ms.
 - Raster image previews are decoded in-process and rendered as true-color `▀` cells (foreground
   = upper pixel, background = lower pixel), so they work through herdr's terminal compositor
   without Kitty/Sixel passthrough. They preserve aspect ratio, center, and rebuild from the
@@ -1108,6 +1399,15 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   (`two_face::syntax::extra_newlines()`), themes still from syntect's `ThemeSet` (theme
   data is grammar-independent). Foreground colors only: the terminal owns the background.
   See `src/syntax.rs`; unknown extensions fall back to plain lines.
+- The ⚙ "Dark syntax" / "Light syntax" row (one row, labelled by the active background — the
+  mode lives in the LABEL because "Syntax theme  intellij (dark)" clipped in a 32-col pane)
+  picks among syntect's BUNDLED themes only (`state::SyntaxTheme`,
+  no `plist-load`), persisted by syntect name as `syntax_dark` / `syntax_light` in
+  `state.json`. It cycles the background the active color theme is drawn for, and each
+  background only offers themes drawn for it — a dark theme on white is the washed-out case.
+  A name saved under the wrong key is ignored on load. Only the viewer highlights, so the
+  choice reaches it like `color_theme`: `syntax::set_themes` at `--preview` startup and on
+  the viewer heartbeat; an open document keeps its colors until it reloads.
 
 ### Experimental in-pane editor (issue #22)
 
@@ -1139,7 +1439,10 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   under forced color; dropping only ESC exposes the hyperlink metadata as visible preview text.
 - Edit mode accepts terminal mouse input: click moves the caret, drag selects across logical and
   wrapped rows, and Shift+click extends the current selection. Coordinates account for the line
-  number gutter, tabs, wide Unicode cells, and the editor's wrapped-row scroll offset.
+  number gutter, tabs, wide Unicode cells, and the editor's wrapped-row scroll offset. Releasing a
+  drag that selected text copies it under the same `copy_on_select` rule as previews, but
+  SYNCHRONOUSLY on the event loop like the editor's Ctrl+C/X — routing it through the preview's
+  `ReleaseCopier` would let a queued release copy land after a later synchronous Ctrl+C.
 
 ### Verifying a plugin TUI end-to-end
 
@@ -1154,7 +1457,10 @@ unit tests can't. **Build the verification binary into its OWN target dir**
 with the running sidebar's Windows exe lock, so no rename-aside dance and the user's live
 panes keep running. Delete the dir afterwards. Run the TUI with `$env:HERDR_PANE_ID=''` so it skips identity-token
 reporting — otherwise the test pane registers as a real sidebar and the tab's launcher/
-ensure logic can fight over it.
+ensure logic can fight over it. Without a pane id the preview cannot close itself, so `q` /
+Esc do nothing: end a run with `pane close`, never by `pane run` into the same pane. The
+still-running TUI takes that text as keystrokes, and its first `e` opens the editor on the
+previewed file.
 
 **Mouse interactions ARE drivable** (verified live): `pane.send_input` text is fed to the
 TUI's stdin, and crossterm parses SGR mouse sequences from it like any terminal input.

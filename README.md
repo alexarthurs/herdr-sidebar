@@ -47,9 +47,11 @@ Use the mouse or press `1`, `2`, and `3`.
 - Click a file to reuse an ephemeral preview tab; double-click to pin it. Preview in the
   same tab with **Preview opens in: pane**, or opt into experimental `replace` mode:
   working panes move to a temporary tab while you preview; Esc / `q` brings them back.
-- Preview text, Markdown, images, and—when `ffmpeg` is available—video poster frames.
+- Preview text, Markdown, HTML (laid out as text; scripts never run), images, and—when
+  `ffmpeg` is available—video poster frames.
   Read-only previews support mouse selection and clipboard copy, including OSC 52 over SSH,
-  and reload on their own when the file changes on disk.
+  and reload on their own when the file changes on disk — immediately when you return to
+  them, or on demand with `r`.
 - Find files with `Ctrl+P`; search project contents with `Ctrl+F` or `Ctrl+Shift+F`.
   Search supports case, whole-word, regex, and include/exclude filters.
 - Stage files or folders from the tree without crossing nested-repository boundaries.
@@ -68,6 +70,8 @@ working panes back manually. Third-party TUIs are not yet verified with takeover
 </div>
 
 - Stage, unstage, discard, commit, inspect diffs, and sync with the upstream.
+- Read a diff unified or side by side: `v` in the diff toggles old-left / new-right
+  columns, and the choice sticks for later diffs.
 - Click the branch name—in the panel header, a repository row, or the Git footer—to
   switch branches, create one with **New branch…**, or track a remote branch.
   Deleting an unmerged branch requires a separate force-delete confirmation.
@@ -96,11 +100,45 @@ Settings persist across tabs and restarts. Configure:
 
 - Unified or separate Explorer and Source Control panes
 - Left/right docking and preferred width
+- Auto-hide in narrow tabs (off by default; see below)
 - Material/emoji icons and VS Code/light/terminal colors
+- Preview syntax theme from syntect's bundled set, kept separately for dark and light
+  color themes (dark: ocean, eighties, mocha, solarized; light: github, ocean, solarized)
 - Tab (default), split-pane, or temporary takeover previews and optional custom editor
 - Source Control list/tree view (shared across sidebars)
 - Hidden files, Git decorations, Git footer, and footer hotkeys
+- Letter shortcuts (on by default)
 - Auto-open, strict open/close toggle, focus-on-open, and live folder following
+- Confirm risky Git ops (off by default; see below)
+- Close emptied tabs (on by default; see below)
+
+Turn **Letter shortcuts** off to ignore unmodified or Shift-modified letters, numbers, and punctuation
+in the Explorer tree, Search results, and Source Control list. Text fields and open menus and
+prompts still accept typing. Navigation keys and existing modifier shortcuts still work.
+Press `F8` or click the gear in any sidebar view to open Settings and turn the shortcuts back on.
+
+**Confirm risky Git ops** asks y/N before Git actions that rewrite history or touch the
+remote: Sync (from `S`, the sync buttons, a repository row, the Git footer in any view, or
+the commit button when it reads Sync), and the history menus' Checkout, Merge, Cherry-Pick,
+Revert, and Pop Stash. Fetch, Apply Stash, Stash, and the branch picker never ask. Discard,
+reset, and deleting a branch, tag, stash, or worktree always ask, whatever the setting.
+
+**Close emptied tabs** closes a tab once only the sidebar is left in it: exit the last shell
+with `Ctrl+D`, or close the last other pane, and the tab goes away as it would without the
+plugin. The sidebar saves any unfinished commit message first; if it cannot, it stays open
+and shows why. Tabs that still hold a preview or editor are kept. Turn it off to keep a
+sidebar-only tab.
+
+**Auto-hide below** hides the sidebar while the tab is at most that many columns wide
+(64–200, or off), like herdr's own `ui.mobile_width_threshold`. The width is the tab area,
+which excludes herdr's own sidebar. Once the tab is wider than the setting again, the
+sidebar comes back at the next pane, tab or workspace focus. A sidebar you hid with `b`
+stays hidden, and one you open yourself in a narrow tab stays open until the tab has been
+wide again. With separate panes, only Explorer auto-hides.
+
+When multiple Herdr clients display different tabs, sidebar folder following and
+automatic refresh use the session's focused tab. A second client's tab catches
+up on its next focus event.
 
 The sidebar follows a neighbouring pane's working directory by default. A manually chosen
 folder stays put until that pane changes directory again.
@@ -117,13 +155,16 @@ folder stays put until that pane changes directory again.
 | `.` | hidden files | `o` | open diff |
 | `r` | refresh | `r` | refresh |
 | `m` | context menu | `m` | context menu |
-| `s` | settings | `s` | settings |
+| `t` | open folder in new tab | `t` | tree / list |
+| `F8` / `s` | settings | `F8` / `s` | settings |
 | `b` | hide | `b` | hide |
 | `1` / `2` / `3` | change view | `1` / `2` / `3` | change view |
 
 Preview: drag to select (releasing copies, following herdr's `copy_on_select`),
 `Ctrl/Cmd+C` to copy, arrows/PageUp/PageDown or
-Space/`b` to scroll, `w` to toggle wrapping, and `q` or Esc to close.
+Space/`b` to scroll, `w` to toggle wrapping, `r` to reload, `v` to switch a diff
+between unified and side-by-side, and `q` or Esc to close. Releasing a drag in edit
+mode (`e`) copies the same way.
 
 Host keybindings can invoke the direct `show-explorer`, `show-search`, `show-git`, and
 `quick-open` actions. For example, bind `cmd+p` to:

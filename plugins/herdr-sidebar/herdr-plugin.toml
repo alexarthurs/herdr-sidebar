@@ -18,7 +18,7 @@
 
 id = "herdr-sidebar"
 name = "herdr-sidebar"
-version = "0.15.1"
+version = "0.16.0"
 description = "VS Code-style sidebar: file explorer + source control (with ✧ AI commit messages) in one herdr pane."
 min_herdr_version = "0.8.0"
 platforms = ["linux", "macos", "windows"]
@@ -242,3 +242,40 @@ command = ["./target/release/herdr-sidebar", "--ensure"]
 on = "tab.focused"
 platforms = ["windows"]
 command = [".\\target\\release\\herdr-sidebar-ensure.exe"]
+
+# Update a moved sidebar's tab membership on demand.
+[[events]]
+on = "pane.moved"
+platforms = ["linux", "macos"]
+command = ["./target/release/herdr-sidebar", "--ensure"]
+
+[[events]]
+on = "pane.moved"
+platforms = ["windows"]
+command = [".\\target\\release\\herdr-sidebar-ensure.exe"]
+
+# Close a tab left holding only sidebars once its last other pane goes away
+# (issue #108), the way herdr closes a tab whose last pane exits. A shell
+# exit (Ctrl+D) emits pane.exited; a herdr close emits pane.closed. Both
+# hooks wait for the launcher lock. Reap uses the exiting pane's tab context
+# or the closed pane's event workspace. Running sidebars get Ctrl+Q so drafts
+# are saved. The "Close emptied tabs" setting turns reap off.
+[[events]]
+on = "pane.exited"
+platforms = ["linux", "macos"]
+command = ["./target/release/herdr-sidebar", "--reap"]
+
+[[events]]
+on = "pane.exited"
+platforms = ["windows"]
+command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--reap"]
+
+[[events]]
+on = "pane.closed"
+platforms = ["linux", "macos"]
+command = ["./target/release/herdr-sidebar", "--reap"]
+
+[[events]]
+on = "pane.closed"
+platforms = ["windows"]
+command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--reap"]

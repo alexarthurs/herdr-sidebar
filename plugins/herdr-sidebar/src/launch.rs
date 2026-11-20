@@ -42,21 +42,34 @@ struct PaneListResult {
 }
 
 #[derive(Deserialize)]
-struct Pane {
-    pane_id: Option<String>,
+pub(crate) struct Pane {
+    pub(crate) pane_id: Option<String>,
+    pub(crate) terminal_id: Option<String>,
     label: Option<String>,
     cwd: Option<String>,
     /// Live cwd of the foreground process. Unlike `cwd`, this changes after
     /// a shell `cd` or when an agent switches projects.
-    foreground_cwd: Option<String>,
+    #[serde(default, deserialize_with = "present_cwd")]
+    foreground_cwd: Option<Option<String>>,
     #[serde(default)]
-    focused: bool,
-    tab_id: Option<String>,
-    workspace_id: Option<String>,
+    pub(crate) focused: bool,
+    pub(crate) tab_id: Option<String>,
+    pub(crate) workspace_id: Option<String>,
     /// Metadata tokens reported via `pane.report_metadata`; shape of the
     /// values is host-defined, only key presence matters here.
     #[serde(default)]
     tokens: serde_json::Map<String, serde_json::Value>,
+}
+
+fn present_cwd<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+pub(crate) fn parse_panes(json: &str) -> Option<Vec<Pane>> {
+    let msg: PaneListMsg = serde_json::from_str(strip_bom(json)).ok()?;
+    Some(msg.result.panes)
 }
 
 /// A non-sidebar pane in the same tab whose live cwd can be followed.
@@ -65,6 +78,107 @@ struct SiblingCwd {
     pane_id: String,
     cwd: String,
     focused: bool,
+}
+
+/// How often a sidebar polls `pane.list` for its sibling's live cwd while its
+/// tab is on screen. herdr reports a `cd` within milliseconds, so this bounds
+/// how long the tree lags behind the terminal; the 5 s heartbeat felt stuck.
+pub const FOLLOW_CWD_EVERY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Hosts without a usable focus marker keep the historical idle cadence.
+pub const FOLLOW_CWD_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Samples `pane.list` for cwd following on a worker thread: at the focused
+/// cadence that is ~3 socket round trips a second, and each can wait out the
+/// 5 s IPC timeout on a busy server, so it must never run on the UI loop.
+///
+/// A sample is handed to the [`CwdFollower`] only once two consecutive samples
+/// agree. Fast sampling otherwise catches transient `foreground_cwd` values
+/// (a tool that briefly runs elsewhere), and each one would re-root the view
+/// and release a manual folder choice that 5 s sampling used to miss.
+#[derive(Debug)]
+pub(crate) struct FollowPoller<T> {
+    inflight: Option<std::sync::mpsc::Receiver<Option<T>>>,
+    last_start: Option<std::time::Instant>,
+    last_sample: Option<Vec<SiblingCwd>>,
+}
+
+impl<T> Default for FollowPoller<T> {
+    fn default() -> Self {
+        Self {
+            inflight: None,
+            last_start: None,
+            last_sample: None,
+        }
+    }
+}
+
+impl<T: Send + 'static> FollowPoller<T> {
+    /// Start a background sample when one is due and none is running.
+    pub fn maybe_start(
+        &mut self,
+        now: std::time::Instant,
+        every: std::time::Duration,
+        fetch: impl FnOnce() -> Option<T> + Send + 'static,
+    ) -> bool {
+        if self.inflight.is_some()
+            || self
+                .last_start
+                .is_some_and(|started| now.saturating_duration_since(started) < every)
+        {
+            return false;
+        }
+        self.last_start = Some(now);
+        let (tx, rx) = std::sync::mpsc::channel();
+        if std::thread::Builder::new()
+            .name("cwd-follow".into())
+            .spawn(move || {
+                let _ = tx.send(fetch());
+            })
+            .is_ok()
+        {
+            self.inflight = Some(rx);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A finished sample, without blocking: `Some(None)` is a failed one.
+    pub fn take(&mut self) -> Option<Option<T>> {
+        let rx = self.inflight.as_ref()?;
+        let sample = match rx.try_recv() {
+            Ok(sample) => sample.filter(|_| self.last_start.is_some()),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.inflight = None;
+        Some(sample)
+    }
+
+    /// Discard any old sample and make the next request due immediately.
+    pub(crate) fn reset(&mut self) {
+        self.last_start = None;
+        self.break_confirmation();
+    }
+
+    pub(crate) fn break_confirmation(&mut self) {
+        self.last_sample = None;
+    }
+
+    /// Ask the follower where to go once the previous sample agrees.
+    pub(crate) fn accept(
+        &mut self,
+        panes: &[Pane],
+        my_pane_id: &str,
+        follower: &mut CwdFollower,
+    ) -> Option<String> {
+        let sample = sibling_cwds(panes, my_pane_id);
+        let confirmed = self.last_sample.as_ref() == Some(&sample);
+        let target = confirmed.then(|| follower.next_from(&sample)).flatten();
+        self.last_sample = Some(sample);
+        target
+    }
 }
 
 /// Process-local state shared by the Explorer and Source Control views.
@@ -95,7 +209,11 @@ impl CwdFollower {
     /// Return the next live cwd to follow, if this sample changes the chosen
     /// root according to the deterministic/manual-precedence rules above.
     pub fn next_cwd(&mut self, pane_list_json: &str, my_pane_id: &str) -> Option<String> {
-        let siblings = sibling_cwds(pane_list_json, my_pane_id);
+        let panes = parse_panes(pane_list_json)?;
+        self.next_from(&sibling_cwds(&panes, my_pane_id))
+    }
+
+    fn next_from(&mut self, siblings: &[SiblingCwd]) -> Option<String> {
         let next_seen = siblings
             .iter()
             .map(|s| (s.pane_id.clone(), s.cwd.clone()))
@@ -375,6 +493,81 @@ pub fn pane_is_starting(pane_list_json: &str, pane_id: &str) -> bool {
         .is_some_and(|p| p.tokens.contains_key(STARTING_TOKEN))
 }
 
+/// How the reap (`ensure::Mode::Reap`) closes one sidebar of a lonely tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReapClose {
+    /// A live TUI: Ctrl+Q, so it saves its drafts and closes its own pane.
+    Graceful,
+    /// No TUI state can exist (a label-only server-resume corpse):
+    /// `pane.close` directly, since nothing would answer Ctrl+Q.
+    Direct,
+}
+
+/// A tab whose remaining panes are all sidebars.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LonelyTab {
+    pub tab: String,
+    pub panes: Vec<(String, ReapClose)>,
+}
+
+/// Tabs left holding nothing but sidebar panes (issue #108: the user's last
+/// shell exited and the sidebar filled the tab). A sidebar is a pane with an
+/// Explorer / Source Control token, or one of our labels without one (a
+/// server-resume corpse). Anything else in the tab — a shell, an agent, a
+/// preview / editor viewer (which may hold unsaved edits), an unidentifiable
+/// pane — keeps the whole tab. Unparsable input yields nothing.
+pub fn lonely_sidebar_tabs(pane_list_json: &str) -> Vec<LonelyTab> {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return Vec::new();
+    };
+    // `None` = a pane that is not ours (or not safely addressable).
+    let mut tabs = BTreeMap::<String, Option<Vec<(String, ReapClose)>>>::new();
+    for pane in &msg.result.panes {
+        let Some(tab) = pane.tab_id.as_deref() else {
+            continue;
+        };
+        let entry = tabs
+            .entry(tab.to_string())
+            .or_insert_with(|| Some(Vec::new()));
+        match (pane.reap_close(), pane.pane_id.as_deref()) {
+            (Some(how), Some(id)) if is_flag_safe(id) => {
+                if let Some(sidebars) = entry {
+                    sidebars.push((id.to_string(), how));
+                }
+            }
+            _ => *entry = None,
+        }
+    }
+    tabs.into_iter()
+        .filter_map(|(tab, panes)| {
+            let panes = panes.filter(|panes| !panes.is_empty())?;
+            Some(LonelyTab { tab, panes })
+        })
+        .collect()
+}
+
+impl Pane {
+    /// `Some` when this pane is one of our sidebars, saying how to close it.
+    fn reap_close(&self) -> Option<ReapClose> {
+        // A cleared token is reported as null. A starting token can survive
+        // a failed metadata report after the TUI has started accepting input.
+        let has = |key: &str| self.tokens.get(key).is_some_and(|value| !value.is_null());
+        let viewer =
+            has(PREVIEW_METADATA_SOURCE) || self.label.as_deref().is_some_and(is_preview_label);
+        if viewer {
+            return None;
+        }
+        if has(STARTING_TOKEN) || has(METADATA_SOURCE) || has(SC_METADATA_SOURCE) {
+            return Some(ReapClose::Graceful);
+        }
+        let ours = matches!(
+            self.label.as_deref(),
+            Some(PANE_LABEL | SIDEBAR_LABEL | SC_PANE_LABEL)
+        );
+        (ours && self.tokens.values().all(serde_json::Value::is_null)).then_some(ReapClose::Direct)
+    }
+}
+
 /// `<pane_id>\t<cwd>` of the focused pane, or empty on any failure. The cwd
 /// keeps its spaces (hence the tab separator) but loses any `\\?\` verbatim
 /// prefix.
@@ -396,9 +589,10 @@ fn pane_spawn_target(pane: &Pane) -> String {
     };
     let cwd = pane
         .foreground_cwd
-        .as_deref()
+        .as_ref()
+        .and_then(|cwd| cwd.as_deref())
         .or(pane.cwd.as_deref())
-        .map(strip_verbatim)
+        .map(normalize_cwd)
         .unwrap_or_default();
     format!("{id}\t{cwd}")
 }
@@ -412,13 +606,10 @@ pub(crate) fn is_preview_label(label: &str) -> bool {
 }
 
 /// Eligible panes in our tab, sorted by pane id so the fallback is stable.
-/// `foreground_cwd` is deliberately required: falling back to `cwd` would
-/// resurrect a stale spawn directory when the host has no live cwd signal.
-fn sibling_cwds(pane_list_json: &str, my_pane_id: &str) -> Vec<SiblingCwd> {
-    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
-        return Vec::new();
-    };
-    let panes = &msg.result.panes;
+/// Only a host that omits the foreground field session-wide can fall back to
+/// its reported shell cwd.
+fn sibling_cwds(panes: &[Pane], my_pane_id: &str) -> Vec<SiblingCwd> {
+    let has_foreground_cwd = panes.iter().any(|p| p.foreground_cwd.is_some());
     let Some(me) = panes
         .iter()
         .find(|p| p.pane_id.as_deref() == Some(my_pane_id))
@@ -438,10 +629,15 @@ fn sibling_cwds(pane_list_json: &str, my_pane_id: &str) -> Vec<SiblingCwd> {
         })
         .filter_map(|p| {
             let pane_id = p.pane_id.as_deref().filter(|id| is_flag_safe(id))?;
-            let cwd = p.foreground_cwd.as_deref().map(strip_verbatim)?;
+            let cwd = if has_foreground_cwd {
+                p.foreground_cwd.as_ref()?.as_deref()?
+            } else {
+                p.cwd.as_deref()?
+            };
+            let cwd = normalize_cwd(cwd);
             (!cwd.is_empty()).then(|| SiblingCwd {
                 pane_id: pane_id.to_string(),
-                cwd: cwd.to_string(),
+                cwd: cwd.into_owned(),
                 focused: p.focused,
             })
         })
@@ -708,6 +904,17 @@ pub fn tab_of(pane_list_json: &str, pane_id: &str) -> String {
         .unwrap_or_default()
 }
 
+/// How many panes live in `tab_id` (0 when unknown or unparsable).
+pub fn tab_pane_count(pane_list_json: &str, tab_id: &str) -> usize {
+    serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)).map_or(0, |msg| {
+        msg.result
+            .panes
+            .iter()
+            .filter(|p| p.tab_id.as_deref() == Some(tab_id))
+            .count()
+    })
+}
+
 /// Any pane living in `tab_id` ("" when the tab is empty or unknown). The
 /// preview flow needs one because herdr 0.9 moves the VIEWING client only on
 /// `pane.focus`; `tab.focus` updates the session-wide record and nothing else.
@@ -768,8 +975,11 @@ pub fn workspace_of(pane_list_json: &str, pane_id: &str) -> String {
 
 /// All tab ids present in a `pane list` JSON — the live-tab set the snooze
 /// cleanup checks markers against.
-pub fn live_tabs(pane_list_json: &str) -> std::collections::BTreeSet<String> {
+/// Every tab id in a `pane.list` reply, or `None` when it is not a successful
+/// reply — an error has no tabs, which is not the same as "no live tabs".
+pub fn live_tabs(pane_list_json: &str) -> Option<std::collections::BTreeSet<String>> {
     serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json))
+        .ok()
         .map(|msg| {
             msg.result
                 .panes
@@ -777,7 +987,6 @@ pub fn live_tabs(pane_list_json: &str) -> std::collections::BTreeSet<String> {
                 .filter_map(|p| p.tab_id)
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// The created pane's id from a `pane.split` response
@@ -876,6 +1085,14 @@ pub struct RepairStep {
 /// same-tab moves) grows the sidebar to full height. `None` when already full
 /// height or the layout doesn't match. Called in a loop: each step removes one
 /// pane from under the sidebar.
+///
+/// A step is taken only when `below` spans exactly the sidebar plus `beside`,
+/// i.e. it is the lower half of the very pane the sidebar was split from, so
+/// the move keeps the user's structure. Under a "1 top + N bottom" layout the
+/// panes below the sidebar belong to a separate row: moving them one by one
+/// restacked that row into a column under the top pane, and closing the
+/// sidebar cannot move them back (issue #114). Those layouts keep a
+/// partial-height sidebar instead.
 pub fn repair_step(layout_json: &str, pane_id: &str, dock_right: bool) -> Option<RepairStep> {
     let msg = serde_json::from_str::<LayoutMsg>(strip_bom(layout_json)).ok()?;
     let layout = &msg.result.layout;
@@ -890,21 +1107,30 @@ pub fn repair_step(layout_json: &str, pane_id: &str, dock_right: bool) -> Option
     if me.height >= area.height {
         return None;
     }
-    let find = |pred: &dyn Fn(&Rect) -> bool| -> Option<String> {
+    let find = |pred: &dyn Fn(&Rect) -> bool| -> Option<(String, &Rect)> {
         layout
             .panes
             .iter()
             .filter(|p| p.pane_id.as_deref() != Some(pane_id))
             .filter_map(|p| Some((p.pane_id.as_deref()?, p.rect.as_ref()?)))
             .find(|(id, rect)| is_flag_safe(id) && pred(rect))
-            .map(|(id, _)| id.to_string())
+            .map(|(id, rect)| (id.to_string(), rect))
     };
-    let below = find(&|r: &Rect| r.y == me.y + me.height && r.x <= me.x && me.x < r.x + r.width)?;
-    let beside = if dock_right {
+    let (below, below_rect) =
+        find(&|r: &Rect| r.y == me.y + me.height && r.x <= me.x && me.x < r.x + r.width)?;
+    let (beside, beside_rect) = if dock_right {
         find(&|r: &Rect| r.x + r.width == me.x && r.y == me.y)?
     } else {
         find(&|r: &Rect| r.x == me.x + me.width && r.y == me.y)?
     };
+    let (left, right) = if dock_right {
+        (beside_rect.x, me.x + me.width)
+    } else {
+        (me.x, beside_rect.x + beside_rect.width)
+    };
+    if below_rect.x != left || below_rect.x + below_rect.width != right {
+        return None;
+    }
     Some(RepairStep {
         below,
         beside,
@@ -1025,7 +1251,7 @@ fn resize_plan_inner(
 
 /// True when the id can be passed as a positional argument to the herdr CLI
 /// without any risk of being parsed as a flag.
-fn is_flag_safe(id: &str) -> bool {
+pub(crate) fn is_flag_safe(id: &str) -> bool {
     !id.is_empty()
         && !id.starts_with('-')
         && id
@@ -1033,8 +1259,12 @@ fn is_flag_safe(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '_' | '-'))
 }
 
-fn strip_verbatim(path: &str) -> &str {
-    path.strip_prefix(r"\\?\").unwrap_or(path)
+fn normalize_cwd(path: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}").into()
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(path).into()
+    }
 }
 
 #[cfg(test)]
@@ -1216,7 +1446,7 @@ mod tests {
     }
 
     #[test]
-    fn cwd_follower_uses_only_live_foreground_cwd() {
+    fn cwd_follower_requires_a_live_cwd_when_the_host_emits_the_field() {
         let mut follower = CwdFollower::default();
         let live = pane_list(
             r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar","tokens":{"herdr-sidebar-explorer":"1"}},
@@ -1230,9 +1460,38 @@ mod tests {
         follower.reset();
         let stale_only = pane_list(
             r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"},
-               {"pane_id":"w1:p1","tab_id":"w1:t1","cwd":"/stale/spawn"}"#,
+               {"pane_id":"w1:p1","tab_id":"w1:t1","cwd":"/stale/spawn"},
+               {"pane_id":"w2:p2","tab_id":"w2:t1","foreground_cwd":null}"#,
         );
         assert_eq!(follower.next_cwd(&stale_only, "w1:p3"), None);
+    }
+
+    #[test]
+    fn cwd_follower_uses_shell_cwd_when_the_host_omits_foreground_cwd() {
+        let mut follower = CwdFollower::default();
+        let at = |cwd: &str| {
+            pane_list(&format!(
+                r#"{{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"}},
+                   {{"pane_id":"w1:p1","tab_id":"w1:t1","cwd":{},"focused":true}}"#,
+                serde_json::json!(cwd),
+            ))
+        };
+        for (reported, expected) in [
+            (r"C:\project", r"C:\project"),
+            (
+                r"\\wsl.localhost\Ubuntu\repo",
+                r"\\wsl.localhost\Ubuntu\repo",
+            ),
+            (
+                r"\\?\UNC\wsl.localhost\Ubuntu\other",
+                r"\\wsl.localhost\Ubuntu\other",
+            ),
+        ] {
+            assert_eq!(
+                follower.next_cwd(&at(reported), "w1:p3").as_deref(),
+                Some(expected)
+            );
+        }
     }
 
     #[test]
@@ -1306,6 +1565,92 @@ mod tests {
                {"pane_id":"w1:p4","tab_id":"w1:t2","foreground_cwd":"/other"}"#,
         );
         assert_eq!(CwdFollower::default().next_cwd(&json, "w1:p3"), None);
+    }
+
+    #[test]
+    fn the_poller_follows_a_cd_only_once_two_samples_agree() {
+        let at = |cwd: &str| {
+            parse_panes(&pane_list(&format!(
+                r#"{{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"}},
+                   {{"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"{cwd}","focused":true}}"#
+            )))
+            .unwrap()
+        };
+        let mut follower = CwdFollower::default();
+        let mut poll = FollowPoller::<String>::default();
+        assert_eq!(poll.accept(&at("/one"), "w1:p3", &mut follower), None);
+        assert_eq!(
+            poll.accept(&at("/one"), "w1:p3", &mut follower).as_deref(),
+            Some("/one")
+        );
+        // A one-sample excursion is ignored, and so cannot release a manual
+        // folder choice either.
+        follower.mark_manual_folder();
+        assert_eq!(poll.accept(&at("/tmp/x"), "w1:p3", &mut follower), None);
+        assert_eq!(poll.accept(&at("/one"), "w1:p3", &mut follower), None);
+        assert_eq!(poll.accept(&at("/one"), "w1:p3", &mut follower), None);
+        // A real cd lands on the second sample.
+        assert_eq!(poll.accept(&at("/two"), "w1:p3", &mut follower), None);
+        assert_eq!(
+            poll.accept(&at("/two"), "w1:p3", &mut follower).as_deref(),
+            Some("/two")
+        );
+    }
+
+    #[test]
+    fn the_poller_discards_an_inflight_sample_on_visibility_transition() {
+        let now = std::time::Instant::now();
+        let mut poll = FollowPoller::<String>::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        poll.inflight = Some(rx);
+        poll.last_start = Some(now);
+        poll.reset();
+        poll.maybe_start(now, FOLLOW_CWD_EVERY, || panic!("still single-flight"));
+        tx.send(Some("stale".into())).unwrap();
+        assert_eq!(poll.take(), Some(None));
+        poll.maybe_start(now, FOLLOW_CWD_EVERY, || Some("fresh".into()));
+        assert_eq!(poll.last_start, Some(now));
+    }
+
+    #[test]
+    fn the_poller_samples_off_thread_at_the_tabs_cadence() {
+        let unfocused = pane_list(
+            r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"},
+               {"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"/one"},
+               {"pane_id":"w1:p4","tab_id":"w1:t2","focused":true}"#,
+        );
+        let mut poll = FollowPoller::<String>::default();
+        let now = std::time::Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let json = unfocused.clone();
+        poll.maybe_start(now, FOLLOW_CWD_IDLE, move || {
+            rx.recv().ok()?;
+            Some(json)
+        });
+        // Still running: no result, and no second sample is started.
+        assert_eq!(poll.take(), None);
+        let first = poll.last_start;
+        poll.maybe_start(now + FOLLOW_CWD_IDLE, FOLLOW_CWD_IDLE, || None);
+        assert_eq!(poll.last_start, first, "a sample is already in flight");
+        tx.send(()).unwrap();
+        let sample = loop {
+            if let Some(sample) = poll.take() {
+                break sample;
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(sample.as_deref(), Some(unfocused.as_str()));
+        // A background tab keeps the 5 s cadence.
+        poll.maybe_start(now + FOLLOW_CWD_EVERY, FOLLOW_CWD_IDLE, || None);
+        assert!(poll.inflight.is_none(), "a background tab is not due yet");
+        poll.maybe_start(now + FOLLOW_CWD_IDLE, FOLLOW_CWD_IDLE, || None);
+        let failed = loop {
+            if let Some(sample) = poll.take() {
+                break sample;
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(failed, None);
     }
 
     const FOCUSED: &str =
@@ -1502,12 +1847,16 @@ mod tests {
         assert_eq!(focused_tab(&json), "w1:t1");
         assert_eq!(focused_workspace(&json), "w1");
         assert_eq!(
-            live_tabs(&json).into_iter().collect::<Vec<_>>(),
+            live_tabs(&json).unwrap().into_iter().collect::<Vec<_>>(),
             vec!["w1:t1".to_string(), "w1:t2".to_string()]
         );
         assert_eq!(focused_tab("not json"), "");
         assert_eq!(focused_workspace("not json"), "");
-        assert!(live_tabs("not json").is_empty());
+        assert_eq!(live_tabs("not json"), None);
+        assert_eq!(
+            live_tabs(r#"{"error":{"code":"timeout","message":"busy"}}"#),
+            None
+        );
     }
 
     #[test]
@@ -1582,6 +1931,37 @@ mod tests {
         assert!(repair_step(&full, "e", false).is_none());
         assert!(repair_step(&full, "missing", false).is_none());
         assert!(repair_step("not json", "e", false).is_none());
+    }
+
+    #[test]
+    fn repair_step_leaves_a_separate_bottom_row_alone() {
+        // Issue #114: one full-width top pane over three bottom panes. The
+        // sidebar split the top pane; the bottom row is not part of that
+        // pane, so moving its panes would restack the row into a column.
+        let left = layout_with_area(
+            r#"{"pane_id":"e","rect":{"x":0,"y":0,"width":32,"height":25}},
+               {"pane_id":"top","rect":{"x":32,"y":0,"width":148,"height":25}},
+               {"pane_id":"b1","rect":{"x":0,"y":25,"width":60,"height":25}},
+               {"pane_id":"b2","rect":{"x":60,"y":25,"width":60,"height":25}},
+               {"pane_id":"b3","rect":{"x":120,"y":25,"width":60,"height":25}}"#,
+        );
+        assert!(repair_step(&left, "e", false).is_none());
+        let right = layout_with_area(
+            r#"{"pane_id":"top","rect":{"x":0,"y":0,"width":148,"height":25}},
+               {"pane_id":"e","rect":{"x":148,"y":0,"width":32,"height":25}},
+               {"pane_id":"b1","rect":{"x":0,"y":25,"width":60,"height":25}},
+               {"pane_id":"b2","rect":{"x":60,"y":25,"width":60,"height":25}},
+               {"pane_id":"b3","rect":{"x":120,"y":25,"width":60,"height":25}}"#,
+        );
+        assert!(repair_step(&right, "e", true).is_none());
+        // A single bottom pane wider than the split pane is a separate row too.
+        let wide = layout_with_area(
+            r#"{"pane_id":"e","rect":{"x":0,"y":0,"width":32,"height":25}},
+               {"pane_id":"p1","rect":{"x":32,"y":0,"width":58,"height":25}},
+               {"pane_id":"p4","rect":{"x":90,"y":0,"width":90,"height":25}},
+               {"pane_id":"p7","rect":{"x":0,"y":25,"width":180,"height":25}}"#,
+        );
+        assert!(repair_step(&wide, "e", false).is_none());
     }
 
     #[test]
@@ -1673,5 +2053,56 @@ mod tests {
         assert_eq!(open_plan(&layout(""), false, 32), "");
         let unsafe_id = layout(r#"{"pane_id":"--x","rect":{"x":0,"y":0,"width":90,"height":50}}"#);
         assert_eq!(open_plan(&unsafe_id, true, 32), "");
+    }
+
+    /// Issue #108: only tabs whose every pane is one of our sidebars are
+    /// reaped. A shell, an agent, a preview / editor viewer, or a pane we
+    /// cannot address keeps the tab, and each sidebar says how to close it.
+    #[test]
+    fn lonely_sidebar_tabs_are_exactly_the_tabs_holding_only_sidebars() {
+        let now = 1_000;
+        let live = now.to_string();
+        let stale = (now - HEARTBEAT_STALE_SECS - 1).to_string();
+        let json = format!(
+            r#"{{"result":{{"panes":[
+            {{"pane_id":"w1:p1","tab_id":"w1:mixed","label":"Sidebar","tokens":{{"herdr-sidebar-explorer":"{live}","herdr-sidebar-git":"{live}"}}}},
+            {{"pane_id":"w1:p2","tab_id":"w1:mixed","label":"shell","tokens":{{}}}},
+            {{"pane_id":"w1:p3","tab_id":"w1:alone","label":"Sidebar","tokens":{{"herdr-sidebar-explorer":"{live}","herdr-sidebar-git":"{live}"}}}},
+            {{"pane_id":"w1:p4","tab_id":"w1:preview","tokens":{{"herdr-sidebar-explorer":"{live}"}}}},
+            {{"pane_id":"w1:p5","tab_id":"w1:preview","label":"a.rs · preview","tokens":{{"herdr-sidebar-preview":"{live}"}}}},
+            {{"pane_id":"w1:p6","tab_id":"w1:resumed-preview","label":"Explorer"}},
+            {{"pane_id":"w1:p7","tab_id":"w1:resumed-preview","label":"a.rs · preview"}},
+            {{"pane_id":"w1:p8","tab_id":"w1:pair","label":"Explorer","tokens":{{"herdr-sidebar-explorer":"{live}","herdr-sidebar-git":null}}}},
+            {{"pane_id":"w1:p9","tab_id":"w1:pair","label":"Source Control","tokens":{{"herdr-sidebar-git":"{live}","herdr-sidebar-starting":null}}}},
+            {{"pane_id":"w1:pa","tab_id":"w1:young","tokens":{{"herdr-sidebar-git":"{live}","herdr-sidebar-starting":"1"}}}},
+            {{"pane_id":"w1:pb","tab_id":"w1:corpses","label":"Source Control"}},
+            {{"pane_id":"w1:pc","tab_id":"w1:corpses","tokens":{{"herdr-sidebar-explorer":"{stale}"}}}},
+            {{"pane_id":"w1:pd","tab_id":"w1:editor","tokens":{{"herdr-sidebar-explorer":"{live}"}}}},
+            {{"pane_id":"w1:pe","tab_id":"w1:editor","label":"notes.md · editor","tokens":{{"hs-editor-path":"abc"}}}},
+            {{"pane_id":"w1:pf","tab_id":"w1:custom-editor","tokens":{{"herdr-sidebar-explorer":"{live}"}}}},
+            {{"pane_id":"w1:pg","tab_id":"w1:custom-editor","label":"vim","tokens":{{"hs-editor-path":"abc"}}}},
+            {{"pane_id":"--x","tab_id":"w1:unsafe","tokens":{{"herdr-sidebar-explorer":"{live}"}}}},
+            {{"pane_id":"w1:ph","tab_id":"w1:unsafe","tokens":{{"herdr-sidebar-explorer":"{live}"}}}},
+            {{"pane_id":"w1:pi","label":"Sidebar"}},
+            {{"pane_id":"w1:pj","tab_id":"w1:foreign","label":"Sidebar","tokens":{{"foreign":"1"}}}}
+        ]}}}}"#
+        );
+        let lonely = lonely_sidebar_tabs(&json);
+        let tab = |id: &str, panes: &[(&str, ReapClose)]| LonelyTab {
+            tab: id.into(),
+            panes: panes.iter().map(|(p, how)| (p.to_string(), *how)).collect(),
+        };
+        use ReapClose::{Direct, Graceful};
+        assert_eq!(
+            lonely,
+            vec![
+                tab("w1:alone", &[("w1:p3", Graceful)]),
+                tab("w1:corpses", &[("w1:pb", Direct), ("w1:pc", Graceful)]),
+                tab("w1:pair", &[("w1:p8", Graceful), ("w1:p9", Graceful)]),
+                tab("w1:young", &[("w1:pa", Graceful)]),
+            ]
+        );
+        assert!(lonely_sidebar_tabs("not json").is_empty());
+        assert!(lonely_sidebar_tabs(r#"{"error":{"code":"x"}}"#).is_empty());
     }
 }

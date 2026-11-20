@@ -4,7 +4,9 @@
 //! build on Windows. Foreground colors only: the terminal keeps its own
 //! background, and unknown file types fall back to plain lines.
 
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -13,6 +15,8 @@ use syntect::highlighting::{FontStyle, Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
+use crate::state::SyntaxTheme;
+
 /// Lines longer than this skip highlighting entirely. syntect's `regex-fancy`
 /// backtracking engine is roughly quadratic in line length on pathological
 /// input (minified JS/CSS, generated data) — a single multi-hundred-KB line
@@ -20,32 +24,56 @@ use syntect::util::LinesWithEndings;
 const MAX_HIGHLIGHT_LINE_LEN: usize = 2000;
 
 /// Grammar + theme assets, loaded once (the bundled dumps take a few ms).
-/// BOTH themes are built up front: switching the color theme must not stall a
-/// render, and the dumps are small.
-fn assets() -> &'static (SyntaxSet, Theme, Theme) {
-    static ASSETS: OnceLock<(SyntaxSet, Theme, Theme)> = OnceLock::new();
+/// EVERY bundled theme is built up front: switching the color or syntax theme
+/// must not stall a render, and the dumps are small.
+fn assets() -> &'static (SyntaxSet, BTreeMap<String, Theme>) {
+    static ASSETS: OnceLock<(SyntaxSet, BTreeMap<String, Theme>)> = OnceLock::new();
     ASSETS.get_or_init(|| {
-        let syntaxes = two_face::syntax::extra_newlines();
-        let mut themes = ThemeSet::load_defaults();
-        let mut pick = |name: &str| {
-            themes
-                .themes
-                .remove(name)
-                .or_else(|| themes.themes.pop_first().map(|(_, t)| t))
-                .unwrap_or_default()
-        };
-        let dark = pick("base16-ocean.dark");
-        let light = pick("InspiredGitHub");
-        (syntaxes, dark, light)
+        (
+            two_face::syntax::extra_newlines(),
+            ThemeSet::load_defaults().themes,
+        )
     })
 }
 
-/// The grammar set plus the theme that suits the active color theme. syntect
-/// colors foregrounds only, so a dark grammar theme on a light terminal is
-/// exactly the washed-out case the light palette exists to fix.
+/// The configured theme per background, as `SyntaxTheme` discriminants. Like
+/// `ui::set_color_theme`, the viewer process sets these from `state.json` at
+/// startup and on its heartbeat.
+static DARK_THEME: AtomicU8 = AtomicU8::new(SyntaxTheme::OceanDark as u8);
+static LIGHT_THEME: AtomicU8 = AtomicU8::new(SyntaxTheme::InspiredGitHub as u8);
+
+pub fn set_themes(dark: SyntaxTheme, light: SyntaxTheme) {
+    DARK_THEME.store(dark as u8, Ordering::Relaxed);
+    LIGHT_THEME.store(light as u8, Ordering::Relaxed);
+}
+
+fn configured_theme(light: bool) -> SyntaxTheme {
+    let stored = if light { &LIGHT_THEME } else { &DARK_THEME }.load(Ordering::Relaxed);
+    SyntaxTheme::ALL
+        .into_iter()
+        .find(|theme| *theme as u8 == stored)
+        .unwrap_or(SyntaxTheme::default_for(light))
+}
+
+/// A bundled theme by choice, falling back to that mode's historical default
+/// (and then to any theme) should syntect ever rename one.
+fn theme_for(theme: SyntaxTheme) -> &'static Theme {
+    static FALLBACK: OnceLock<Theme> = OnceLock::new();
+    let (_, themes) = assets();
+    themes
+        .get(theme.syntect_name())
+        .or_else(|| themes.get(SyntaxTheme::default_for(theme.is_light()).syntect_name()))
+        .or_else(|| themes.values().next())
+        .unwrap_or_else(|| FALLBACK.get_or_init(Theme::default))
+}
+
+/// The grammar set plus the configured theme for the active color theme.
+/// syntect colors foregrounds only, so a dark grammar theme on a light
+/// terminal is exactly the washed-out case the light palette exists to fix —
+/// which is why each background keeps its own choice.
 fn syntaxes_and_theme() -> (&'static SyntaxSet, &'static Theme) {
-    let (syntaxes, dark, light) = assets();
-    (syntaxes, if crate::ui::is_light() { light } else { dark })
+    let (syntaxes, _) = assets();
+    (syntaxes, theme_for(configured_theme(crate::ui::is_light())))
 }
 
 /// Highlight `text` for a file called `name`, up to `max` lines. `None` when
@@ -207,5 +235,14 @@ name = \"x\"
         let spans = hl.line(long_line.trim_end_matches('\n'));
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, long_line.trim_end_matches('\n'));
+    }
+
+    #[test]
+    fn every_selectable_theme_is_bundled_with_syntect() {
+        let (_, themes) = assets();
+        for theme in SyntaxTheme::ALL {
+            assert!(themes.contains_key(theme.syntect_name()), "{theme:?}");
+            assert_eq!(theme_for(theme).name, themes[theme.syntect_name()].name);
+        }
     }
 }

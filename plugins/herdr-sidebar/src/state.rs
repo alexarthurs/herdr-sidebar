@@ -9,6 +9,10 @@
 //! - `follow_cwd`: follow the live cwd of the neighbouring pane.
 //! - `dock_right`: dock at the right edge instead of the default left edge.
 //! - `sidebar_width`: preferred sidebar width in terminal columns.
+//! - `auto_hide_below`: hide the sidebar while the tab is at most this many
+//!   columns wide (0 = off).
+//! - `close_lonely_tab`: close a tab once only sidebars are left in it.
+//! - `letter_hotkeys`: enable printable-key shortcuts in sidebar lists.
 //!
 //! Both views live in ONE binary; switching is an in-process re-render, and
 //! separated panes are the same binary pinned to a starting view with
@@ -25,8 +29,47 @@ pub const MIN_SIDEBAR_WIDTH: u16 = 24;
 pub const MAX_SIDEBAR_WIDTH: u16 = 80;
 pub const SIDEBAR_WIDTH_STEP: u16 = 4;
 
+/// ⚙ Settings label for `close_lonely_tab`, shared by both views' modals.
+/// Short enough to sit beside "off" in a default-width pane.
+pub const CLOSE_LONELY_TAB_LABEL: &str = "Close emptied tabs";
+pub const LETTER_HOTKEYS_LABEL: &str = "Letter shortcuts";
+
 pub fn clamp_sidebar_width(width: u16) -> u16 {
     width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH)
+}
+
+/// The auto-hide threshold starts at herdr's own `ui.mobile_width_threshold`
+/// default; 0 is off and sits one step below the minimum.
+pub const MIN_AUTO_HIDE_BELOW: u16 = 64;
+pub const MAX_AUTO_HIDE_BELOW: u16 = 200;
+pub const AUTO_HIDE_BELOW_STEP: u16 = 8;
+
+pub fn clamp_auto_hide_below(columns: u16) -> u16 {
+    if columns == 0 {
+        0
+    } else {
+        columns.clamp(MIN_AUTO_HIDE_BELOW, MAX_AUTO_HIDE_BELOW)
+    }
+}
+
+pub fn step_auto_hide_below(columns: u16, wider: bool) -> u16 {
+    let columns = clamp_auto_hide_below(columns);
+    match (columns, wider) {
+        (0, true) => MIN_AUTO_HIDE_BELOW,
+        (0, false) => 0,
+        (MIN_AUTO_HIDE_BELOW, false) => 0,
+        (_, true) => (columns + AUTO_HIDE_BELOW_STEP).min(MAX_AUTO_HIDE_BELOW),
+        (_, false) => columns
+            .saturating_sub(AUTO_HIDE_BELOW_STEP)
+            .max(MIN_AUTO_HIDE_BELOW),
+    }
+}
+
+pub fn auto_hide_below_label(columns: u16) -> String {
+    match clamp_auto_hide_below(columns) {
+        0 => "off".to_string(),
+        columns => format!("{columns} cols"),
+    }
 }
 
 pub fn step_sidebar_width(width: u16, wider: bool) -> u16 {
@@ -224,6 +267,96 @@ impl ColorTheme {
     }
 }
 
+/// The preview's syntax-highlighting theme: one of syntect's bundled themes
+/// (no extra dependencies). Dark and light color themes each keep their own
+/// choice, and each only cycles through the themes drawn for that background
+/// — syntect colors foregrounds only, so a dark theme on a light terminal is
+/// the washed-out case the light palette exists to avoid.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SyntaxTheme {
+    OceanDark,
+    EightiesDark,
+    MochaDark,
+    SolarizedDark,
+    InspiredGitHub,
+    OceanLight,
+    SolarizedLight,
+}
+
+impl SyntaxTheme {
+    pub const ALL: [Self; 7] = [
+        Self::OceanDark,
+        Self::EightiesDark,
+        Self::MochaDark,
+        Self::SolarizedDark,
+        Self::InspiredGitHub,
+        Self::OceanLight,
+        Self::SolarizedLight,
+    ];
+    const DARK: [Self; 4] = [
+        Self::OceanDark,
+        Self::EightiesDark,
+        Self::MochaDark,
+        Self::SolarizedDark,
+    ];
+    const LIGHT: [Self; 3] = [Self::InspiredGitHub, Self::OceanLight, Self::SolarizedLight];
+
+    /// The historical theme for each background.
+    pub fn default_for(light: bool) -> Self {
+        if light {
+            Self::InspiredGitHub
+        } else {
+            Self::OceanDark
+        }
+    }
+
+    /// The key in syntect's `ThemeSet::load_defaults()`; also the persisted
+    /// value, so `state.json` names a theme the user can look up.
+    pub fn syntect_name(self) -> &'static str {
+        match self {
+            Self::OceanDark => "base16-ocean.dark",
+            Self::EightiesDark => "base16-eighties.dark",
+            Self::MochaDark => "base16-mocha.dark",
+            Self::SolarizedDark => "Solarized (dark)",
+            Self::InspiredGitHub => "InspiredGitHub",
+            Self::OceanLight => "base16-ocean.light",
+            Self::SolarizedLight => "Solarized (light)",
+        }
+    }
+
+    /// Short Settings value; the row adds the mode.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OceanDark | Self::OceanLight => "ocean",
+            Self::EightiesDark => "eighties",
+            Self::MochaDark => "mocha",
+            Self::SolarizedDark | Self::SolarizedLight => "solarized",
+            Self::InspiredGitHub => "github",
+        }
+    }
+
+    pub fn is_light(self) -> bool {
+        Self::LIGHT.contains(&self)
+    }
+
+    /// The Settings row rotates through this theme's own mode only.
+    pub fn next(self) -> Self {
+        let themes: &[Self] = if self.is_light() {
+            &Self::LIGHT
+        } else {
+            &Self::DARK
+        };
+        let index = themes.iter().position(|t| *t == self).unwrap_or(0);
+        themes[(index + 1) % themes.len()]
+    }
+
+    /// A persisted name, accepted only for the mode it was saved under.
+    fn from_state_name(name: &str, light: bool) -> Option<Self> {
+        let themes: &[Self] = if light { &Self::LIGHT } else { &Self::DARK };
+        themes.iter().copied().find(|t| t.syntect_name() == name)
+    }
+}
+
 /// Where a preview, diff or `git show` opens. `Tab` gives every document its
 /// own herdr tab (VS Code editor-tab semantics, the historical default);
 /// `Pane` splits ONE viewer pane into the tab the sidebar already lives in
@@ -278,6 +411,7 @@ pub struct State {
     /// Show the hotkey chips at the bottom of the sidebar (they always
     /// live in the ⚙ Settings modal; the footer copy is opt-in).
     pub show_hotkeys: bool,
+    pub letter_hotkeys: bool,
     /// Show the compact branch + sync strip at the bottom while the current
     /// folder belongs to a Git repository.
     pub show_git_footer: bool,
@@ -288,6 +422,11 @@ pub struct State {
     /// Accent palette. Terminal mode uses ANSI colors that inherit the
     /// terminal profile; VS Code preserves the original fixed RGB palette.
     pub color_theme: ColorTheme,
+    /// Preview syntax theme while a dark color theme (`vscode`, `terminal`)
+    /// is active.
+    pub syntax_dark: SyntaxTheme,
+    /// Preview syntax theme while the `light` color theme is active.
+    pub syntax_light: SyntaxTheme,
     /// The first-run "install a Nerd Font?" prompt was answered (either
     /// way) — never show it again.
     pub font_prompt_done: bool,
@@ -317,6 +456,10 @@ pub struct State {
     /// column target in the normal range and yields proportionally when the
     /// tab becomes unusually narrow.
     pub sidebar_width: u16,
+    /// Hide the sidebar while the whole tab area is at most this many
+    /// columns wide; the quiet ensure hook docks it again once the tab is
+    /// wider. 0 = off.
+    pub auto_hide_below: u16,
     /// Whether a clicked file opens in its own tab or in a viewer pane beside
     /// the sidebar, inside the tab the click came from.
     pub preview_placement: PreviewPlacement,
@@ -325,6 +468,41 @@ pub struct State {
     pub custom_editor_on_click: bool,
     /// View mode in Source Control: true for hierarchical tree view, false for flat list view.
     pub scm_tree_view: bool,
+    /// Diff previews show old and new side by side instead of one unified
+    /// column (`v` in the preview toggles it).
+    pub diff_side_by_side: bool,
+    /// Ask y/N before Git actions that rewrite history or touch the remote
+    /// (Sync, merge, cherry-pick, revert, stash pop, drawer checkout). Off
+    /// keeps the historical one-click behavior (issue #118).
+    pub confirm_git_ops: bool,
+    /// Close a tab once its last non-sidebar pane exits or closes, as herdr
+    /// does for a tab whose last pane exits (issue #108). Off keeps the
+    /// sidebar-only tab.
+    pub close_lonely_tab: bool,
+}
+
+impl State {
+    /// Advance the syntax theme of the background the active color theme is
+    /// drawn for; the other background keeps its choice.
+    pub fn cycle_syntax_theme(&mut self) {
+        if self.color_theme.is_light() {
+            self.syntax_light = self.syntax_light.next();
+        } else {
+            self.syntax_dark = self.syntax_dark.next();
+        }
+    }
+
+    /// Settings row label and value for the active background's theme. The
+    /// background is named in the LABEL so it is clear the other one keeps
+    /// its own choice; the value stays short so the row fits the default
+    /// sidebar width without clipping.
+    pub fn syntax_theme_row(&self) -> (&'static str, String) {
+        if self.color_theme.is_light() {
+            ("Light syntax", self.syntax_light.label().to_string())
+        } else {
+            ("Dark syntax", self.syntax_dark.label().to_string())
+        }
+    }
 }
 
 impl Default for State {
@@ -334,9 +512,12 @@ impl Default for State {
             active: View::Explorer,
             search_active: false,
             show_hotkeys: false,
+            letter_hotkeys: true,
             show_git_footer: true,
             icons: None,
             color_theme: ColorTheme::VsCode,
+            syntax_dark: SyntaxTheme::default_for(false),
+            syntax_light: SyntaxTheme::default_for(true),
             font_prompt_done: false,
             auto_open: true,
             strict_toggle: false,
@@ -345,9 +526,13 @@ impl Default for State {
             git_deco: true,
             dock_right: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            auto_hide_below: 0,
             preview_placement: PreviewPlacement::Tab,
             custom_editor_on_click: false,
             scm_tree_view: false,
+            diff_side_by_side: false,
+            confirm_git_ops: false,
+            close_lonely_tab: true,
         }
     }
 }
@@ -513,11 +698,12 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"letter_hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"auto_hide_below\":{},\"colors\":\"{}\",\"syntax_dark\":\"{}\",\"syntax_light\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{},\"diff_side_by_side\":{},\"confirm_git_ops\":{},\"close_lonely_tab\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.search_active,
         state.show_hotkeys,
+        state.letter_hotkeys,
         state.show_git_footer,
         state.font_prompt_done,
         state.auto_open,
@@ -527,10 +713,16 @@ fn write_state(path: &Path, state: State) {
         state.git_deco,
         state.dock_right,
         clamp_sidebar_width(state.sidebar_width),
+        clamp_auto_hide_below(state.auto_hide_below),
         state.color_theme.label(),
+        state.syntax_dark.syntect_name(),
+        state.syntax_light.syntect_name(),
         state.preview_placement.label(),
         state.custom_editor_on_click,
-        state.scm_tree_view
+        state.scm_tree_view,
+        state.diff_side_by_side,
+        state.confirm_git_ops,
+        state.close_lonely_tab
     );
     let _ = std::fs::write(path, json);
 }
@@ -919,6 +1111,10 @@ pub fn parse_state(json: &str) -> State {
             .get("hotkeys")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.show_hotkeys),
+        letter_hotkeys: value
+            .get("letter_hotkeys")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.letter_hotkeys),
         show_git_footer: value
             .get("git_footer")
             .and_then(|v| v.as_bool())
@@ -932,6 +1128,16 @@ pub fn parse_state(json: &str) -> State {
             .and_then(|v| v.as_str())
             .and_then(ColorTheme::from_state_name)
             .unwrap_or(default.color_theme),
+        syntax_dark: value
+            .get("syntax_dark")
+            .and_then(|v| v.as_str())
+            .and_then(|name| SyntaxTheme::from_state_name(name, false))
+            .unwrap_or(default.syntax_dark),
+        syntax_light: value
+            .get("syntax_light")
+            .and_then(|v| v.as_str())
+            .and_then(|name| SyntaxTheme::from_state_name(name, true))
+            .unwrap_or(default.syntax_light),
         font_prompt_done: value
             .get("font_prompt")
             .and_then(|v| v.as_bool())
@@ -966,6 +1172,11 @@ pub fn parse_state(json: &str) -> State {
             .and_then(|v| u16::try_from(v).ok())
             .map(clamp_sidebar_width)
             .unwrap_or(default.sidebar_width),
+        auto_hide_below: value
+            .get("auto_hide_below")
+            .and_then(|v| v.as_u64())
+            .map(|v| clamp_auto_hide_below(u16::try_from(v).unwrap_or(u16::MAX)))
+            .unwrap_or(default.auto_hide_below),
         preview_placement: value
             .get("preview_placement")
             .and_then(|v| v.as_str())
@@ -979,6 +1190,18 @@ pub fn parse_state(json: &str) -> State {
             .get("scm_tree_view")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.scm_tree_view),
+        diff_side_by_side: value
+            .get("diff_side_by_side")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.diff_side_by_side),
+        confirm_git_ops: value
+            .get("confirm_git_ops")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.confirm_git_ops),
+        close_lonely_tab: value
+            .get("close_lonely_tab")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.close_lonely_tab),
     }
 }
 
@@ -1104,15 +1327,81 @@ mod tests {
     }
 
     #[test]
+    fn syntax_themes_cycle_within_their_mode_and_persist_by_name() {
+        for light in [false, true] {
+            let first = SyntaxTheme::default_for(light);
+            let mut theme = first;
+            let mut seen = Vec::new();
+            loop {
+                assert_eq!(theme.is_light(), light, "{theme:?} left its mode");
+                assert_eq!(
+                    SyntaxTheme::from_state_name(theme.syntect_name(), light),
+                    Some(theme)
+                );
+                seen.push(theme);
+                theme = theme.next();
+                if theme == first {
+                    break;
+                }
+            }
+            assert_eq!(seen.len(), if light { 3 } else { 4 });
+        }
+        // Files written before the setting existed keep the historical
+        // themes; a name saved under the other mode, or unknown, is ignored.
+        let legacy = parse_state("{\"merged\":true}");
+        assert_eq!(legacy.syntax_dark, SyntaxTheme::OceanDark);
+        assert_eq!(legacy.syntax_light, SyntaxTheme::InspiredGitHub);
+        let swapped = parse_state("{\"syntax_dark\":\"InspiredGitHub\",\"syntax_light\":\"nope\"}");
+        assert_eq!(swapped.syntax_dark, SyntaxTheme::OceanDark);
+        assert_eq!(swapped.syntax_light, SyntaxTheme::InspiredGitHub);
+    }
+
+    /// The Settings modal is no wider than the pane (32 columns by default):
+    /// the syntax row must be no longer than the existing "Updates" row, or
+    /// its value is clipped.
+    #[test]
+    fn syntax_theme_row_fits_the_settings_modal() {
+        let longest_existing = "Updates".len() + "local checkout".len();
+        assert!(CLOSE_LONELY_TAB_LABEL.len() + "off".len() <= longest_existing);
+        assert!(LETTER_HOTKEYS_LABEL.len() + "off".len() <= longest_existing);
+        for color_theme in [ColorTheme::VsCode, ColorTheme::Light, ColorTheme::Terminal] {
+            for theme in SyntaxTheme::ALL {
+                let state = State {
+                    color_theme,
+                    syntax_dark: if theme.is_light() {
+                        SyntaxTheme::OceanDark
+                    } else {
+                        theme
+                    },
+                    syntax_light: if theme.is_light() {
+                        theme
+                    } else {
+                        SyntaxTheme::InspiredGitHub
+                    },
+                    ..State::default()
+                };
+                let (label, value) = state.syntax_theme_row();
+                assert!(
+                    label.len() + value.len() <= longest_existing,
+                    "{label} {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn state_roundtrip_and_forgiving_parse() {
         let state = State {
             merged: true,
             active: View::SourceControl,
             search_active: true,
             show_hotkeys: true,
+            letter_hotkeys: false,
             show_git_footer: false,
             icons: Some(crate::icons::IconTheme::Emoji),
             color_theme: ColorTheme::Terminal,
+            syntax_dark: SyntaxTheme::MochaDark,
+            syntax_light: SyntaxTheme::SolarizedLight,
             font_prompt_done: true,
             auto_open: false,
             strict_toggle: true,
@@ -1121,12 +1410,27 @@ mod tests {
             git_deco: false,
             dock_right: true,
             sidebar_width: 44,
+            auto_hide_below: 96,
             preview_placement: PreviewPlacement::Pane,
             custom_editor_on_click: true,
             scm_tree_view: true,
+            diff_side_by_side: true,
+            confirm_git_ops: true,
+            close_lonely_tab: false,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"icons\":\"emoji\"}";
-        assert_eq!(parse_state(json), state);
+        let file = std::env::temp_dir().join(format!("hs-state-{}.json", std::process::id()));
+        write_state(&file, state);
+        let json = std::fs::read_to_string(&file).unwrap();
+        std::fs::remove_file(file).unwrap();
+        assert_eq!(parse_state(&json), state);
+        assert!(parse_state("{\"merged\":true}").letter_hotkeys);
+        // Files written before the setting existed close a tab left with
+        // only sidebars, like herdr closes a tab whose last pane exits.
+        assert!(parse_state("{\"merged\":true}").close_lonely_tab);
+        // Diffs stay unified unless the user switched them.
+        assert!(!parse_state("{\"merged\":true}").diff_side_by_side);
+        // Files written before the setting existed keep one-click Git actions.
+        assert!(!parse_state("{\"merged\":true}").confirm_git_ops);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
         // decorations on.
@@ -1166,6 +1470,15 @@ mod tests {
         assert_eq!(parse_state("{\"merged\":true}").sidebar_width, 32);
         assert_eq!(parse_state("{\"sidebar_width\":1}").sidebar_width, 24);
         assert_eq!(parse_state("{\"sidebar_width\":999}").sidebar_width, 80);
+        // Files written before auto-hide existed keep the sidebar in narrow
+        // tabs; out-of-range values clamp, 0 stays off.
+        assert_eq!(parse_state("{\"merged\":true}").auto_hide_below, 0);
+        assert_eq!(parse_state("{\"auto_hide_below\":0}").auto_hide_below, 0);
+        assert_eq!(parse_state("{\"auto_hide_below\":1}").auto_hide_below, 64);
+        assert_eq!(
+            parse_state("{\"auto_hide_below\":99999}").auto_hide_below,
+            200
+        );
         // Files written before the preview setting existed keep the
         // historical behavior: a tab per document.
         assert_eq!(
@@ -1205,6 +1518,19 @@ mod tests {
             PreviewPlacement::Replace
         );
         assert!(PreviewPlacement::Replace.is_inline());
+    }
+
+    #[test]
+    fn auto_hide_below_steps_between_off_and_the_supported_bounds() {
+        assert_eq!(step_auto_hide_below(0, true), 64);
+        assert_eq!(step_auto_hide_below(0, false), 0);
+        assert_eq!(step_auto_hide_below(64, false), 0);
+        assert_eq!(step_auto_hide_below(64, true), 72);
+        assert_eq!(step_auto_hide_below(80, false), 72);
+        assert_eq!(step_auto_hide_below(200, true), 200);
+        assert_eq!(step_auto_hide_below(u16::MAX, false), 192);
+        assert_eq!(auto_hide_below_label(0), "off");
+        assert_eq!(auto_hide_below_label(96), "96 cols");
     }
 
     #[test]

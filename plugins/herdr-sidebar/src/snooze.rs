@@ -3,11 +3,30 @@
 //! very next focus event would reopen what the user just closed. Toggle OPEN
 //! clears it. Markers for tabs that no longer exist are swept each ensure run
 //! (tab ids can be recycled).
+//!
+//! Markers live in one subdirectory per herdr session (issue #115): tab ids
+//! such as `w1:t1` repeat across sessions, so a shared directory let one
+//! session honor another's markers and its sweep delete them.
 
 use std::path::{Path, PathBuf};
 
 pub fn dir() -> PathBuf {
-    crate::rundir::dir("snooze")
+    let session = crate::ipc::socket_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    session_dir(&crate::rundir::dir("snooze"), &session)
+}
+
+fn session_dir(root: &Path, session: &str) -> PathBuf {
+    root.join(crate::viewer::document_token(session))
+}
+
+/// Create the per-session marker directory and its parent, both private.
+fn ensure_dir(dir: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dir.parent() {
+        crate::rundir::ensure_private(parent)?;
+    }
+    crate::rundir::ensure_private(dir)
 }
 
 fn legacy_dir() -> PathBuf {
@@ -17,11 +36,33 @@ fn legacy_dir() -> PathBuf {
 pub fn migrate_legacy(dir: &Path, live_tabs: &std::collections::BTreeSet<String>) {
     let legacy = legacy_dir();
     migrate_legacy_from(&legacy, dir, live_tabs);
+    if let Some(flat) = dir.parent() {
+        migrate_flat_from(flat, dir, live_tabs);
+    }
+}
+
+/// Markers from before per-session directories sat directly in the shared
+/// root. Adopt the ones naming a tab live in THIS session; the others may
+/// belong to another session, which adopts them on its own next run. The
+/// shared root itself is never swept.
+fn migrate_flat_from(flat: &Path, dir: &Path, live_tabs: &std::collections::BTreeSet<String>) {
+    if !crate::rundir::is_private(flat) {
+        return;
+    }
+    for tab in live_tabs {
+        let Some(name) = marker_name(tab) else {
+            continue;
+        };
+        let old = flat.join(&name);
+        if old.is_file() && ensure_dir(dir).is_ok() && std::fs::write(dir.join(&name), b"").is_ok()
+        {
+            let _ = std::fs::remove_file(old);
+        }
+    }
 }
 
 fn migrate_legacy_from(legacy: &Path, dir: &Path, live_tabs: &std::collections::BTreeSet<String>) {
-    if !crate::rundir::is_owned_non_writable(legacy) || crate::rundir::ensure_private(dir).is_err()
-    {
+    if !crate::rundir::is_owned_non_writable(legacy) || ensure_dir(dir).is_err() {
         return;
     }
     for tab in live_tabs {
@@ -68,7 +109,7 @@ pub fn set(dir: &Path, tab: &str) -> std::io::Result<()> {
     let Some(name) = marker_name(tab) else {
         return Err(invalid_tab_id(tab));
     };
-    crate::rundir::ensure_private(dir)?;
+    ensure_dir(dir)?;
     std::fs::write(dir.join(name), b"")
 }
 
@@ -98,6 +139,9 @@ pub fn is_set(dir: &Path, tab: &str) -> bool {
         && marker_name(tab).is_some_and(|name| dir.join(name).exists())
 }
 
+/// Drop this session's markers for tabs that no longer exist. Only call it
+/// with a `pane.list` that actually parsed: an error reply has no tabs, and
+/// sweeping against it would forget every marker.
 pub fn sweep(dir: &Path, live_tabs: &std::collections::BTreeSet<String>) {
     if !crate::rundir::is_private(dir) {
         return;
@@ -222,5 +266,45 @@ mod tests {
         assert!(legacy.join("w1_old").exists());
         let _ = std::fs::remove_dir_all(legacy);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sessions_keep_and_sweep_only_their_own_markers() {
+        let root = scratch("sessions");
+        let _ = std::fs::remove_dir_all(&root);
+        let one = session_dir(&root, "/run/herdr/one.sock");
+        let two = session_dir(&root, "/run/herdr/two.sock");
+        assert_ne!(one, two);
+        set(&one, "w1:t1").unwrap();
+        set(&two, "w1:t1").unwrap();
+        set(&two, "w1:t2").unwrap();
+
+        // Session one has no w1:t2 and a different w1:t1; its sweep must not
+        // reach session two.
+        sweep(&one, &std::collections::BTreeSet::new());
+        assert!(!is_set(&one, "w1:t1"));
+        assert!(is_set(&two, "w1:t1"));
+        assert!(is_set(&two, "w1:t2"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn flat_markers_from_before_sessions_are_adopted_only_for_live_tabs() {
+        let root = scratch("flat");
+        let _ = std::fs::remove_dir_all(&root);
+        crate::rundir::ensure_private(&root).unwrap();
+        std::fs::write(root.join("w1_t1"), b"").unwrap();
+        std::fs::write(root.join("w1_t9"), b"").unwrap();
+        let dir = session_dir(&root, "/run/herdr/one.sock");
+
+        let live = std::collections::BTreeSet::from(["w1:t1".to_string()]);
+        migrate_flat_from(&root, &dir, &live);
+        sweep(&dir, &live);
+
+        assert!(is_set(&dir, "w1:t1"));
+        assert!(!root.join("w1_t1").exists());
+        // Possibly another session's: left for that session to adopt.
+        assert!(root.join("w1_t9").exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

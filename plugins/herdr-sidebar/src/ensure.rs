@@ -6,8 +6,9 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use crate::{ipc, launch, state::View};
+use crate::{autohide, ipc, launch, state::View};
 
 const REPLACE_ATTEMPTS_PER_WINDOW: u32 = 3;
 const REPLACE_WINDOW_SECS: u64 = 60;
@@ -21,6 +22,10 @@ pub enum Mode {
     Toggle(View),
     /// An explicit host keybinding opens or focuses a specific activity.
     Activate(Target),
+    /// A pane exited or closed (`pane.exited` / `pane.closed` hooks): close
+    /// every tab left holding only sidebars, the way herdr closes a tab
+    /// whose last pane exits (issue #108).
+    Reap,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,12 +370,7 @@ impl RefreshHost for LiveRefresh {
     }
 
     fn request_close(&mut self, pane: &str) -> Result<(), String> {
-        let response = ipc::call_text(
-            "pane.send_input",
-            serde_json::json!({ "pane_id": pane, "text": "", "keys": ["ctrl+q"] }),
-        )
-        .map_err(|error| error.to_string())?;
-        ipc_ok(&response)
+        send_ctrl_q(pane)
     }
 
     fn open(&mut self, panes_json: &str, tab: &str, view: View) -> Result<(), String> {
@@ -391,19 +391,166 @@ pub fn refresh_all() -> std::io::Result<RefreshReport> {
     refresh_with(&mut LiveRefresh).map_err(std::io::Error::other)
 }
 
+/// Ask a running sidebar TUI to save its drafts and close its own pane.
+fn send_ctrl_q(pane: &str) -> Result<(), String> {
+    let response = ipc::call_text(
+        "pane.send_input",
+        serde_json::json!({ "pane_id": pane, "text": "", "keys": ["ctrl+q"] }),
+    )
+    .map_err(|error| error.to_string())?;
+    ipc_ok(&response)
+}
+
+/// Everything the lonely-tab reap needs from herdr, injectable for tests.
+trait ReapHost {
+    fn list(&mut self) -> Result<String, String>;
+    /// Tabs a takeover journal still owes a restore (`takeover::journaled_tabs`).
+    fn journaled_tabs(&mut self) -> std::collections::BTreeSet<String>;
+    /// Ctrl+Q: the TUI saves drafts and closes its own pane, or stays open
+    /// with its error notice when a draft cannot be saved.
+    fn request_close(&mut self, pane: &str) -> Result<(), String>;
+    /// `pane.close`, only for panes that cannot hold TUI state.
+    fn close(&mut self, pane: &str) -> Result<(), String>;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReapScope {
+    Tab(String),
+    Workspace(String),
+}
+
+impl ReapScope {
+    fn from_event(event: &str, context_tab: &str) -> Option<Self> {
+        let scope = launch::event_scope(event);
+        match launch::event_kind(event).as_str() {
+            "pane_exited" => {
+                let tab = launch::event_scope_with_tab_context(event, "", context_tab);
+                tab.contains(':').then_some(Self::Tab(tab))
+            }
+            "pane_closed" if !scope.is_empty() && !scope.contains(':') => {
+                Some(Self::Workspace(scope))
+            }
+            _ => None,
+        }
+    }
+
+    fn contains(&self, tab: &str) -> bool {
+        match self {
+            Self::Tab(id) => tab == id,
+            Self::Workspace(id) => tab.split_once(':').is_some_and(|(ws, _)| ws == id),
+        }
+    }
+}
+
+/// Ask sidebars in the removal scope to close. Closing the last pane closes
+/// the tab; nothing waits for a running sidebar to acknowledge Ctrl+Q.
+fn reap_with(host: &mut impl ReapHost, scope: &ReapScope) -> Result<usize, String> {
+    let lonely: Vec<_> = launch::lonely_sidebar_tabs(&host.list()?)
+        .into_iter()
+        .filter(|tab| scope.contains(&tab.tab))
+        .collect();
+    if lonely.is_empty() {
+        return Ok(0);
+    }
+    let journaled = host.journaled_tabs();
+    let mut asked = 0;
+    for tab in lonely.iter().filter(|tab| !journaled.contains(&tab.tab)) {
+        for (pane, _) in &tab.panes {
+            // A shell could have arrived, or the pane could have reported
+            // its first identity token since the candidate snapshot.
+            let current = launch::lonely_sidebar_tabs(&host.list()?);
+            let Some((_, how)) = current
+                .iter()
+                .find(|candidate| candidate.tab == tab.tab)
+                .and_then(|candidate| candidate.panes.iter().find(|(id, _)| id == pane))
+            else {
+                continue;
+            };
+            let result = match how {
+                launch::ReapClose::Graceful => host.request_close(pane),
+                launch::ReapClose::Direct => host.close(pane),
+            };
+            if result.is_ok() {
+                asked += 1;
+            }
+        }
+    }
+    Ok(asked)
+}
+
+struct LiveReap;
+
+impl ReapHost for LiveReap {
+    fn list(&mut self) -> Result<String, String> {
+        ipc::call_text("pane.list", serde_json::json!({})).map_err(|error| error.to_string())
+    }
+
+    fn journaled_tabs(&mut self) -> std::collections::BTreeSet<String> {
+        crate::takeover::journaled_tabs()
+    }
+
+    fn request_close(&mut self, pane: &str) -> Result<(), String> {
+        send_ctrl_q(pane)
+    }
+
+    fn close(&mut self, pane: &str) -> Result<(), String> {
+        let response = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane }))
+            .map_err(|error| error.to_string())?;
+        ipc_ok(&response)
+    }
+}
+
+/// `--reap` (the `pane.exited` / `pane.closed` hooks). A discrete event, so
+/// it WAITS for the launcher lock instead of yielding like a focus hook: a
+/// skipped reap would leave the tab until some unrelated pane next closes.
+/// Holding the lock also means it never sees a tab our own launch, refresh
+/// or takeover is in the middle of rearranging.
+fn reap() -> std::io::Result<()> {
+    let event = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
+    let context_tab = std::env::var("HERDR_TAB_ID").unwrap_or_default();
+    let Some(scope) = ReapScope::from_event(&event, &context_tab) else {
+        return Ok(());
+    };
+    if !crate::state::load_state().close_lonely_tab {
+        return Ok(());
+    }
+    let Some(_lock) = LaunchLock::acquire(true) else {
+        return Ok(());
+    };
+    reap_with(&mut LiveReap, &scope)
+        .map(drop)
+        .map_err(std::io::Error::other)
+}
+
 /// Quiet mode (hooks): make sure the focused tab has an Explorer, never moving
 /// focus, and respecting a tab the user toggled closed. Toggle mode (the
 /// action): open-or-focus-or-close, like VS Code's explorer shortcut.
 pub fn run(mode: Mode) -> std::io::Result<()> {
+    if mode == Mode::Reap {
+        return reap();
+    }
     let toggle = matches!(mode, Mode::Toggle(_));
     let activation = match mode {
         Mode::Activate(target) => Some(target),
         _ => None,
     };
     let explicit = toggle || activation.is_some();
+    let event_json = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
+    let event_kind = launch::event_kind(&event_json);
+    if mode == Mode::Ensure {
+        match event_kind.as_str() {
+            "pane_moved" => return crate::focus::publish_move(&event_json),
+            "pane_focused" | "tab_focused" | "workspace_focused" => {
+                // Focus is useful even when auto-open is off or the launch
+                // lock is busy. A publication failure must not stop docking.
+                let _ = crate::focus::publish_focus();
+            }
+            _ => {}
+        }
+    }
     let state = crate::state::load_state();
     let view = match mode {
-        Mode::Ensure => View::Explorer,
+        Mode::Ensure | Mode::Reap => View::Explorer,
         Mode::Toggle(view) => view,
         Mode::Activate(target) => target.pane_view(state.merged),
     };
@@ -412,12 +559,8 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
     if !explicit && !state.auto_open {
         return Ok(());
     }
-    let event_json = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
-    let creation_event = !explicit
-        && matches!(
-            launch::event_kind(&event_json).as_str(),
-            "tab_created" | "workspace_created"
-        );
+    let creation_event =
+        !explicit && matches!(event_kind.as_str(), "tab_created" | "workspace_created");
     let wait_for_lock = must_wait_for_lock(explicit, &event_json);
     let Some(_lock) = LaunchLock::acquire(wait_for_lock) else {
         return Ok(());
@@ -434,15 +577,16 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
         launch::event_scope_with_tab_context(&event_json, &panes, &context_tab)
     };
     let tab = snooze_tab_for_scope(&panes, &scope);
-    if !tab.is_empty() {
-        // Budgeted, and never touches a viewer that is still present.
-        crate::takeover::recover_locked(&tab, &panes);
+    // Budgeted, and never touches a viewer that is still present. The
+    // no-op path leaves the snapshot valid; recovery may change layout.
+    if !tab.is_empty() && crate::takeover::recover_locked(&tab, &panes) {
         panes = ipc::call_text("pane.list", serde_json::json!({}))?;
     }
     let snooze_dir = snooze::dir();
-    let live_tabs = launch::live_tabs(&panes);
-    snooze::migrate_legacy(&snooze_dir, &live_tabs);
-    snooze::sweep(&snooze_dir, &live_tabs);
+    if let Some(live_tabs) = launch::live_tabs(&panes) {
+        snooze::migrate_legacy(&snooze_dir, &live_tabs);
+        snooze::sweep(&snooze_dir, &live_tabs);
+    }
     let now = crate::state::unix_now();
     let decision_view = activation.map_or(view, |target| match target {
         Target::SourceControl => View::SourceControl,
@@ -572,7 +716,9 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
                 }
                 prepare_activation(target);
                 open(&panes, true, &scope, view, Some(target), creation_event)?;
-            } else if !snooze::is_set(&snooze_dir, &tab) {
+            } else if !snooze::is_set(&snooze_dir, &tab)
+                && auto_hide_allows_open(&panes, &tab, state.auto_hide_below)
+            {
                 open(&panes, false, &scope, view, None, creation_event)?;
             }
         }
@@ -594,6 +740,84 @@ pub fn request_close(panes_json: &str, pane_id: &str) -> std::io::Result<()> {
         )?;
     }
     Ok(())
+}
+
+pub struct PendingUnifiedClose {
+    width: u16,
+    tab: String,
+    siblings: Vec<String>,
+    started: Instant,
+    last_check: Option<Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum UnifiedClose {
+    Waiting,
+    Closed(u16),
+    TimedOut,
+}
+
+impl PendingUnifiedClose {
+    pub fn request(pane_id: &str, other: View, width: u16) -> std::io::Result<Option<Self>> {
+        let list = ipc::call_text("pane.list", serde_json::json!({}))?;
+        ipc_ok(&list).map_err(std::io::Error::other)?;
+        let siblings = crate::ui::sibling_panes_of(&list, pane_id, other);
+        if siblings.is_empty() {
+            return Ok(None);
+        }
+        let mut failure = None;
+        for id in &siblings {
+            if let Err(error) = request_close(&list, id) {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(Some(Self {
+            width,
+            tab: launch::tab_of(&list, pane_id),
+            siblings,
+            started: Instant::now(),
+            last_check: None,
+        }))
+    }
+
+    pub fn poll(&mut self) -> UnifiedClose {
+        self.check(Instant::now(), |pane, tab| {
+            ipc::call_text("pane.get", serde_json::json!({"pane_id": pane}))
+                .ok()
+                .is_some_and(|reply| sibling_gone(&reply, tab))
+        })
+    }
+
+    fn check(&mut self, now: Instant, mut gone: impl FnMut(&str, &str) -> bool) -> UnifiedClose {
+        if self
+            .last_check
+            .is_none_or(|at| now.duration_since(at) >= Duration::from_millis(120))
+        {
+            self.last_check = Some(now);
+            self.siblings.retain(|pane| !gone(pane, &self.tab));
+            if self.siblings.is_empty() {
+                return UnifiedClose::Closed(self.width);
+            }
+        }
+        if now.duration_since(self.started) >= Duration::from_secs(2) {
+            return UnifiedClose::TimedOut;
+        }
+        UnifiedClose::Waiting
+    }
+}
+
+fn sibling_gone(reply: &str, tab: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(launch::strip_bom(reply))
+        .ok()
+        .is_some_and(|value| {
+            value["error"]["code"] == "pane_not_found"
+                || value["result"]["pane"]["tab_id"]
+                    .as_str()
+                    .is_some_and(|current| current != tab)
+        })
 }
 
 fn replace_backoff_path(dir: &Path, scope: &str, view: View) -> PathBuf {
@@ -662,6 +886,25 @@ fn sweep_replace_backoff(dir: &Path, now: u64) {
     }
 }
 
+/// Auto-hide (⚙ Settings): the quiet hook leaves a narrow tab without a
+/// sidebar and docks one again once the tab is wider than the setting. The
+/// width is read through any pane of the already-resolved `tab`: a workspace
+/// scope with several tabs has no single focused pane to ask. A layout that
+/// cannot be read does not block the dock.
+fn auto_hide_allows_open(panes_json: &str, tab: &str, threshold: u16) -> bool {
+    if threshold == 0 {
+        return true;
+    }
+    let pane = launch::pane_in_tab(panes_json, tab);
+    if pane.is_empty() {
+        return true;
+    }
+    ipc::call_text("pane.layout", serde_json::json!({ "pane_id": pane }))
+        .ok()
+        .and_then(|layout| launch::layout_width(&layout))
+        .is_none_or(|width| !autohide::should_hide(threshold, width))
+}
+
 fn snooze_tab_for_scope(panes_json: &str, scope: &str) -> String {
     if scope.contains(':') {
         scope.to_string()
@@ -680,20 +923,20 @@ fn focused_pane_id(panes_json: &str) -> String {
 }
 
 fn creation_focus_repair(
-    panes_before: &str,
-    panes_after: &str,
+    before: &str,
+    current_pane: Option<&str>,
     new_sidebar: &str,
     displaced_by_swap: Option<&str>,
 ) -> Option<String> {
-    let after = focused_pane_id(panes_after);
-    if after != new_sidebar {
+    if current_pane != Some(new_sidebar) {
         return None;
     }
-    if let Some(displaced) = displaced_by_swap.filter(|pane| !pane.is_empty()) {
-        return Some(displaced.to_string());
-    }
-    let before = focused_pane_id(panes_before);
-    (!before.is_empty() && before != new_sidebar).then_some(before)
+    let previous = if before.is_empty() {
+        displaced_by_swap.unwrap_or_default().to_string()
+    } else {
+        before.to_string()
+    };
+    (!previous.is_empty() && previous != new_sidebar).then_some(previous)
 }
 
 fn focus(pane_id: &str) -> std::io::Result<()> {
@@ -805,7 +1048,11 @@ fn open(
         new_pane
     };
 
+    // A creation hook can be queued while the user changes tabs. Capture the
+    // focused pane immediately before swapping, not only at hook entry.
+    let mut focus_before_layout = None;
     if needs_swap {
+        focus_before_layout = ipc::call_text("pane.list", serde_json::json!({})).ok();
         ipc::call_text(
             "pane.swap",
             serde_json::json!({ "source_pane_id": new_pane, "target_pane_id": target }),
@@ -846,14 +1093,17 @@ fn open(
         // land while this hook is docking (notably a preview tab's explicit
         // focus transition). Re-read and repair only when the layout operation
         // itself left focus on the new sidebar pane; otherwise do nothing.
-        if let Ok(after) = ipc::call_text("pane.list", serde_json::json!({}))
-            && let Some(previous) = creation_focus_repair(
-                panes_json,
-                &after,
-                &new_pane,
-                needs_swap.then_some(target.as_str()),
-            )
-        {
+        let before = focus_before_layout.as_deref().unwrap_or(panes_json);
+        let previous = focused_pane_id(before);
+        let current = crate::focus::current_pane().ok().flatten();
+        if let Some(previous) = creation_focus_repair(
+            &previous,
+            current.as_ref().and_then(|pane| pane.pane_id.as_deref()),
+            &new_pane,
+            needs_swap.then_some(target.as_str()),
+        ) {
+            // Herdr has no conditional focus request. Navigation between
+            // pane.current and pane.focus can still win the check and lose focus.
             focus(&previous)?;
         }
     } else {
@@ -934,6 +1184,60 @@ fn must_wait_for_lock(explicit: bool, event_json: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unified_close_checks_only_requested_siblings_and_times_out() {
+        let start = Instant::now();
+        let mut pending = PendingUnifiedClose {
+            width: 32,
+            tab: "w1:t1".into(),
+            siblings: vec!["w1:p1".into(), "w1:p2".into()],
+            started: start,
+            last_check: None,
+        };
+        assert_eq!(
+            pending.check(start, |pane, tab| tab == "w1:t1" && pane == "w1:p1"),
+            UnifiedClose::Waiting
+        );
+        assert_eq!(
+            pending.check(start + Duration::from_millis(50), |_, _| panic!(
+                "throttled"
+            )),
+            UnifiedClose::Waiting
+        );
+        assert_eq!(
+            pending.check(start + Duration::from_secs(2), |pane, _| {
+                assert_eq!(pane, "w1:p2");
+                false
+            }),
+            UnifiedClose::TimedOut
+        );
+        assert_eq!(
+            pending.check(start + Duration::from_secs(3), |_, _| true),
+            UnifiedClose::Closed(32)
+        );
+    }
+
+    #[test]
+    fn unified_close_recognizes_missing_or_moved_panes_but_not_api_errors() {
+        assert!(sibling_gone(
+            r#"{"error":{"code":"pane_not_found"}}"#,
+            "w1:t1"
+        ));
+        assert!(sibling_gone(
+            r#"{"result":{"pane":{"tab_id":"w1:t2"}}}"#,
+            "w1:t1"
+        ));
+        assert!(!sibling_gone(
+            r#"{"result":{"pane":{"tab_id":"w1:t1"}}}"#,
+            "w1:t1"
+        ));
+        assert!(!sibling_gone(
+            r#"{"error":{"code":"unavailable"}}"#,
+            "w1:t1"
+        ));
+        assert!(!sibling_gone("truncated{", "w1:t1"));
+    }
 
     /// A simulated herdr for `refresh_with`: panes are (id, tab, tokens).
     /// Sidebars in `closes` save and close themselves a few waits after
@@ -1119,6 +1423,183 @@ mod tests {
         assert!(report.is_complete());
     }
 
+    /// A simulated herdr for `reap_with`. A Ctrl+Q'd sidebar closes itself
+    /// unless it is in `keeps` (a draft it cannot save); `pane.close` always
+    /// works. Either removes the pane, as its own close would.
+    #[derive(Default)]
+    struct FakeReap {
+        panes: Vec<serde_json::Value>,
+        journaled: std::collections::BTreeSet<String>,
+        keeps: Vec<String>,
+        asked: Vec<String>,
+        closed: Vec<String>,
+    }
+
+    impl FakeReap {
+        fn pane(&mut self, id: &str, tab: &str, label: &str, tokens: serde_json::Value) {
+            self.panes.push(
+                serde_json::json!({"pane_id": id, "tab_id": tab, "label": label, "tokens": tokens}),
+            );
+        }
+        fn has(&self, id: &str) -> bool {
+            self.panes.iter().any(|pane| pane["pane_id"] == id)
+        }
+        fn remove(&mut self, id: &str) -> Result<(), String> {
+            if !self.has(id) {
+                return Err("pane_not_found".into());
+            }
+            self.panes.retain(|pane| pane["pane_id"] != id);
+            Ok(())
+        }
+    }
+
+    impl ReapHost for FakeReap {
+        fn list(&mut self) -> Result<String, String> {
+            Ok(serde_json::json!({"result": {"panes": self.panes}}).to_string())
+        }
+        fn journaled_tabs(&mut self) -> std::collections::BTreeSet<String> {
+            self.journaled.clone()
+        }
+        fn request_close(&mut self, pane: &str) -> Result<(), String> {
+            self.asked.push(pane.into());
+            if self.keeps.iter().any(|id| id == pane) {
+                return Ok(());
+            }
+            self.remove(pane)
+        }
+        fn close(&mut self, pane: &str) -> Result<(), String> {
+            self.closed.push(pane.into());
+            self.remove(pane)
+        }
+    }
+
+    const REAP_NOW: u64 = 10_000;
+
+    fn live_sidebar() -> serde_json::Value {
+        let now = REAP_NOW.to_string();
+        serde_json::json!({ launch::METADATA_SOURCE: now, launch::SC_METADATA_SOURCE: now })
+    }
+
+    /// Issue #108: the last shell exits and the sidebar is alone. It is asked
+    /// to close itself (drafts saved), which closes the tab; tabs with any
+    /// other pane — a shell, a viewer that may hold unsaved edits — and
+    /// tabs a takeover journal still needs are left alone.
+    #[test]
+    fn reap_closes_only_sidebar_only_tabs_and_gracefully() {
+        let mut host = FakeReap::default();
+        host.pane("alone", "w1:t1", "Sidebar", live_sidebar());
+        host.pane("busy", "w1:t2", "Sidebar", live_sidebar());
+        host.pane("shell", "w1:t2", "", serde_json::json!({}));
+        host.pane("previewing", "w1:t3", "", live_sidebar());
+        host.pane(
+            "viewer",
+            "w1:t3",
+            "a.rs · preview",
+            serde_json::json!({ crate::viewer::METADATA_SOURCE: REAP_NOW.to_string() }),
+        );
+        host.pane("parked", "w1:t4", "Sidebar", live_sidebar());
+        host.journaled.insert("w1:t4".into());
+        let mut young = serde_json::json!({ launch::SC_METADATA_SOURCE: REAP_NOW.to_string() });
+        young[launch::STARTING_TOKEN] = serde_json::json!("1");
+        host.pane("young", "w1:t5", "Source Control", young);
+        host.pane("corpse", "w1:t6", "Explorer", serde_json::json!({}));
+
+        assert_eq!(
+            reap_with(&mut host, &ReapScope::Workspace("w1".into())),
+            Ok(3)
+        );
+        assert_eq!(
+            host.asked,
+            vec!["alone", "young"],
+            "token-bearing panes get Ctrl+Q"
+        );
+        assert_eq!(host.closed, vec!["corpse"], "only the token-less corpse");
+        for kept in ["busy", "shell", "previewing", "viewer", "parked"] {
+            assert!(host.has(kept), "{kept} must survive");
+        }
+
+        // Each self-close emits pane.closed, which re-runs the reap: with
+        // nothing lonely left it does nothing, so it can never loop.
+        host.asked.clear();
+        host.closed.clear();
+        assert_eq!(
+            reap_with(&mut host, &ReapScope::Workspace("w1".into())),
+            Ok(0)
+        );
+        assert!(host.asked.is_empty() && host.closed.is_empty());
+    }
+
+    /// A separated Explorer + Source Control pair is lonely together; each
+    /// gets Ctrl+Q. One whose draft cannot be saved stays open (it shows
+    /// its own error), and a later event just asks it again — never a kill.
+    #[test]
+    fn reap_asks_every_sidebar_of_a_separated_pair_and_never_kills_a_draft() {
+        let mut host = FakeReap::default();
+        let now = "1";
+        host.pane(
+            "explorer",
+            "w1:t1",
+            "Explorer",
+            serde_json::json!({ launch::METADATA_SOURCE: now }),
+        );
+        host.pane(
+            "git",
+            "w1:t1",
+            "Source Control",
+            serde_json::json!({ launch::SC_METADATA_SOURCE: now }),
+        );
+        host.keeps.push("git".into());
+        assert_eq!(
+            reap_with(&mut host, &ReapScope::Workspace("w1".into())),
+            Ok(2)
+        );
+        assert_eq!(host.asked, vec!["explorer", "git"]);
+        assert!(host.closed.is_empty());
+        assert!(host.has("git") && !host.has("explorer"));
+        assert_eq!(
+            reap_with(&mut host, &ReapScope::Workspace("w1".into())),
+            Ok(1)
+        );
+        assert!(host.has("git"), "an unsaved draft is never hard-closed");
+        assert!(host.closed.is_empty());
+    }
+
+    #[test]
+    fn reap_preserves_a_starting_pane_that_does_not_close() {
+        let mut host = FakeReap::default();
+        host.pane(
+            "starting",
+            "w1:t1",
+            "Source Control",
+            serde_json::json!({ launch::STARTING_TOKEN: "1" }),
+        );
+        host.keeps.push("starting".into());
+
+        assert_eq!(reap_with(&mut host, &ReapScope::Tab("w1:t1".into())), Ok(1));
+        assert_eq!(host.asked, vec!["starting"]);
+        assert!(host.has("starting"));
+        assert!(host.closed.is_empty());
+    }
+
+    #[test]
+    fn reap_uses_exit_tab_and_close_workspace_without_global_fallback() {
+        let exit = r#"{"event":"pane.exited","data":{"pane_id":"w1:p9","workspace_id":"w1"}}"#;
+        let close = r#"{"event":"pane.closed","data":{"pane_id":"w1:p9","workspace_id":"w1"}}"#;
+        let mut host = FakeReap::default();
+        host.pane("exit", "w1:t1", "Explorer", live_sidebar());
+        host.pane("other-tab", "w1:t2", "Explorer", live_sidebar());
+        host.pane("other-workspace", "w2:t1", "Explorer", live_sidebar());
+
+        assert_eq!(ReapScope::from_event(exit, "w2:t1"), None);
+        assert_eq!(ReapScope::from_event("", "w1:t1"), None);
+        let scope = ReapScope::from_event(exit, "w1:t1").unwrap();
+        assert_eq!(reap_with(&mut host, &scope), Ok(1));
+        assert!(host.has("other-tab") && host.has("other-workspace"));
+        let scope = ReapScope::from_event(close, "w2:t1").unwrap();
+        assert_eq!(reap_with(&mut host, &scope), Ok(1));
+        assert!(host.has("other-workspace"));
+    }
+
     #[test]
     fn snooze_set_clear_and_sweep() {
         let dir = std::env::temp_dir().join(format!("aa-ft-snooze-test-{}", std::process::id()));
@@ -1162,31 +1643,54 @@ mod tests {
         let (scoped_pane, _) = scoped.split_once('\t').unwrap();
         assert_eq!(scoped_pane, "w2:p1", "the dock still roots in the new tab");
 
-        let sidebar_stole_focus = r#"{"result":{"panes":[
-            {"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","focused":false},
-            {"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","focused":false},
-            {"pane_id":"w2:p2","tab_id":"w2:t1","workspace_id":"w2","focused":true}
-        ]}}"#;
+        let before = focused_pane_id(before);
+        let sidebar_stole_focus = Some("w2:p2");
         assert_eq!(
-            creation_focus_repair(before, sidebar_stole_focus, "w2:p2", None).as_deref(),
+            creation_focus_repair(&before, sidebar_stole_focus, "w2:p2", None).as_deref(),
             Some("w1:p1")
         );
 
-        let intended_preview_focus = r#"{"result":{"panes":[
-            {"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","focused":false},
-            {"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","focused":true},
-            {"pane_id":"w2:p2","tab_id":"w2:t1","workspace_id":"w2","focused":false}
-        ]}}"#;
+        let intended_preview_focus = Some("w2:p1");
         assert_eq!(
-            creation_focus_repair(before, intended_preview_focus, "w2:p2", Some("w2:p1")),
+            creation_focus_repair(&before, intended_preview_focus, "w2:p2", Some("w2:p1")),
             None,
             "a concurrent intended focus must never be snapped back"
         );
 
         assert_eq!(
-            creation_focus_repair(before, sidebar_stole_focus, "w2:p2", Some("w2:p1")).as_deref(),
+            creation_focus_repair(&before, sidebar_stole_focus, "w2:p2", Some("w2:p1")).as_deref(),
+            Some("w1:p1"),
+            "a background worktree's sidebar must not switch away from the original workspace"
+        );
+
+        let same_tab_before = r#"{"result":{"panes":[
+            {"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","focused":true},
+            {"pane_id":"w2:p3","tab_id":"w2:t1","workspace_id":"w2","focused":false}
+        ]}}"#;
+        assert_eq!(
+            creation_focus_repair(
+                &focused_pane_id(same_tab_before),
+                sidebar_stole_focus,
+                "w2:p2",
+                Some("w2:p1")
+            )
+            .as_deref(),
             Some("w2:p1"),
-            "after a swap, restore the displaced pane rather than stale global focus"
+            "a dock in the focused tab restores its original pane"
+        );
+        let no_prior_focus = r#"{"result":{"panes":[
+            {"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","focused":false}
+        ]}}"#;
+        assert_eq!(
+            creation_focus_repair(
+                &focused_pane_id(no_prior_focus),
+                sidebar_stole_focus,
+                "w2:p2",
+                Some("w2:p1")
+            )
+            .as_deref(),
+            Some("w2:p1"),
+            "without a recorded prior focus, restore the displaced pane"
         );
     }
 

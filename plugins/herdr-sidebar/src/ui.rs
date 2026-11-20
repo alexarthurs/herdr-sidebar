@@ -3,6 +3,7 @@
 //! pane-list parsing both views use to find their sibling panes. One home —
 //! these used to be copy-mirrored between two crates.
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -380,6 +381,16 @@ pub fn status_color(letter: char) -> Color {
     }
 }
 
+pub const SETTINGS_KEY: KeyCode = KeyCode::F(8);
+pub const LETTER_HOTKEYS_NOTICE: &str = "Letter shortcuts are off — F8 for Settings";
+
+/// The list handlers call this before dispatching printable shortcuts.
+pub fn ignore_letter_hotkey(key: KeyEvent, enabled: bool) -> bool {
+    !enabled
+        && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+        && matches!(key.code, KeyCode::Char(c) if !c.is_control())
+}
+
 /// Rendered width of one `key label` hint: keycap padding + gap + label.
 fn hint_width(key: &str, label: &str) -> usize {
     Span::raw(key).width() + 2 + 1 + Span::raw(label).width()
@@ -415,6 +426,25 @@ pub fn wrap_hints(
         used += if line.len() == 3 { w } else { 2 + w };
     }
     lines.into_iter().map(Line::from).collect()
+}
+
+/// The longest "how to open the menu" footer hint that fits in `width`
+/// columns, so a narrow sidebar shows a shorter hint instead of a clipped one.
+pub fn fit_menu_hint(width: u16, letter_hotkeys: bool) -> &'static str {
+    let hints: &[_] = if letter_hotkeys {
+        &[
+            "m / ctrl+rclick for menus",
+            "m / ctrl+rclick: menu",
+            "m: menu",
+        ]
+    } else {
+        &["ctrl+rclick: menu"]
+    };
+    hints
+        .iter()
+        .copied()
+        .find(|hint| Span::raw(*hint).width() <= usize::from(width))
+        .unwrap_or("")
 }
 
 /// A subtle right-edge scrollbar when the list overflows its viewport.
@@ -701,6 +731,65 @@ pub fn sibling_panes_of(pane_list_json: &str, my_pane_id: &str, other: View) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fit_menu_hint_shrinks_to_fit() {
+        assert_eq!(fit_menu_hint(40, true), "m / ctrl+rclick for menus");
+        assert_eq!(fit_menu_hint(25, true), "m / ctrl+rclick for menus");
+        assert_eq!(fit_menu_hint(24, true), "m / ctrl+rclick: menu");
+        assert_eq!(fit_menu_hint(10, true), "m: menu");
+        assert_eq!(fit_menu_hint(6, true), "");
+        assert_eq!(fit_menu_hint(24, false), "ctrl+rclick: menu");
+        assert_eq!(fit_menu_hint(10, false), "");
+    }
+
+    #[test]
+    fn disabled_letter_hotkeys_ignore_only_plain_printable_keys() {
+        use KeyCode::*;
+        use KeyModifiers as Mods;
+
+        for (code, modifiers) in [
+            (Char('b'), Mods::NONE),
+            (Char('A'), Mods::SHIFT),
+            (Char('3'), Mods::NONE),
+            (Char('.'), Mods::NONE),
+            (Char('!'), Mods::SHIFT),
+            (Char(' '), Mods::NONE),
+            (Char('é'), Mods::NONE),
+        ] {
+            let key = KeyEvent::new(code, modifiers);
+            assert!(ignore_letter_hotkey(key, false), "{key:?}");
+            assert!(!ignore_letter_hotkey(key, true), "{key:?}");
+        }
+
+        for (code, modifiers) in [
+            (Char('@'), Mods::CONTROL | Mods::ALT),
+            (Char('p'), Mods::CONTROL),
+            (Char('3'), Mods::CONTROL),
+            (Char('F'), Mods::CONTROL | Mods::SHIFT),
+            (Char('p'), Mods::SUPER),
+            (Char('r'), Mods::ALT),
+            (F(8), Mods::NONE),
+            (F(9), Mods::NONE),
+            (F(10), Mods::NONE),
+            (F(11), Mods::NONE),
+            (F(12), Mods::NONE),
+            (Up, Mods::NONE),
+            (Left, Mods::NONE),
+            (Enter, Mods::NONE),
+            (Esc, Mods::NONE),
+            (Tab, Mods::NONE),
+            (BackTab, Mods::SHIFT),
+            (PageUp, Mods::NONE),
+            (PageDown, Mods::NONE),
+            (Home, Mods::NONE),
+            (End, Mods::NONE),
+            (Delete, Mods::NONE),
+        ] {
+            let key = KeyEvent::new(code, modifiers);
+            assert!(!ignore_letter_hotkey(key, false), "{key:?}");
+        }
+    }
 
     /// Perceived brightness on a 0..1 scale, the measure `darken_for_light`
     /// caps.

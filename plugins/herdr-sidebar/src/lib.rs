@@ -5,12 +5,15 @@
 
 pub mod actions;
 pub mod ansi;
+pub mod autohide;
 pub mod branch_ui;
 pub mod diffview;
 pub mod editor;
 pub mod ensure;
+pub mod focus;
 pub mod fontsetup;
 pub mod git;
+pub mod gitconfirm;
 pub mod gitdeco;
 pub mod icons;
 pub mod ipc;

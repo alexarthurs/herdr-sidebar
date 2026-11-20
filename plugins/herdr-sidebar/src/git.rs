@@ -11,6 +11,14 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 const IGNORED_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Status runs on background workers (the SCM view's status worker, the
+/// Explorer's decoration worker); the bound only keeps a hung git — a stalled
+/// network drive, say — from stranding that worker forever. Generous, because
+/// `-uall` in a very large worktree legitimately takes many seconds and a
+/// bound it can never meet would mean the view never loads at all.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(120);
+/// Drawer queries are capped log/ref listings; the same stranding guard.
+const DRAWER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One file in the staged or unstaged list.
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +42,38 @@ pub struct Status {
     pub behind: usize,
     /// The branch has an upstream at all (the header carries `...remote`).
     pub has_upstream: bool,
+}
+
+/// The checkout and tracking ref the user approved for Sync.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncTarget {
+    root: PathBuf,
+    pub branch: String,
+    upstream: String,
+}
+
+impl SyncTarget {
+    fn from_refs(root: &Path, refs: &str) -> Option<Self> {
+        let mut lines = refs.lines();
+        let branch = lines.next()?.strip_prefix("refs/heads/")?;
+        let upstream = lines.next()?.strip_prefix("refs/")?;
+        if branch.is_empty() || upstream.is_empty() || lines.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            root: root.to_path_buf(),
+            branch: branch.into(),
+            upstream: upstream.into(),
+        })
+    }
+
+    fn validate(&self, current: Option<&Self>) -> Result<(), String> {
+        if current == Some(self) {
+            Ok(())
+        } else {
+            Err("Sync cancelled: repository, branch, or upstream changed. Open Sync again.".into())
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -119,6 +159,21 @@ impl Git {
             .unwrap_or_else(|| self.root.display().to_string())
     }
 
+    /// One bounded ref lookup, with no worktree scan.
+    pub fn sync_target(&self) -> Result<SyncTarget, String> {
+        let refs = run_action_lookup(
+            &self.root,
+            &["rev-parse", "--symbolic-full-name", "HEAD", "@{upstream}"],
+        )?;
+        SyncTarget::from_refs(&self.root, &refs)
+            .ok_or_else(|| "No tracking branch to sync.".to_string())
+    }
+
+    pub fn sync_confirmed(&self, approved: &SyncTarget) -> Result<String, String> {
+        approved.validate(self.sync_target().as_ref().ok())?;
+        self.sync()
+    }
+
     /// VS Code's Sync Changes: pull (rebase, autostash) then push. Returns a
     /// short human summary; the caller runs this on a background thread.
     pub fn sync(&self) -> Result<String, String> {
@@ -128,7 +183,7 @@ impl Git {
     }
 
     pub fn status(&self) -> Result<Status, String> {
-        let out = run_read_in(
+        let out = run_read_in_with_timeout(
             &self.root,
             &[
                 "status",
@@ -138,6 +193,7 @@ impl Git {
                 "--renames",
                 "--untracked-files=all",
             ],
+            STATUS_TIMEOUT,
         )?;
         Ok(parse_status(&out))
     }
@@ -407,31 +463,43 @@ impl Git {
 
     pub fn graph(&self, limit: usize) -> Result<Vec<String>, String> {
         let n = format!("-{limit}");
-        lines(run_in(
+        lines(run_drawer(
             &self.root,
-            &["log", "--graph", "--oneline", "--decorate=short", &n],
+            &[
+                "log",
+                "--graph",
+                "--format=%H%x09%h%d %s",
+                "--decorate=short",
+                &n,
+            ],
         )?)
     }
 
     pub fn commits(&self, limit: usize) -> Result<Vec<String>, String> {
         let n = format!("-{limit}");
-        lines(run_in(
+        lines(run_drawer(
             &self.root,
-            &["log", "--oneline", "--decorate=short", "--date=short", &n],
+            &[
+                "log",
+                "--format=%H%x09%h%d %s",
+                "--decorate=short",
+                "--date=short",
+                &n,
+            ],
         )?)
     }
 
     pub fn file_history(&self, path: &str, limit: usize) -> Result<Vec<String>, String> {
         let n = format!("-{limit}");
-        lines(run_in(
+        lines(run_drawer(
             &self.root,
-            &["log", "--oneline", "--follow", &n, "--", path],
+            &["log", "--format=%H%x09%h %s", "--follow", &n, "--", path],
         )?)
     }
 
     /// Local + remote branches, the current one first and starred.
     pub fn branches(&self) -> Result<Vec<String>, String> {
-        lines(run_in(
+        lines(run_drawer(
             &self.root,
             &[
                 "branch",
@@ -570,7 +638,7 @@ impl Git {
     }
 
     pub fn remotes(&self) -> Result<Vec<String>, String> {
-        let out = run_in(&self.root, &["remote", "-v"])?;
+        let out = run_drawer(&self.root, &["remote", "-v"])?;
         // `remote -v` lists fetch and push separately; one line per remote reads better.
         let mut seen = Vec::new();
         for line in out.lines() {
@@ -582,17 +650,27 @@ impl Git {
     }
 
     pub fn stashes(&self) -> Result<Vec<String>, String> {
-        lines(run_in(&self.root, &["stash", "list"])?)
+        lines(run_drawer(
+            &self.root,
+            &["stash", "list", "--format=%gd%x09%H%x09%gs"],
+        )?)
+    }
+
+    pub fn stash_selector(&self, object: &str, require_unique: bool) -> Result<String, String> {
+        let list = run_action_lookup(&self.root, &["stash", "list", "--format=%gd%x09%H"])?;
+        stash_selector(&list, object, require_unique)
+            .map(str::to_owned)
+            .map_err(str::to_owned)
     }
 
     pub fn tags(&self) -> Result<Vec<String>, String> {
-        lines(run_in(&self.root, &["tag", "--sort=-creatordate"])?)
+        lines(run_drawer(&self.root, &["tag", "--sort=-creatordate"])?)
     }
 
     /// One line per worktree (`git worktree list`): path, short head,
     /// [branch] — the primary checkout first.
     pub fn worktrees(&self) -> Result<Vec<String>, String> {
-        lines(run_in(&self.root, &["worktree", "list"])?)
+        lines(run_drawer(&self.root, &["worktree", "list"])?)
     }
 
     /// Run an arbitrary git command in this repo — the escape hatch the
@@ -600,6 +678,26 @@ impl Git {
     pub fn raw(&self, args: &[&str]) -> Result<String, String> {
         run_in(&self.root, args)
     }
+}
+
+fn stash_selector<'a>(
+    list: &'a str,
+    object: &str,
+    require_unique: bool,
+) -> Result<&'a str, &'static str> {
+    let mut matches = list.lines().filter_map(|line| {
+        let (selector, id) = line.split_once('\t')?;
+        (id == object).then_some(selector)
+    });
+    let selector = matches
+        .next()
+        .ok_or("The selected stash no longer exists.")?;
+    if require_unique && matches.next().is_some() {
+        return Err(
+            "The selected stash appears more than once. Pop and Drop require a unique entry.",
+        );
+    }
+    Ok(selector)
 }
 
 fn lines(out: String) -> Result<Vec<String>, String> {
@@ -642,17 +740,21 @@ fn parse_branch_choices(out: &str) -> Vec<Branch> {
     branches
 }
 
-/// Background status reads must never refresh the index while another pane or
-/// tool is trying to write it. `GIT_OPTIONAL_LOCKS=0` asks Git to skip those
-/// optional index writes without changing the result of these read-only calls.
-fn run_read_in(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = git_command(dir, args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
-    command_result(out.status, out.stdout, out.stderr)
+/// Confirmation and stash selector reads can run on the input thread.
+fn run_action_lookup(dir: &Path, args: &[&str]) -> Result<String, String> {
+    run_read_in_with_timeout(dir, args, Duration::from_secs(2))
 }
 
+/// Drawer listings are read-only and run on the SCM status worker, so they
+/// get the same bounded, lock-free read as status.
+fn run_drawer(dir: &Path, args: &[&str]) -> Result<String, String> {
+    run_read_in_with_timeout(dir, args, DRAWER_TIMEOUT)
+}
+
+/// A bounded background read. It must never refresh the index while another
+/// pane or tool is trying to write it: `GIT_OPTIONAL_LOCKS=0` asks Git to skip
+/// those optional index writes without changing the result of read-only calls.
+/// On timeout the whole child tree is terminated (a Job Object on Windows).
 fn run_read_in_with_timeout(
     dir: &Path,
     args: &[&str],
@@ -678,6 +780,9 @@ fn run_read_in_with_timeout(
     let stdout_reader = std::thread::spawn(move || read_all(stdout));
     let stderr_reader = std::thread::spawn(move || read_all(stderr));
     let deadline = Instant::now() + timeout;
+    // Start with short naps: most reads finish in a few milliseconds, and a
+    // fixed 25ms poll would add that much latency to every one of them.
+    let mut nap = Duration::from_millis(1);
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|e| format!("git: {e}"))? {
             break status;
@@ -693,11 +798,13 @@ fn run_read_in_with_timeout(
                 drop(stderr_reader);
             }
             return Err(format!(
-                "ignored-file scan timed out after {}s",
+                "git {} timed out after {}s",
+                args.first().copied().unwrap_or_default(),
                 timeout.as_secs()
             ));
         }
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(nap);
+        nap = (nap * 2).min(Duration::from_millis(25));
     };
     let stdout = stdout_reader
         .join()
@@ -1179,6 +1286,64 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn action_lookup_caps_a_stalled_git_read_at_two_seconds() {
+        let git = repo_with_head("action-lookup-timeout");
+        let result = run_action_lookup(
+            git.root(),
+            &["-c", "alias.sidebar-slow=!sleep 4", "sidebar-slow"],
+        );
+        assert_eq!(result.unwrap_err(), "git -c timed out after 2s");
+    }
+
+    #[test]
+    fn stash_selector_follows_the_object_after_insertion_and_refuses_removed_objects() {
+        let list = "stash@{0}\tnew\nstash@{1}\tselected\nstash@{2}\tolder\n";
+        assert_eq!(stash_selector(list, "selected", true), Ok("stash@{1}"));
+        for missing in ["removed", "select"] {
+            assert_eq!(
+                stash_selector(list, missing, true),
+                Err("The selected stash no longer exists.")
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_stash_actions_require_a_unique_object() {
+        let list = "stash@{0}\tduplicate\nstash@{1}\tother\nstash@{2}\tduplicate\n";
+        assert_eq!(
+            stash_selector(list, "duplicate", true),
+            Err("The selected stash appears more than once. Pop and Drop require a unique entry.")
+        );
+        assert_eq!(stash_selector(list, "duplicate", false), Ok("stash@{0}"));
+        assert_eq!(stash_selector(list, "other", true), Ok("stash@{1}"));
+    }
+
+    #[test]
+    fn confirmed_sync_requires_same_repository_branch_and_upstream() {
+        let root = Path::new("repo");
+        let refs = "refs/heads/main\nrefs/remotes/origin/main\n";
+        let approved = SyncTarget::from_refs(root, refs).unwrap();
+        assert!(
+            approved
+                .validate(SyncTarget::from_refs(root, refs).as_ref())
+                .is_ok()
+        );
+        for (other_root, other_refs) in [
+            (Path::new("other"), refs),
+            (root, "refs/heads/topic\nrefs/remotes/origin/main\n"),
+            (root, "refs/heads/main\nrefs/remotes/backup/main\n"),
+            (root, "HEAD\nrefs/remotes/origin/main\n"),
+            (root, "refs/heads/main\n"),
+        ] {
+            assert!(
+                approved
+                    .validate(SyncTarget::from_refs(other_root, other_refs).as_ref())
+                    .is_err()
+            );
+        }
     }
 
     #[test]

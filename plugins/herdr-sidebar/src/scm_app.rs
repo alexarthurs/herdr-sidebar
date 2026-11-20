@@ -25,22 +25,26 @@ use herdr_sidebar::actions::{ClipboardWrite, copy_to_clipboard, open_external, r
 use herdr_sidebar::branch_ui::{
     BranchPicker, FooterZones, PickerAction, draw_git_footer, sync_glyph,
 };
-use herdr_sidebar::git::{DeleteRefused, FileEntry, Git, Status};
+use herdr_sidebar::git::{DeleteRefused, FileEntry, Git, Status, SyncTarget};
+use herdr_sidebar::gitconfirm::{self, GitOp};
 use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::state::Exit;
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::suggest;
 use herdr_sidebar::ui::{
-    TitleAction, activity_button_style, activity_icons, branch_icon, chrome_button_style,
-    draw_activity_caps, draw_scrollbar, gear_icon, hits, hits_activity_button,
-    hits_collapse_button, hover_style, icon_style as ui_icon_style, keep_visible_scroll, palette,
-    selection_style, set_color_theme, sibling_panes_of, sparkle_icon, status_color,
-    title_action_spans, title_actions_visible, title_actions_width, truncate_to, within,
-    wrap_footer_message, wrap_hints,
+    LETTER_HOTKEYS_NOTICE, SETTINGS_KEY, TitleAction, activity_button_style, activity_icons,
+    branch_icon, chrome_button_style, draw_activity_caps, draw_scrollbar, fit_menu_hint, gear_icon,
+    hits, hits_activity_button, hits_collapse_button, hover_style, icon_style as ui_icon_style,
+    ignore_letter_hotkey, keep_visible_scroll, palette, selection_style, set_color_theme,
+    sparkle_icon, status_color, title_action_spans, title_actions_visible, title_actions_width,
+    truncate_to, within, wrap_footer_message, wrap_hints,
 };
 
 /// How many log lines the history-ish drawers fetch.
 const DRAWER_LIMIT: usize = 30;
+/// Floor between periodic background status reads; the adaptive throttle in
+/// [`RefreshGate`] stretches it to 3x the last read in very large worktrees.
+const STATUS_REFRESH_MIN: std::time::Duration = std::time::Duration::from_millis(1500);
 const REPO_HEADER_ACTIONS: &str = " ⇅  ✓ ";
 
 /// How long two clicks on the same row still count as a double click (to pin
@@ -129,15 +133,64 @@ struct DrawerPanel {
     refs: Vec<DrawerRef>,
 }
 
+impl DrawerPanel {
+    /// Replace the lines with a fresh query result; true when they changed.
+    fn fill(&mut self, kind: Drawer, lines: Result<Vec<String>, String>) -> bool {
+        let raw = match lines {
+            Ok(lines) if lines.is_empty() => vec!["(none)".to_string()],
+            Ok(lines) => lines,
+            Err(e) => vec![format!("({e})")],
+        };
+        let refs: Vec<DrawerRef> = raw.iter().map(|l| parse_drawer_ref(kind, l)).collect();
+        let lines: Vec<String> = match kind {
+            Drawer::Worktrees => raw.iter().map(|l| pretty_worktree_line(l)).collect(),
+            Drawer::Remotes => raw.iter().map(|l| pretty_remote_line(l)).collect(),
+            Drawer::Graph | Drawer::Commits | Drawer::FileHistory | Drawer::Stashes => raw
+                .iter()
+                .map(|line| display_drawer_object(kind, line))
+                .collect(),
+            _ => raw,
+        };
+        if lines == self.lines && refs == self.refs {
+            return false;
+        }
+        self.lines = lines;
+        self.refs = refs;
+        true
+    }
+}
+
+/// One drawer's git query. Shared by the synchronous reload (a drawer toggle,
+/// an active-repo switch) and the background status worker.
+fn load_drawer(
+    git: &Git,
+    kind: Drawer,
+    history_target: Option<&str>,
+) -> Result<Vec<String>, String> {
+    match kind {
+        Drawer::Graph => git.graph(DRAWER_LIMIT),
+        Drawer::Commits => git.commits(DRAWER_LIMIT),
+        Drawer::FileHistory => match history_target {
+            Some(path) => git.file_history(path, DRAWER_LIMIT),
+            None => Ok(vec!["(select a file above)".to_string()]),
+        },
+        Drawer::Branches => git.branches(),
+        Drawer::Worktrees => git.worktrees(),
+        Drawer::Remotes => git.remotes(),
+        Drawer::Stashes => git.stashes(),
+        Drawer::Tags => git.tags(),
+    }
+}
+
 /// What a drawer line points at, for clicks and context menus.
 #[derive(Clone, PartialEq, Eq, Default, Debug)]
 enum DrawerRef {
     #[default]
     None,
-    /// A short commit hash (GRAPH / COMMITS / FILE HISTORY lines).
+    /// A full commit object ID (GRAPH / COMMITS / FILE HISTORY lines).
     Commit(String),
-    /// `stash@{n}`.
-    Stash(usize),
+    /// A full stash object ID, independent of its reflog position.
+    Stash(String),
     Branch {
         name: String,
         current: bool,
@@ -203,18 +256,33 @@ fn pretty_remote_url(url: &str) -> String {
         .to_string()
 }
 
+fn display_drawer_object(kind: Drawer, line: &str) -> String {
+    let Some((head, rest)) = line.split_once('\t') else {
+        return line.to_owned();
+    };
+    if kind == Drawer::Stashes {
+        return match rest.split_once('\t') {
+            Some((_, subject)) => format!("{head}: {subject}"),
+            None => line.to_owned(),
+        };
+    }
+    let prefix_end = head.rfind(' ').map_or(0, |i| i + 1);
+    format!("{}{rest}", &head[..prefix_end])
+}
+
+fn object_id(text: &str) -> Option<String> {
+    (matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| text.to_owned())
+}
+
 fn parse_drawer_ref(kind: Drawer, line: &str) -> DrawerRef {
     match kind {
         Drawer::Graph | Drawer::Commits | Drawer::FileHistory => line
-            .split_whitespace()
-            .find(|tok| {
-                tok.len() >= 7
-                    && tok
-                        .chars()
-                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-            })
-            .map(|h| DrawerRef::Commit(h.to_string()))
-            .unwrap_or(DrawerRef::None),
+            .split_once('\t')
+            .and_then(|(head, _)| head.split_whitespace().next_back())
+            .and_then(object_id)
+            .map(DrawerRef::Commit)
+            .unwrap_or_default(),
         Drawer::Branches => {
             let current = line.starts_with('*');
             let name = line.trim_start_matches('*').trim().to_string();
@@ -244,10 +312,11 @@ fn parse_drawer_ref(kind: Drawer, line: &str) -> DrawerRef {
         }
         Drawer::Stashes => line
             .strip_prefix("stash@{")
-            .and_then(|rest| rest.split('}').next())
-            .and_then(|n| n.parse::<usize>().ok())
+            .and_then(|rest| rest.split_once("}\t"))
+            .and_then(|(_, rest)| rest.split_once('\t'))
+            .and_then(|(object, _)| object_id(object))
             .map(DrawerRef::Stash)
-            .unwrap_or(DrawerRef::None),
+            .unwrap_or_default(),
         Drawer::Tags => {
             let name = line.trim().to_string();
             if name.is_empty() || name.starts_with('(') {
@@ -263,8 +332,7 @@ fn parse_drawer_ref(kind: Drawer, line: &str) -> DrawerRef {
 /// a selection across tabs. `None` for blank graph-edge rows.
 fn drawer_spec(dref: &DrawerRef) -> Option<String> {
     match dref {
-        DrawerRef::Commit(h) => Some(h.clone()),
-        DrawerRef::Stash(n) => Some(format!("stash@{{{n}}}")),
+        DrawerRef::Commit(h) | DrawerRef::Stash(h) => Some(h.clone()),
         DrawerRef::Branch { name, .. } => Some(name.clone()),
         DrawerRef::Tag(t) => Some(t.clone()),
         DrawerRef::Remote { name, .. } => Some(name.clone()),
@@ -299,6 +367,10 @@ fn drawer_checkout_args(dref: &DrawerRef, spec: &str, git_spec: &str) -> Option<
         ]),
         _ => None,
     }
+}
+
+fn git_args(args: &[&str]) -> Vec<String> {
+    args.iter().map(|arg| (*arg).to_string()).collect()
 }
 
 fn drawer_reset_args(git_spec: &str) -> Vec<String> {
@@ -499,12 +571,41 @@ fn flatten_scm_tree(
     }
 }
 
+#[derive(Default)]
+struct StatusFreshness {
+    generation: Option<u64>,
+    last_error: Option<String>,
+}
+
+impl StatusFreshness {
+    fn stale(&self, generation: u64) -> bool {
+        self.generation != Some(generation)
+    }
+
+    fn succeeded(&mut self, generation: u64) {
+        self.generation = Some(generation);
+        self.last_error = None;
+    }
+
+    fn failed(&mut self, error: String) -> Option<String> {
+        self.generation = None;
+        if self.last_error.as_ref() == Some(&error) {
+            return None;
+        }
+        self.last_error = Some(error.clone());
+        Some(error)
+    }
+}
+
 /// One discovered repository and its per-repo view state — including its own
 /// commit message, so the multi-repo view mirrors VS Code's per-repo inputs.
 struct Repo {
     git: Git,
     name: String,
     status: Status,
+    /// A status read has landed; until then the view shows "loading…".
+    loaded: bool,
+    freshness: StatusFreshness,
     collapsed: bool,
     staged_collapsed: bool,
     changes_collapsed: bool,
@@ -526,6 +627,8 @@ impl Repo {
             name: git.name(),
             git,
             status: Status::default(),
+            loaded: false,
+            freshness: StatusFreshness::default(),
             collapsed: false,
             staged_collapsed: false,
             changes_collapsed: false,
@@ -565,6 +668,9 @@ impl Repo {
 
     /// The repo row's branch decoration: `name*` when the tree is dirty.
     fn branch_decor(&self) -> String {
+        if !self.loaded {
+            return "…".to_string();
+        }
         let dirty = if self.status.staged.is_empty() && self.status.unstaged.is_empty() {
             ""
         } else {
@@ -576,6 +682,171 @@ impl Repo {
 
 fn commit_draft_present<'a>(messages: impl IntoIterator<Item = &'a [char]>) -> bool {
     messages.into_iter().any(|message| !message.is_empty())
+}
+
+/// Scheduling for the single-flight background status worker (issue #97):
+/// `git status -uall` in a very large worktree takes seconds, so it never
+/// runs on the event loop. At most one read is in flight; a request made
+/// meanwhile is coalesced into one follow-up read. Everything that can change
+/// status under a running read (a git action, an explicit refresh, a finished
+/// sync, a new repo set) bumps the generation, and a result from an older
+/// generation is dropped instead of briefly reverting the view.
+#[derive(Debug)]
+struct RefreshGate {
+    generation: u64,
+    /// The generation and start time of the in-flight read.
+    running: Option<(u64, std::time::Instant)>,
+    /// A read is wanted but has not started (one is still running).
+    queued: bool,
+    /// Earliest next periodic read: max([`STATUS_REFRESH_MIN`], 3x the last
+    /// read's duration) after it returned, so a slow repo stays mostly idle.
+    next_periodic: std::time::Instant,
+}
+
+impl RefreshGate {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            generation: 0,
+            running: None,
+            queued: false,
+            next_periodic: now,
+        }
+    }
+
+    /// Status may have changed: anything in flight is stale; read again.
+    fn invalidate(&mut self) {
+        self.generation += 1;
+        self.queued = true;
+    }
+
+    /// A periodic read is due (nothing running or queued, throttle elapsed).
+    fn periodic_due(&self, now: std::time::Instant) -> bool {
+        self.running.is_none() && !self.queued && now >= self.next_periodic
+    }
+
+    fn queue(&mut self) {
+        self.queued = true;
+    }
+
+    /// The generation to start a read for, if one should start now.
+    fn start(&mut self, now: std::time::Instant) -> Option<u64> {
+        if self.running.is_some() || !self.queued {
+            return None;
+        }
+        self.queued = false;
+        self.running = Some((self.generation, now));
+        Some(self.generation)
+    }
+
+    /// The in-flight read returned; true when its result is current and
+    /// should be applied. `None` = the worker died without a result.
+    fn finish(&mut self, generation: Option<u64>, now: std::time::Instant) -> bool {
+        let Some((_, started)) = self.running.take() else {
+            return false;
+        };
+        self.next_periodic = now + STATUS_REFRESH_MIN.max(now.duration_since(started) * 3);
+        generation == Some(self.generation)
+    }
+
+    fn running(&self) -> bool {
+        self.running.is_some()
+    }
+}
+
+/// What one background read covers: every repo's status, plus the active
+/// repo's expanded drawers (also periodic git reads, previously synchronous).
+struct StatusJob {
+    generation: u64,
+    repos: Vec<Git>,
+    drawers: Option<DrawerJob>,
+}
+
+struct DrawerJob {
+    git: Git,
+    history_target: Option<String>,
+    kinds: Vec<Drawer>,
+}
+
+type DrawerLines = Vec<(Drawer, Result<Vec<String>, String>)>;
+
+struct StatusResult {
+    generation: u64,
+    repos: Vec<(PathBuf, Result<Status, String>)>,
+    /// The drawer query with its lines: applied only while the same repo is
+    /// active and FILE HISTORY follows the same file.
+    drawers: Option<(DrawerJob, DrawerLines)>,
+}
+
+/// The worker body. Every git call in here is bounded (see `git.rs`), so a
+/// hung git cannot strand the single-flight worker.
+fn read_status(job: StatusJob) -> StatusResult {
+    let repos = job
+        .repos
+        .iter()
+        .map(|git| (git.root().to_path_buf(), git.status()))
+        .collect();
+    let drawers = job.drawers.map(|d| {
+        let lines = d
+            .kinds
+            .iter()
+            .map(|&kind| (kind, load_drawer(&d.git, kind, d.history_target.as_deref())))
+            .collect();
+        (d, lines)
+    });
+    StatusResult {
+        generation: job.generation,
+        repos,
+        drawers,
+    }
+}
+
+/// The row to select after a rebuild: the one whose stable id is `keep`
+/// (`ids` = every new row's id), else the previous index (clamped later).
+fn reselect(
+    ids: Option<&[Option<String>]>,
+    keep: Option<&str>,
+    previous: Option<usize>,
+) -> Option<usize> {
+    ids.zip(keep)
+        .and_then(|(ids, keep)| ids.iter().position(|id| id.as_deref() == Some(keep)))
+        .or(previous)
+}
+
+/// Apply fresh statuses, matched by repo ROOT (the repo set can change while
+/// a read runs). Replaces status data only: commit drafts, cursors and
+/// collapse state are view state and are never touched. Returns whether any
+/// status changed, and any errors newly reported by the affected repos.
+fn apply_repo_statuses(
+    repos: &mut [Repo],
+    generation: u64,
+    results: Vec<(PathBuf, Result<Status, String>)>,
+) -> (bool, Option<String>) {
+    let mut changed = false;
+    let mut errors = Vec::new();
+    for (root, result) in results {
+        let Some(repo) = repos.iter_mut().find(|r| r.git.root() == root) else {
+            continue;
+        };
+        match result {
+            Ok(status) => {
+                repo.freshness.succeeded(generation);
+                if !repo.loaded || repo.status != status {
+                    repo.status = status;
+                    repo.loaded = true;
+                    changed = true;
+                }
+            }
+            Err(e) => {
+                // The read finished; its error is flashed, not "loading…".
+                changed |= !repo.loaded;
+                repo.loaded = true;
+                if let Some(first) = repo.freshness.failed(e) {
+                    errors.push(first);
+                }
+            }
+        }
+    }
+    (changed, (!errors.is_empty()).then(|| errors.join(" | ")))
 }
 
 /// List rows; the first index on the repo-scoped variants is the repo.
@@ -634,10 +905,25 @@ enum MenuTarget {
         entry: FileEntry,
         staged: bool,
     },
-    Drawer {
-        kind: Drawer,
-        index: usize,
-    },
+    Drawer(DrawerTarget),
+}
+
+#[derive(Clone)]
+struct DrawerTarget {
+    root: PathBuf,
+    reference: DrawerRef,
+    path: Option<String>,
+}
+
+impl DrawerTarget {
+    fn capture(root: &Path, panel: &DrawerPanel, index: usize, path: Option<&str>) -> Option<Self> {
+        let reference = panel.refs.get(index)?;
+        (*reference != DrawerRef::None).then(|| Self {
+            root: root.to_path_buf(),
+            reference: reference.clone(),
+            path: path.map(str::to_owned),
+        })
+    }
 }
 
 /// Context-menu actions for file rows and drawer lines.
@@ -718,6 +1004,15 @@ enum MenuEntry {
     Separator,
 }
 
+#[derive(Clone)]
+enum ConfirmedGit {
+    Args(Vec<String>),
+    Stash {
+        subcommand: &'static str,
+        object: String,
+    },
+}
+
 /// A modal layered over the list; while open it owns keyboard and mouse input.
 enum Overlay {
     BranchPicker(BranchPicker),
@@ -738,9 +1033,16 @@ enum Overlay {
     },
     /// A y/N prompt guarding a destructive git command (reset, delete, drop).
     ConfirmGit {
-        repo: usize,
+        root: PathBuf,
         prompt: String,
-        args: Vec<String>,
+        command: ConfirmedGit,
+    },
+    /// The opt-in y/N before Sync (`confirm_git_ops`). Sync runs on a
+    /// background worker rather than through `run_git`, so it is not an argv.
+    ConfirmSync {
+        repo: usize,
+        target: SyncTarget,
+        prompt: String,
     },
     /// The ⚙ settings modal: mouse-toggleable panel settings.
     Settings {
@@ -758,16 +1060,21 @@ enum Setting {
     UnifiedSidebar,
     DockRight,
     SidebarWidth,
+    AutoHideBelow,
     IconTheme,
     ColorTheme,
+    SyntaxTheme,
     PreviewPlacement,
     AutoOpen,
+    CloseLonelyTab,
     StrictToggle,
     FocusOnOpen,
     FollowCwd,
     GitDecorations,
     GitFooter,
+    ConfirmGitOps,
     Hotkeys,
+    LetterHotkeys,
     Folder,
     ScmViewMode,
 }
@@ -937,6 +1244,7 @@ pub struct App {
     history_target: Option<String>,
     /// One-shot footer notice: (text, is_error). Cleared on the next key press.
     flash: Option<(String, bool)>,
+    shortcut_notice: bool,
     /// Pending ✧ commit-message generation, polled from tick().
     suggesting: Option<Receiver<String>>,
     /// Pending Sync Changes run, polled from tick().
@@ -964,6 +1272,8 @@ pub struct App {
     /// Whole tab area width from the last layout snapshot. Divider-only
     /// resizes leave this unchanged and are therefore respected.
     last_layout_width: Option<i64>,
+    /// Auto-hide in narrow tabs (⚙ Settings), as in the Explorer.
+    auto_hide: herdr_sidebar::autohide::Latch,
     last_height: u16,
     // Merged-sidebar state.
     sidebar_state: sidebar::State,
@@ -971,20 +1281,23 @@ pub struct App {
     pane_ctl: Option<PaneCtl>,
     /// Last heartbeat stamp, throttling the token refresh.
     last_beat: std::time::Instant,
-    /// A native folder picker running on a background thread; its result
-    /// arrives here (None = cancelled).
-    picking: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
-    /// Shared across rebuilds and unified-view switches so a manual folder
-    /// choice keeps its precedence until a known neighbour actually moves.
-    cwd_follower: std::rc::Rc<std::cell::RefCell<herdr_sidebar::launch::CwdFollower>>,
+    /// Result of the background native folder picker (None = cancelled).
+    picking: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
+    sidebar_activity: std::rc::Rc<std::cell::RefCell<herdr_sidebar::focus::SidebarActivity>>,
     /// Draft roots this pane loaded or successfully persisted. An empty box
     /// only clears one of these roots, so a stale sibling pane cannot erase a
     /// newer draft it never observed.
     persisted_draft_roots: std::collections::BTreeSet<String>,
-    pending_unified_width: Option<(u16, std::time::Instant)>,
+    pending_unified_width: Option<herdr_sidebar::ensure::PendingUnifiedClose>,
     pub tree_view: bool,
     /// Keep polling Git status while unfocused ([`sidebar::BACKGROUND_REFRESH_ENV`]).
     background_refresh: bool,
+    /// The background status worker: scheduling, and the in-flight result.
+    status_gate: RefreshGate,
+    status_rx: Option<Receiver<StatusResult>>,
+    /// The saved (selected row id, scroll) to restore once the first status
+    /// read has built the rows they refer to.
+    pending_restore: Option<(Option<String>, usize)>,
 }
 
 const MY_VIEW: View = View::SourceControl;
@@ -992,7 +1305,7 @@ const MY_VIEW: View = View::SourceControl;
 impl App {
     pub fn new(
         cwd: PathBuf,
-        cwd_follower: std::rc::Rc<std::cell::RefCell<herdr_sidebar::launch::CwdFollower>>,
+        sidebar_activity: std::rc::Rc<std::cell::RefCell<herdr_sidebar::focus::SidebarActivity>>,
     ) -> Self {
         let mut repos: Vec<Repo> = Git::discover_all(&cwd).into_iter().map(Repo::new).collect();
         let discover_err = if repos.is_empty() {
@@ -1077,6 +1390,7 @@ impl App {
             drawers,
             history_target,
             flash: None,
+            shortcut_notice: false,
             suggesting: None,
             syncing: None,
             overlay: None,
@@ -1091,13 +1405,17 @@ impl App {
             page: 20,
             last_width: sidebar_state.sidebar_width,
             last_layout_width,
+            auto_hide: herdr_sidebar::autohide::Latch::new(
+                sidebar_state.auto_hide_below,
+                last_layout_width,
+            ),
             last_height: 24,
             sidebar_state,
             other_exe,
             pane_ctl,
             last_beat: std::time::Instant::now(),
             picking: None,
-            cwd_follower,
+            sidebar_activity,
             persisted_draft_roots,
             pending_unified_width: None,
             tree_view,
@@ -1106,17 +1424,15 @@ impl App {
                     .ok()
                     .as_deref(),
             ),
+            status_gate: RefreshGate::new(std::time::Instant::now()),
+            status_rx: None,
+            pending_restore: Some((selected_id, saved_scroll)),
         };
         app.apply_identity();
-        app.refresh();
-        // Rows are built now: re-find the selected row by its stable id and
-        // restore the scroll the user left it on.
-        if let Some(id) = selected_id
-            && let Some(i) = app.find_row_by_stable_id(&id)
-        {
-            app.selected = Some(i);
-        }
-        app.scroll = saved_scroll.min(app.rows.len().saturating_sub(1));
+        // Show the view at once; status and drawers arrive from the worker,
+        // and the saved selection/scroll are restored when they do.
+        app.rebuild();
+        app.request_refresh();
         app
     }
 
@@ -1168,6 +1484,19 @@ impl App {
         self.close(true);
     }
 
+    /// The tab became too narrow (⚙ Auto-hide): close our pane without a
+    /// snooze marker, so the quiet ensure hook docks it again once the tab
+    /// is wide. Never the tab's last pane: that would close the whole tab.
+    /// `close` saves commit drafts first and stays open if it cannot.
+    fn auto_hide_now(&mut self) {
+        let Some(ctl) = &self.pane_ctl else { return };
+        let company = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({}))
+            .is_ok_and(|json| herdr_sidebar::autohide::has_company(&json, &ctl.pane_id));
+        if company {
+            self.close(false);
+        }
+    }
+
     fn close(&mut self, snooze: bool) {
         // Closing our own pane kills this process: save a pending remembered
         // root first (the outer loop's flush never runs on this path).
@@ -1205,27 +1534,115 @@ impl App {
         );
     }
 
-    /// Re-read every repo's git status (this is the change auto-detection —
-    /// tick() calls it every [`crate::REFRESH_EVERY`]); keeps the flash so
-    /// periodic ticks don't eat notices.
-    pub fn refresh(&mut self) {
-        let mut error = None;
-        for repo in &mut self.repos {
-            match repo.git.status() {
-                Ok(status) => repo.status = status,
-                Err(e) => error = Some(e),
+    /// Re-read every repo's git status after something changed it (a git
+    /// action, `r`, a finished sync). The read runs on the background worker;
+    /// anything already in flight predates the change and is dropped.
+    fn request_refresh(&mut self) {
+        self.status_gate.invalidate();
+        self.start_status_read();
+    }
+
+    /// Start the queued background read, unless one is still running (it
+    /// starts when that one returns — see [`Self::collect_status`]).
+    fn start_status_read(&mut self) {
+        let Some(generation) = self.status_gate.start(std::time::Instant::now()) else {
+            return;
+        };
+        let drawers = self.active_repo().map(|repo| DrawerJob {
+            git: repo.git.clone(),
+            history_target: self.history_target.clone(),
+            kinds: Drawer::ALL
+                .into_iter()
+                .filter(|kind| self.drawers[kind.index()].expanded)
+                .collect(),
+        });
+        let job = StatusJob {
+            generation,
+            repos: self.repos.iter().map(|repo| repo.git.clone()).collect(),
+            drawers,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_status(job));
+        });
+        self.status_rx = Some(rx);
+    }
+
+    /// Whether a status read is in flight (the event loop polls faster).
+    pub fn status_pending(&self) -> bool {
+        self.status_gate.running()
+    }
+
+    /// Collect a finished status read, apply it when it is still current,
+    /// and start the coalesced follow-up read. Called every loop iteration;
+    /// keeps the flash so periodic reads don't eat notices.
+    pub fn collect_status(&mut self) {
+        let Some(rx) = &self.status_rx else { return };
+        let result = match rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.status_rx = None;
+        let current = self.status_gate.finish(
+            result.as_ref().map(|r| r.generation),
+            std::time::Instant::now(),
+        );
+        match result {
+            Some(result) if current => self.apply_status(result),
+            None => {
+                for repo in &mut self.repos {
+                    repo.freshness.generation = None;
+                }
             }
+            _ => {}
         }
+        self.start_status_read();
+    }
+
+    fn apply_status(&mut self, result: StatusResult) {
+        // Capture the selection's identity BEFORE the status it indexes into
+        // is replaced, so the cursor stays on the same file when rows shift.
+        let keep = match self.selected {
+            Some(i) => self.row_stable_id(i),
+            None => self.pending_restore.as_ref().and_then(|(id, _)| id.clone()),
+        };
+        let (mut changed, error) =
+            apply_repo_statuses(&mut self.repos, result.generation, result.repos);
         if let Some(e) = error {
             self.flash = Some((e, true));
         }
-        self.reload_expanded_drawers();
-        self.rebuild();
+        if let Some((job, drawers)) = result.drawers
+            && self
+                .active_repo()
+                .is_some_and(|repo| repo.git.root() == job.git.root())
+            && job.history_target == self.history_target
+        {
+            for (kind, lines) in drawers {
+                // A drawer collapsed meanwhile stays empty; one expanded
+                // meanwhile was already loaded synchronously by its toggle.
+                let panel = &mut self.drawers[kind.index()];
+                if panel.expanded {
+                    changed |= panel.fill(kind, lines);
+                }
+            }
+        }
+        let restore = self.pending_restore.take();
+        if !changed && restore.is_none() {
+            return;
+        }
+        self.rebuild_selecting(keep.as_deref());
+        if let Some((_, scroll)) = restore
+            && self.scroll == 0
+        {
+            self.scroll = scroll.min(self.rows.len().saturating_sub(1));
+        }
     }
 
     /// Re-stamp the identity tokens so launchers know this pane is alive.
     pub fn heartbeat(&mut self) {
         self.poll_unified_close();
+        self.follow_sibling_cwd();
         if self.last_beat.elapsed() < std::time::Duration::from_secs(5) {
             return;
         }
@@ -1233,91 +1650,86 @@ impl App {
         if let Some(ctl) = &self.pane_ctl {
             ctl.report_tokens(MY_VIEW, self.merged());
         }
-        self.follow_sibling_cwd();
     }
 
     fn poll_unified_close(&mut self) -> bool {
-        let Some((target, started)) = self.pending_unified_width else {
+        use herdr_sidebar::ensure::UnifiedClose;
+
+        let Some(pending) = &mut self.pending_unified_width else {
             return false;
         };
-        let Some(pane_id) = self.pane_ctl.as_ref().map(|ctl| ctl.pane_id.clone()) else {
-            self.pending_unified_width = None;
-            return false;
-        };
-        let Ok(json) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) else {
-            return false;
-        };
-        if sibling_panes_of(&json, &pane_id, MY_VIEW.other()).is_empty() {
-            self.pending_unified_width = None;
-            if let Some(ctl) = &self.pane_ctl {
-                ctl.resize_to(self.last_width, target, self.sidebar_state.dock_right);
+        match pending.poll() {
+            UnifiedClose::Waiting => false,
+            UnifiedClose::Closed(width) => {
+                self.pending_unified_width = None;
+                if let Some(ctl) = &self.pane_ctl {
+                    ctl.resize_to(self.last_width, width, self.sidebar_state.dock_right);
+                }
+                true
             }
-            return true;
+            UnifiedClose::TimedOut => {
+                self.pending_unified_width = None;
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.merged = false;
+                    state.active = MY_VIEW;
+                });
+                self.apply_identity();
+                self.flash = Some(("Explorer stayed open; unified mode cancelled".into(), true));
+                false
+            }
         }
-        if started.elapsed() >= std::time::Duration::from_secs(2) {
-            self.pending_unified_width = None;
-            self.sidebar_state = sidebar::update_state(|state| {
-                state.merged = false;
-                state.active = MY_VIEW;
-            });
-            self.apply_identity();
-            self.flash = Some(("Explorer stayed open; unified mode cancelled".into(), true));
-        }
-        false
     }
 
-    fn pane_is_focused(&self) -> bool {
-        let Some(pane_id) = self.pane_ctl.as_ref().map(|ctl| ctl.pane_id.as_str()) else {
-            return true;
-        };
-        herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({}))
-            .ok()
-            .is_some_and(|json| pane_focused_in(&json, pane_id))
+    fn sync_follow_setting(&mut self, enabled: bool) {
+        if self.sidebar_state.follow_cwd != enabled {
+            self.sidebar_state.follow_cwd = enabled;
+            self.sidebar_activity.borrow_mut().reset_follower();
+        }
     }
 
     fn follow_sibling_cwd(&mut self) {
-        if !self.sidebar_state.follow_cwd
-            || self.overlay.is_some()
-            || self.picking.is_some()
-            || self.suggesting.is_some()
-            || self.syncing.is_some()
-            || commit_draft_present(self.repos.iter().map(|repo| repo.message.as_slice()))
-        {
-            return;
-        }
-        let Some(ctl) = &self.pane_ctl else { return };
-        let Ok(panes) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) else {
-            return;
-        };
+        let follow = self.sidebar_state.follow_cwd
+            && self.overlay.is_none()
+            && self.picking.is_none()
+            && self.suggesting.is_none()
+            && self.syncing.is_none()
+            && !commit_draft_present(self.repos.iter().map(|repo| repo.message.as_slice()));
         let target = self
-            .cwd_follower
+            .sidebar_activity
             .borrow_mut()
-            .next_cwd(&panes, &ctl.pane_id);
+            .poll(follow, !self.background_refresh);
         let Some(target) = target else { return };
         let target = PathBuf::from(target);
         if target == self.cwd || !target.is_dir() || std::env::set_current_dir(&target).is_err() {
             return;
         }
         let root = std::env::current_dir().unwrap_or(target);
-        let cwd_follower = std::rc::Rc::clone(&self.cwd_follower);
-        *self = App::new(root, cwd_follower);
+        let activity = std::rc::Rc::clone(&self.sidebar_activity);
+        *self = App::new(root, activity);
     }
 
     /// Periodic timer tick: retry repo discovery if we started outside one,
     /// pick up external changes, and collect finished ✧ suggestion / sync runs.
     pub fn tick(&mut self) {
         let shared = sidebar::load_state();
+        self.sync_follow_setting(shared.follow_cwd);
         self.sidebar_state.git_deco = shared.git_deco;
         self.sidebar_state.show_git_footer = shared.show_git_footer;
         self.sidebar_state.dock_right = shared.dock_right;
         self.sidebar_state.strict_toggle = shared.strict_toggle;
         self.sidebar_state.focus_on_open = shared.focus_on_open;
+        self.sidebar_state.auto_hide_below = shared.auto_hide_below;
+        self.sidebar_state.confirm_git_ops = shared.confirm_git_ops;
+        self.sidebar_state.close_lonely_tab = shared.close_lonely_tab;
+        self.sidebar_state.letter_hotkeys = shared.letter_hotkeys;
         if shared.scm_tree_view != self.tree_view {
             // Toggled from another pane (separated view, a preview tab).
             self.tree_view = shared.scm_tree_view;
             self.sidebar_state.scm_tree_view = shared.scm_tree_view;
             self.rebuild();
         }
+        self.sidebar_state.syntax_dark = shared.syntax_dark;
+        self.sidebar_state.syntax_light = shared.syntax_light;
         if shared.color_theme != self.sidebar_state.color_theme {
             self.sidebar_state.color_theme = shared.color_theme;
             set_color_theme(shared.color_theme);
@@ -1361,8 +1773,16 @@ impl App {
                     self.syncing = None;
                 }
             }
+            if self.syncing.is_none() {
+                // Even a failed pull/push may have moved refs.
+                self.request_refresh();
+            }
         }
-        if !self.background_refresh && !self.pane_is_focused() {
+        // Periodic reads are throttled by the gate (adaptive to the last
+        // read's duration), and back off while this pane is unfocused.
+        if !self.status_gate.periodic_due(std::time::Instant::now())
+            || (!self.background_refresh && !self.sidebar_activity.borrow().pane_is_focused())
+        {
             return;
         }
         if self.repos.is_empty() {
@@ -1370,11 +1790,15 @@ impl App {
                 .into_iter()
                 .map(Repo::new)
                 .collect();
-            if !self.repos.is_empty() {
-                self.discover_err.clear();
+            if self.repos.is_empty() {
+                return;
             }
+            self.discover_err.clear();
+            self.request_refresh();
+            return;
         }
-        self.refresh();
+        self.status_gate.queue();
+        self.start_status_read();
     }
 
     pub fn is_syncing(&self) -> bool {
@@ -1391,7 +1815,16 @@ impl App {
                 .zip(layout_width)
                 .is_some_and(|(before, now)| before != now);
             self.last_layout_width = layout_width.or(self.last_layout_width);
-            if !unified_close_completed && surrounding_changed {
+            // A standalone Source Control pane is never docked by the ensure
+            // hook, so only the unified sidebar hides for width.
+            let auto_hide = self.merged()
+                && layout_width.is_some_and(|width| {
+                    self.auto_hide
+                        .observe(self.sidebar_state.auto_hide_below, width)
+                });
+            if !unified_close_completed && auto_hide {
+                self.auto_hide_now();
+            } else if !unified_close_completed && surrounding_changed {
                 ctl.resize_preferred(
                     width,
                     self.sidebar_state.sidebar_width,
@@ -1432,52 +1865,22 @@ impl App {
         let Some(git) = self.active_repo().map(|r| r.git.clone()) else {
             return;
         };
-        let git = &git;
         for kind in Drawer::ALL {
             if !self.drawers[kind.index()].expanded {
                 continue;
             }
-            let lines = match kind {
-                Drawer::Graph => git.graph(DRAWER_LIMIT),
-                Drawer::Commits => git.commits(DRAWER_LIMIT),
-                Drawer::FileHistory => match &self.history_target {
-                    Some(path) => git.file_history(path, DRAWER_LIMIT),
-                    None => Ok(vec!["(select a file above)".to_string()]),
-                },
-                Drawer::Branches => git.branches(),
-                Drawer::Worktrees => git.worktrees(),
-                Drawer::Remotes => git.remotes(),
-                Drawer::Stashes => git.stashes(),
-                Drawer::Tags => git.tags(),
-            };
-            self.drawers[kind.index()].lines = match lines {
-                Ok(lines) if lines.is_empty() => vec!["(none)".to_string()],
-                Ok(lines) => lines,
-                Err(e) => vec![format!("({e})")],
-            };
-            let panel = &mut self.drawers[kind.index()];
-            panel.refs = panel
-                .lines
-                .iter()
-                .map(|l| parse_drawer_ref(kind, l))
-                .collect();
-            match kind {
-                Drawer::Worktrees => {
-                    panel.lines = panel
-                        .lines
-                        .iter()
-                        .map(|l| pretty_worktree_line(l))
-                        .collect();
-                }
-                Drawer::Remotes => {
-                    panel.lines = panel.lines.iter().map(|l| pretty_remote_line(l)).collect();
-                }
-                _ => {}
-            }
+            let lines = load_drawer(&git, kind, self.history_target.as_deref());
+            self.drawers[kind.index()].fill(kind, lines);
         }
     }
 
     fn rebuild(&mut self) {
+        self.rebuild_selecting(None);
+    }
+
+    /// Rebuild the rows; `keep` re-finds the selection by stable id (falling
+    /// back to the clamped old index when that row is gone).
+    fn rebuild_selecting(&mut self, keep: Option<&str>) {
         self.rows.clear();
         let multi = self.repos.len() > 1;
         if self.tree_view {
@@ -1544,8 +1947,13 @@ impl App {
             self.hovered = None;
             return;
         }
-        if let Some(sel) = self.selected {
-            let index = sel.min(self.rows.len() - 1);
+        let ids = keep.map(|_| {
+            (0..self.rows.len())
+                .map(|i| self.row_stable_id(i))
+                .collect::<Vec<_>>()
+        });
+        if let Some(i) = reselect(ids.as_deref(), keep, self.selected) {
+            let index = i.min(self.rows.len() - 1);
             self.selected = Some(self.nearest_selectable(index));
         }
         self.scroll = self.scroll.min(self.rows.len() - 1);
@@ -1607,10 +2015,21 @@ impl App {
     }
 
     /// Handle one key press; `Some(exit)` ends the event loop.
-    pub fn on_key(&mut self, key: KeyEvent) -> Option<Exit> {
+    pub fn on_key(&mut self, key: KeyEvent, shortcut_notice_shown: &mut bool) -> Option<Exit> {
         if key.kind != KeyEventKind::Press {
             return None;
         }
+        if self.overlay.is_none()
+            && self.focus == Focus::List
+            && ignore_letter_hotkey(key, self.sidebar_state.letter_hotkeys)
+        {
+            if !std::mem::replace(shortcut_notice_shown, true) {
+                self.flash = None;
+                self.shortcut_notice = true;
+            }
+            return None;
+        }
+        self.shortcut_notice = false;
         if key.code == KeyCode::Char('q')
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
@@ -1660,6 +2079,10 @@ impl App {
         }
         if self.overlay.is_some() {
             self.overlay_key(key);
+            return None;
+        }
+        if key.code == SETTINGS_KEY && key.modifiers.is_empty() {
+            self.open_settings();
             return None;
         }
         if matches!(key.code, KeyCode::Char('f' | 'F'))
@@ -1755,7 +2178,7 @@ impl App {
             KeyCode::Char('t') => self.toggle_tree_view(),
             KeyCode::Char('a') => self.stage_all(),
             KeyCode::Char('u') => self.unstage_all(),
-            KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('r') => self.request_refresh(),
             KeyCode::Char('i') => self.set_theme(self.theme.toggled()),
             KeyCode::Char('A') => self.suggest_message(),
             KeyCode::Char('s') => self.open_settings(),
@@ -1792,6 +2215,7 @@ impl App {
                 // Reaches us only as Ctrl+right-click (herdr's passthrough
                 // modifier); plain right-click opens herdr's own pane menu.
                 self.flash = None;
+                self.shortcut_notice = false;
                 self.open_context_menu(mouse.column, mouse.row);
             }
             _ => {}
@@ -1801,6 +2225,7 @@ impl App {
 
     fn left_click(&mut self, mouse: MouseEvent) -> Option<Exit> {
         self.flash = None;
+        self.shortcut_notice = false;
         if hits_collapse_button(mouse.column, mouse.row, self.last_width, self.last_height) {
             self.hide();
             return None;
@@ -1825,7 +2250,7 @@ impl App {
         if let Some(&(_, action)) = self.title_zones.iter().find(|(rect, _)| hits(*rect, x, y)) {
             match action {
                 TitleAction::ViewAsTree | TitleAction::ViewAsList => self.toggle_tree_view(),
-                TitleAction::Refresh => self.refresh(),
+                TitleAction::Refresh => self.request_refresh(),
                 TitleAction::CollapseAll => self.collapse_all(),
                 _ => {}
             }
@@ -1924,7 +2349,7 @@ impl App {
                                 if let Err(error) = self.repos[r].git.unstage(&entry) {
                                     self.flash = Some((error, true));
                                 }
-                                self.refresh();
+                                self.request_refresh();
                             }
                             _ if double && self.pin_if_open(index) => {
                                 // pinned the first click's tab
@@ -1949,7 +2374,7 @@ impl App {
                                 if let Err(error) = self.repos[r].git.stage(&entry) {
                                     self.flash = Some((error, true));
                                 }
-                                self.refresh();
+                                self.request_refresh();
                             }
                             _ if double && self.pin_if_open(index) => {
                                 // pinned the first click's tab
@@ -2009,7 +2434,7 @@ impl App {
                         {
                             self.flash = Some((e, true));
                         }
-                        self.refresh();
+                        self.request_refresh();
                     } else {
                         self.activate();
                     }
@@ -2152,10 +2577,10 @@ impl App {
 
     /// The context menu for a commit / branch / stash / remote / tag.
     fn open_drawer_menu(&mut self, x: u16, y: u16, kind: Drawer, index: usize) {
-        let Some(dref) = self.drawers[kind.index()].refs.get(index) else {
+        let Some(target) = self.drawer_target(kind, index) else {
             return;
         };
-        let entries: Vec<MenuEntry> = match dref {
+        let entries: Vec<MenuEntry> = match &target.reference {
             DrawerRef::Commit(_) => vec![
                 MenuEntry::Action(MenuAction::ShowRef, "Show Changes"),
                 MenuEntry::Separator,
@@ -2209,7 +2634,7 @@ impl App {
         self.overlay = Some(Overlay::Menu {
             x,
             y,
-            target: MenuTarget::Drawer { kind, index },
+            target: MenuTarget::Drawer(target),
             entries,
             selected: 0,
             rect: Rect::default(),
@@ -2223,9 +2648,11 @@ impl App {
             Activate,
             ToggleSetting(usize),
             AdjustWidth(bool),
+            AdjustAutoHide(bool),
             DiscardConfirmed(usize, FileEntry),
             DiscardAllConfirmed(usize),
-            GitConfirmed(usize, Vec<String>),
+            GitConfirmed(PathBuf, ConfirmedGit),
+            SyncConfirmed(usize, SyncTarget),
             Picker(PickerAction),
         }
         let settings = self.settings_rows();
@@ -2266,6 +2693,16 @@ impl App {
                 {
                     Cmd::AdjustWidth(true)
                 }
+                KeyCode::Left | KeyCode::Char('h')
+                    if settings.get(*selected).map(|row| row.0) == Some(Setting::AutoHideBelow) =>
+                {
+                    Cmd::AdjustAutoHide(false)
+                }
+                KeyCode::Right | KeyCode::Char('l')
+                    if settings.get(*selected).map(|row| row.0) == Some(Setting::AutoHideBelow) =>
+                {
+                    Cmd::AdjustAutoHide(true)
+                }
                 KeyCode::Enter | KeyCode::Char(' ') => Cmd::ToggleSetting(*selected),
                 _ => Cmd::Nothing,
             },
@@ -2280,8 +2717,16 @@ impl App {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Cmd::DiscardAllConfirmed(*repo),
                 _ => Cmd::Close,
             },
-            Some(Overlay::ConfirmGit { repo, args, .. }) => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => Cmd::GitConfirmed(*repo, args.clone()),
+            Some(Overlay::ConfirmGit { root, command, .. }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    Cmd::GitConfirmed(root.clone(), command.clone())
+                }
+                _ => Cmd::Close,
+            },
+            Some(Overlay::ConfirmSync { repo, target, .. }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    Cmd::SyncConfirmed(*repo, target.clone())
+                }
                 _ => Cmd::Close,
             },
             None => Cmd::Nothing,
@@ -2292,15 +2737,28 @@ impl App {
             Cmd::Activate => self.activate_menu_entry(),
             Cmd::ToggleSetting(index) => self.toggle_setting(index),
             Cmd::AdjustWidth(wider) => self.adjust_sidebar_width(wider),
-            Cmd::GitConfirmed(repo, args) => {
+            Cmd::AdjustAutoHide(wider) => self.adjust_auto_hide_below(wider),
+            Cmd::GitConfirmed(root, command) => {
                 self.overlay = None;
-                match safe_branch_delete(&args) {
-                    Some(branch) => self.delete_branch(repo, branch.to_string()),
-                    None => {
-                        let strs: Vec<&str> = args.iter().map(String::as_str).collect();
-                        self.run_git(repo, &strs);
+                let Some(repo) = self.repo_index(&root) else {
+                    return;
+                };
+                match command {
+                    ConfirmedGit::Args(args) => match safe_branch_delete(&args) {
+                        Some(branch) => self.delete_branch(repo, branch.to_string()),
+                        None => {
+                            let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+                            self.run_git(repo, &strs);
+                        }
+                    },
+                    ConfirmedGit::Stash { subcommand, object } => {
+                        self.run_stash(repo, subcommand, &object);
                     }
                 }
+            }
+            Cmd::SyncConfirmed(repo, target) => {
+                self.overlay = None;
+                self.start_sync(repo, Some(target));
             }
             Cmd::DiscardConfirmed(repo, entry) => {
                 self.overlay = None;
@@ -2312,7 +2770,7 @@ impl App {
                     Ok(()) => self.flash = Some((format!("discarded {}", entry.path), false)),
                     Err(e) => self.flash = Some((e, true)),
                 }
-                self.refresh();
+                self.request_refresh();
             }
             Cmd::DiscardAllConfirmed(repo) => {
                 self.overlay = None;
@@ -2450,7 +2908,7 @@ impl App {
                 match picker.git.checkout_branch(&branch) {
                     Ok(()) => {
                         self.flash = Some((format!("switched to {}", branch.name), false));
-                        self.refresh();
+                        self.request_refresh();
                     }
                     Err(error) => self.flash = Some((error, true)),
                 }
@@ -2462,7 +2920,7 @@ impl App {
                 match picker.git.create_branch(&name) {
                     Ok(()) => {
                         self.flash = Some((format!("created {name}"), false));
-                        self.refresh();
+                        self.request_refresh();
                     }
                     Err(error) => self.flash = Some((error, true)),
                 }
@@ -2516,6 +2974,12 @@ impl App {
                 true,
             ),
             (
+                Setting::AutoHideBelow,
+                "Auto-hide below",
+                sidebar::auto_hide_below_label(self.sidebar_state.auto_hide_below),
+                true,
+            ),
+            (
                 Setting::IconTheme,
                 "Icon theme",
                 match self.theme {
@@ -2531,6 +2995,10 @@ impl App {
                 self.sidebar_state.color_theme.label().to_string(),
                 true,
             ),
+            {
+                let (label, value) = self.sidebar_state.syntax_theme_row();
+                (Setting::SyntaxTheme, label, value, true)
+            },
             (
                 Setting::PreviewPlacement,
                 "Preview opens in",
@@ -2549,9 +3017,31 @@ impl App {
                 true,
             ),
             (
+                Setting::LetterHotkeys,
+                sidebar::LETTER_HOTKEYS_LABEL,
+                if self.sidebar_state.letter_hotkeys {
+                    "on"
+                } else {
+                    "off"
+                }
+                .into(),
+                true,
+            ),
+            (
                 Setting::AutoOpen,
                 "Auto-open sidebar",
                 if self.sidebar_state.auto_open {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
+                Setting::CloseLonelyTab,
+                sidebar::CLOSE_LONELY_TAB_LABEL,
+                if self.sidebar_state.close_lonely_tab {
                     "on"
                 } else {
                     "off"
@@ -2610,6 +3100,17 @@ impl App {
                 true,
             ),
             (
+                Setting::ConfirmGitOps,
+                gitconfirm::SETTING_LABEL,
+                if self.sidebar_state.confirm_git_ops {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
                 Setting::ScmViewMode,
                 "View as",
                 if self.tree_view { "tree" } else { "list" }.to_string(),
@@ -2654,12 +3155,16 @@ impl App {
                     sidebar::update_state(|state| state.dock_right = !state.dock_right);
             }
             Setting::SidebarWidth => self.adjust_sidebar_width(true),
+            Setting::AutoHideBelow => self.adjust_auto_hide_below(true),
             Setting::IconTheme => self.set_theme(self.theme.toggled()),
             Setting::ColorTheme => {
                 self.sidebar_state = sidebar::update_state(|state| {
                     state.color_theme = state.color_theme.next();
                 });
                 set_color_theme(self.sidebar_state.color_theme);
+            }
+            Setting::SyntaxTheme => {
+                self.sidebar_state = sidebar::update_state(sidebar::State::cycle_syntax_theme);
             }
             Setting::PreviewPlacement => {
                 self.sidebar_state = sidebar::update_state(|state| {
@@ -2670,9 +3175,18 @@ impl App {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.show_hotkeys = !state.show_hotkeys);
             }
+            Setting::LetterHotkeys => {
+                self.sidebar_state =
+                    sidebar::update_state(|state| state.letter_hotkeys = !state.letter_hotkeys);
+            }
             Setting::AutoOpen => {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.auto_open = !state.auto_open);
+            }
+            Setting::CloseLonelyTab => {
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.close_lonely_tab = !state.close_lonely_tab;
+                });
             }
             Setting::StrictToggle => {
                 self.sidebar_state =
@@ -2685,7 +3199,7 @@ impl App {
             Setting::FollowCwd => {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.follow_cwd = !state.follow_cwd);
-                self.cwd_follower.borrow_mut().reset();
+                self.sidebar_activity.borrow_mut().reset_follower();
             }
             Setting::GitDecorations => {
                 self.sidebar_state =
@@ -2696,11 +3210,22 @@ impl App {
                     state.show_git_footer = !state.show_git_footer;
                 });
             }
+            Setting::ConfirmGitOps => {
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.confirm_git_ops = !state.confirm_git_ops;
+                });
+            }
             Setting::Folder => {
                 self.overlay = None;
                 self.change_folder_dialog();
             }
         }
+    }
+
+    fn adjust_auto_hide_below(&mut self, wider: bool) {
+        self.sidebar_state = sidebar::update_state(|state| {
+            state.auto_hide_below = sidebar::step_auto_hide_below(state.auto_hide_below, wider);
+        });
     }
 
     fn adjust_sidebar_width(&mut self, wider: bool) {
@@ -2752,10 +3277,10 @@ impl App {
                 if std::env::set_current_dir(&path).is_ok() {
                     let root = std::env::current_dir().unwrap_or(path);
                     if self.sidebar_state.follow_cwd {
-                        self.cwd_follower.borrow_mut().mark_manual_folder();
+                        self.sidebar_activity.borrow_mut().mark_manual_folder();
                     }
-                    let cwd_follower = std::rc::Rc::clone(&self.cwd_follower);
-                    *self = App::new(root, cwd_follower);
+                    let activity = std::rc::Rc::clone(&self.sidebar_activity);
+                    *self = App::new(root, activity);
                 } else {
                     self.flash = Some((format!("cannot open {}", path.display()), true));
                 }
@@ -2822,7 +3347,7 @@ impl App {
             Style::default().bold(),
         )));
         lines.extend(hint_lines);
-        lines.push(Line::from(" click/⏎ · ←/→ width · esc".dim()));
+        lines.push(Line::from(" click/⏎ · ←/→ adjust · esc".dim()));
 
         frame.render_widget(Clear, popup);
         frame.render_widget(
@@ -2854,7 +3379,7 @@ impl App {
                 entry,
                 staged,
             } => self.file_menu_action(action, repo, entry, staged),
-            MenuTarget::Drawer { kind, index } => self.drawer_menu_action(action, kind, index),
+            MenuTarget::Drawer(target) => self.drawer_menu_action(action, target),
             MenuTarget::Dir { repo, path, staged } => {
                 self.dir_menu_action(action, repo, path, staged)
             }
@@ -2974,7 +3499,7 @@ impl App {
                 if let Err(e) = result {
                     self.flash = Some((e, true));
                 }
-                self.refresh();
+                self.request_refresh();
             }
             MenuAction::OpenDiff => self.open_diff(repo, &entry, staged),
             MenuAction::Discard => self.overlay = Some(Overlay::ConfirmDiscard { repo, entry }),
@@ -3014,23 +3539,25 @@ impl App {
         }
     }
 
-    fn drawer_menu_action(&mut self, action: MenuAction, kind: Drawer, index: usize) {
-        let Some(dref) = self.drawers[kind.index()].refs.get(index).cloned() else {
+    fn drawer_menu_action(&mut self, action: MenuAction, target: DrawerTarget) {
+        if action == MenuAction::ShowRef {
+            self.show_drawer_target(&target);
+            return;
+        }
+        let Some(repo) = self.repo_index(&target.root) else {
             return;
         };
-        let repo = self.active;
-        let spec = match &dref {
-            DrawerRef::Commit(h) => h.clone(),
-            DrawerRef::Stash(n) => format!("stash@{{{n}}}"),
-            DrawerRef::Branch { name, .. } => name.clone(),
-            DrawerRef::Remote { name, .. } => name.clone(),
-            DrawerRef::Tag(t) => t.clone(),
-            DrawerRef::Worktree(p) => p.clone(),
-            DrawerRef::None => return,
+        let dref = target.reference;
+        let Some(spec) = drawer_spec(&dref) else {
+            return;
         };
         let git_spec = drawer_git_spec(&dref).unwrap_or_else(|| spec.clone());
+        let current = self
+            .repos
+            .get(repo)
+            .map(|r| r.status.branch.clone())
+            .unwrap_or_default();
         match action {
-            MenuAction::ShowRef => self.open_drawer_ref(kind, index),
             MenuAction::Reveal => reveal(std::path::Path::new(&spec), true),
             MenuAction::RemoveWorktree => self.confirm_git(
                 repo,
@@ -3052,20 +3579,50 @@ impl App {
             }
             MenuAction::Checkout => {
                 if let Some(args) = drawer_checkout_args(&dref, &spec, &git_spec) {
-                    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-                    self.run_git(repo, &args);
+                    let detached = matches!(dref, DrawerRef::Commit(_) | DrawerRef::Tag(_));
+                    let op = GitOp::Checkout {
+                        target: &spec,
+                        detached,
+                    };
+                    self.run_git_guarded(repo, op, args);
                 }
             }
             MenuAction::MergeInto => {
-                self.run_git(repo, &["merge", "--no-edit", "--", &git_spec]);
+                let op = GitOp::Merge {
+                    source: &spec,
+                    into: &current,
+                };
+                self.run_git_guarded(repo, op, git_args(&["merge", "--no-edit", "--", &git_spec]));
             }
-            MenuAction::CherryPick => self.run_git(repo, &["cherry-pick", "--", &git_spec]),
+            MenuAction::CherryPick => {
+                let op = GitOp::CherryPick {
+                    commit: &spec,
+                    onto: &current,
+                };
+                self.run_git_guarded(repo, op, git_args(&["cherry-pick", "--", &git_spec]));
+            }
             MenuAction::Revert => {
-                self.run_git(repo, &["revert", "--no-edit", "--", &git_spec]);
+                let op = GitOp::Revert { commit: &spec };
+                self.run_git_guarded(
+                    repo,
+                    op,
+                    git_args(&["revert", "--no-edit", "--", &git_spec]),
+                );
             }
-            MenuAction::StashApply => self.run_git(repo, &["stash", "apply", "--", &spec]),
-            MenuAction::StashPop => self.run_git(repo, &["stash", "pop", "--", &spec]),
-            MenuAction::FetchRemote => self.run_git(repo, &["fetch", "--", &spec]),
+            MenuAction::StashApply => self.run_stash(repo, "apply", &spec),
+            MenuAction::StashPop => {
+                let stash = format!("stash {}", &spec[..7]);
+                let op = GitOp::StashPop { stash: &stash };
+                if op.needs_confirm(self.sidebar_state.confirm_git_ops) {
+                    self.flash = None;
+                    self.confirm_stash(target.root, op.prompt(), "pop", spec);
+                } else {
+                    self.run_stash(repo, "pop", &spec);
+                }
+            }
+            MenuAction::FetchRemote => {
+                self.run_git_guarded(repo, GitOp::Fetch, git_args(&["fetch", "--", &spec]));
+            }
             MenuAction::ResetHere => self.confirm_git(
                 repo,
                 format!("Reset current branch to {spec} (mixed)? (y/N)"),
@@ -3076,10 +3633,11 @@ impl App {
                 format!("Delete branch '{spec}'? (y/N)"),
                 vec!["branch".into(), "-d".into(), "--".into(), spec],
             ),
-            MenuAction::StashDrop => self.confirm_git(
-                repo,
-                format!("Drop {spec}? (y/N)"),
-                vec!["stash".into(), "drop".into(), "--".into(), spec],
+            MenuAction::StashDrop => self.confirm_stash(
+                target.root,
+                format!("Drop stash {}? (y/N)", &spec[..7]),
+                "drop",
+                spec,
             ),
             MenuAction::DeleteTag => self.confirm_git(
                 repo,
@@ -3101,11 +3659,60 @@ impl App {
             Ok(_) => self.flash = Some((format!("git {} ✓", args.join(" ")), false)),
             Err(e) => self.flash = Some((e, true)),
         }
-        self.refresh();
+        self.request_refresh();
+    }
+
+    fn repo_index(&mut self, root: &Path) -> Option<usize> {
+        let index = self.repos.iter().position(|repo| repo.git.root() == root);
+        if index.is_none() {
+            self.flash = Some(("repository is gone".into(), true));
+        }
+        index
+    }
+
+    fn run_stash(&mut self, repo: usize, subcommand: &str, object: &str) {
+        let require_unique = matches!(subcommand, "pop" | "drop");
+        match self.repos[repo].git.stash_selector(object, require_unique) {
+            Ok(selector) => self.run_git(repo, &["stash", subcommand, "--", &selector]),
+            Err(error) => {
+                self.flash = Some((error, true));
+                self.request_refresh();
+            }
+        }
     }
 
     fn confirm_git(&mut self, repo: usize, prompt: String, args: Vec<String>) {
-        self.overlay = Some(Overlay::ConfirmGit { repo, prompt, args });
+        self.overlay = Some(Overlay::ConfirmGit {
+            root: self.repos[repo].git.root().to_path_buf(),
+            prompt,
+            command: ConfirmedGit::Args(args),
+        });
+    }
+
+    fn confirm_stash(
+        &mut self,
+        root: PathBuf,
+        prompt: String,
+        subcommand: &'static str,
+        object: String,
+    ) {
+        self.overlay = Some(Overlay::ConfirmGit {
+            root,
+            prompt,
+            command: ConfirmedGit::Stash { subcommand, object },
+        });
+    }
+
+    /// Run a one-click git op now, or behind the opt-in y/N
+    /// (`confirm_git_ops`) when `op` is one it guards.
+    fn run_git_guarded(&mut self, repo: usize, op: GitOp<'_>, args: Vec<String>) {
+        if op.needs_confirm(self.sidebar_state.confirm_git_ops) {
+            self.flash = None;
+            self.confirm_git(repo, op.prompt(), args);
+        } else {
+            let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+            self.run_git(repo, &strs);
+        }
     }
 
     /// The confirmed non-forcing delete. Unmerged commits are the one refusal
@@ -3122,11 +3729,11 @@ impl App {
         match git.delete_branch(&branch) {
             Ok(()) => {
                 self.flash = Some((format!("deleted {branch}"), false));
-                self.refresh();
+                self.request_refresh();
             }
             Err(DeleteRefused::Failed(error)) => {
                 self.flash = Some((error, true));
-                self.refresh();
+                self.request_refresh();
             }
             Err(DeleteRefused::NotMerged) => self.confirm_git(
                 repo,
@@ -3152,7 +3759,7 @@ impl App {
                 {
                     self.flash = Some((error, true));
                 }
-                self.refresh();
+                self.request_refresh();
             }
         }
     }
@@ -3174,33 +3781,38 @@ impl App {
         } else {
             (errors.join("; "), true)
         });
-        self.refresh();
+        self.request_refresh();
     }
 
-    /// Click/⏎ on a drawer line: show the commit / stash / tag / branch tip
-    /// in the preview pane (scrollable colored `git show`).
+    fn drawer_target(&self, kind: Drawer, index: usize) -> Option<DrawerTarget> {
+        let repo = self.active_repo()?;
+        let path = if kind == Drawer::FileHistory {
+            self.history_target.as_deref()
+        } else {
+            None
+        };
+        DrawerTarget::capture(repo.git.root(), &self.drawers[kind.index()], index, path)
+    }
+
+    /// Click/⏎ on a drawer line: show the captured ref in the preview pane.
     fn open_drawer_ref(&mut self, kind: Drawer, index: usize) {
+        if let Some(target) = self.drawer_target(kind, index) {
+            self.show_drawer_target(&target);
+        }
+    }
+
+    fn show_drawer_target(&mut self, target: &DrawerTarget) {
         let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) else {
             self.flash = Some(("preview needs a herdr pane".into(), true));
             return;
         };
-        let Some(repo) = self.repos.get(self.active) else {
+        let Some(spec) = drawer_git_spec(&target.reference) else {
             return;
         };
-        let Some(spec) = self.drawers[kind.index()]
-            .refs
-            .get(index)
-            .and_then(drawer_git_spec)
-        else {
-            return;
-        };
-        let path = (kind == Drawer::FileHistory)
-            .then(|| self.history_target.clone())
-            .flatten();
-        let payload = herdr_sidebar::viewer::show_request(repo.git.root(), &spec, path.as_deref());
-        let doc_key =
-            herdr_sidebar::viewer::doc_key_for_show(repo.git.root(), &spec, path.as_deref());
-        match herdr_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &doc_key, &payload) {
+        let path = target.path.as_deref();
+        let payload = herdr_sidebar::viewer::show_request(&target.root, &spec, path);
+        let doc_key = herdr_sidebar::viewer::doc_key_for_show(&target.root, &spec, path);
+        match herdr_sidebar::viewer::open_in_pane(&pane_id, &target.root, &doc_key, &payload) {
             Ok(target) => {
                 self.last_preview = Some((doc_key, target));
             }
@@ -3347,11 +3959,6 @@ impl App {
         }
     }
 
-    /// Inverse of [`row_stable_id`]: the row whose id matches, if any.
-    fn find_row_by_stable_id(&self, id: &str) -> Option<usize> {
-        (0..self.rows.len()).find(|&i| self.row_stable_id(i).as_deref() == Some(id))
-    }
-
     /// A snapshot of the view state worth mirroring into a new tab.
     fn snapshot_scm(&self) -> sidebar::ScmState {
         let drawers = Drawer::ALL
@@ -3363,7 +3970,15 @@ impl App {
             .repos
             .get(self.active)
             .map(|r| sidebar::scm_path_key(r.git.root()));
-        let selected = self.selected.and_then(|i| self.row_stable_id(i));
+        // Closed before the first status read landed: keep the saved
+        // selection/scroll rather than overwriting them with "nothing".
+        let (selected, scroll) = match (&self.pending_restore, self.selected) {
+            (Some((id, scroll)), None) => (id.clone(), *scroll),
+            _ => (
+                self.selected.and_then(|i| self.row_stable_id(i)),
+                self.scroll,
+            ),
+        };
         let drafts = self
             .repos
             .iter()
@@ -3400,7 +4015,7 @@ impl App {
             active_root,
             selected,
             history_target: self.history_target.clone(),
-            scroll: self.scroll,
+            scroll,
             drafts,
             cleared_drafts,
             collapsed_dirs,
@@ -3466,12 +4081,13 @@ impl App {
         });
         self.apply_identity();
         if on {
-            let width = self.last_width;
-            match self.close_other_standalone_pane() {
-                Ok(true) => {
-                    self.pending_unified_width = Some((width, std::time::Instant::now()));
-                }
-                Ok(false) => {}
+            let Some(ctl) = &self.pane_ctl else { return };
+            match herdr_sidebar::ensure::PendingUnifiedClose::request(
+                &ctl.pane_id,
+                MY_VIEW.other(),
+                self.last_width,
+            ) {
+                Ok(pending) => self.pending_unified_width = pending,
                 Err(error) => {
                     self.sidebar_state = sidebar::update_state(|state| {
                         state.merged = false;
@@ -3507,25 +4123,6 @@ impl App {
             state.search_active = true;
         });
         Some(Exit::Search { focus_query })
-    }
-
-    /// Close the other panel's standalone pane in our tab, if one is open.
-    fn close_other_standalone_pane(&self) -> std::io::Result<bool> {
-        let Some(ctl) = &self.pane_ctl else {
-            return Ok(false);
-        };
-        let json = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({}))?;
-        let ids = sibling_panes_of(&json, &ctl.pane_id, MY_VIEW.other());
-        if ids.is_empty() {
-            return Ok(false);
-        }
-        let mut failure = None;
-        for id in ids {
-            if let Err(error) = herdr_sidebar::ensure::request_close(&json, &id) {
-                failure.get_or_insert(error);
-            }
-        }
-        failure.map_or(Ok(true), Err)
     }
 
     /// Open the other view in a fresh pane beside this one (detach).
@@ -3684,7 +4281,7 @@ impl App {
         if let Err(e) = op(&repo.git, entry) {
             self.flash = Some((e, true));
         }
-        self.refresh();
+        self.request_refresh();
     }
 
     fn stage_all(&mut self) {
@@ -3694,7 +4291,7 @@ impl App {
         if let Err(e) = repo.git.stage_all() {
             self.flash = Some((e, true));
         }
-        self.refresh();
+        self.request_refresh();
     }
 
     fn unstage_all(&mut self) {
@@ -3704,7 +4301,7 @@ impl App {
         if let Err(e) = repo.git.unstage_all() {
             self.flash = Some((e, true));
         }
-        self.refresh();
+        self.request_refresh();
     }
 
     pub fn toggle_tree_view(&mut self) {
@@ -3782,7 +4379,7 @@ impl App {
             ),
             Err(error) => (error, true),
         });
-        self.refresh();
+        self.request_refresh();
     }
 
     fn unstage_dir(&mut self, repo_idx: usize, dir_path: &str) {
@@ -3793,7 +4390,7 @@ impl App {
             Ok(count) => (format!("unstaged {count} path(s) under {dir_path}"), false),
             Err(error) => (error, true),
         });
-        self.refresh();
+        self.request_refresh();
     }
 
     /// Kick off ✧ commit-message generation in the background.
@@ -3822,6 +4419,9 @@ impl App {
         self.sync_repo(self.active);
     }
 
+    /// Every Sync entry point (`S`, ⇅, the Git footer, the multi-repo
+    /// header, the primary button) lands here, so the opt-in confirmation
+    /// covers them all.
     fn sync_repo(&mut self, index: usize) {
         if self.syncing.is_some() {
             return;
@@ -3829,14 +4429,44 @@ impl App {
         let Some(repo) = self.repos.get(index) else {
             return;
         };
-        if !repo.status.has_upstream {
+        if self.sidebar_state.confirm_git_ops {
+            let target = match repo.git.sync_target() {
+                Ok(target) => target,
+                Err(error) => {
+                    self.flash = Some((error, true));
+                    return;
+                }
+            };
+            let prompt = target.prompt(&repo.status);
+            self.flash = None;
+            self.overlay = Some(Overlay::ConfirmSync {
+                repo: index,
+                target,
+                prompt,
+            });
+        } else if repo.status.has_upstream {
+            self.start_sync(index, None);
+        } else {
             self.flash = Some(("no upstream to sync with".into(), true));
+        }
+    }
+
+    fn start_sync(&mut self, index: usize, target: Option<SyncTarget>) {
+        if self.syncing.is_some() {
             return;
         }
+        let Some(repo) = self.repos.get(index) else {
+            self.flash = Some(("repository is gone".to_string(), true));
+            return;
+        };
         let git = repo.git.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(git.sync());
+            let result = match target {
+                Some(target) => git.sync_confirmed(&target),
+                None => git.sync(),
+            };
+            let _ = tx.send(result);
         });
         self.syncing = Some((index, rx));
     }
@@ -3857,6 +4487,8 @@ impl App {
     }
 
     fn commit_repo(&mut self, index: usize) {
+        // Right after a stage the displayed status still predates it (the
+        // follow-up read is in flight); let git decide instead of refusing.
         let Some(repo) = self.repos.get_mut(index) else {
             return;
         };
@@ -3867,7 +4499,7 @@ impl App {
             self.focus = Focus::Message;
             return;
         }
-        if repo.status.staged.is_empty() {
+        if !repo.freshness.stale(self.status_gate.generation) && repo.status.staged.is_empty() {
             self.flash = Some(("No staged changes to commit.".to_string(), true));
             return;
         }
@@ -3880,7 +4512,7 @@ impl App {
             }
             Err(e) => self.flash = Some((e, true)),
         }
-        self.refresh();
+        self.request_refresh();
         self.persist_scm();
     }
 
@@ -4084,9 +4716,12 @@ impl App {
         frame.render_widget(Paragraph::new(footer_lines), footer_content);
         if menu_hint {
             frame.render_widget(
-                Paragraph::new(action_hint.unwrap_or("m / ctrl+rclick for menus"))
-                    .style(Style::default().fg(Color::DarkGray))
-                    .alignment(Alignment::Right),
+                Paragraph::new(action_hint.unwrap_or(fit_menu_hint(
+                    footer_content.width,
+                    self.sidebar_state.letter_hotkeys,
+                )))
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Right),
                 footer_content,
             );
         }
@@ -4114,9 +4749,12 @@ impl App {
             }
         } else if footer_empty {
             frame.render_widget(
-                Paragraph::new(action_hint.unwrap_or("m / ctrl+rclick for menus"))
-                    .style(Style::default().fg(Color::DarkGray))
-                    .alignment(Alignment::Right),
+                Paragraph::new(action_hint.unwrap_or(fit_menu_hint(
+                    footer_status.width,
+                    self.sidebar_state.letter_hotkeys,
+                )))
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Right),
                 footer_status,
             );
         }
@@ -4252,6 +4890,7 @@ impl App {
         // With several repos visible, the header names the one the commit box
         // and sync act on; a single repo shows branch + ahead/behind arrows.
         let right_text = match self.active_repo() {
+            Some(repo) if !repo.loaded => "loading… ".to_string(),
             Some(repo) if self.repos.len() > 1 => {
                 format!("{} · {} ", repo.name, repo.status.branch)
             }
@@ -4734,7 +5373,7 @@ impl App {
                 "Discard all unstaged changes? (y/N)".to_string(),
                 palette().deleted,
             )),
-            (Some(Overlay::ConfirmGit { prompt, .. }), _) => {
+            (Some(Overlay::ConfirmGit { prompt, .. } | Overlay::ConfirmSync { prompt, .. }), _) => {
                 Some((prompt.clone(), palette().deleted))
             }
             (_, Some((text, is_error))) => {
@@ -4746,6 +5385,7 @@ impl App {
                 let prefix = if *is_error { "" } else { "✓ " };
                 Some((format!("{prefix}{text}"), color))
             }
+            _ if self.shortcut_notice => Some((LETTER_HOTKEYS_NOTICE.into(), palette().modified)),
             _ => None,
         };
         if let Some((msg, color)) = message {
@@ -4762,6 +5402,26 @@ impl App {
 
     /// The hotkey hints, shown in Settings (and optionally the footer).
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        if !self.sidebar_state.letter_hotkeys {
+            let mut hints = vec![
+                ("↑↓", "move"),
+                ("←→", "fold"),
+                ("⏎", "stage"),
+                ("tab", "message"),
+                ("F8", "settings"),
+                ("ctrl+q", "close"),
+            ];
+            if self.merged() {
+                hints.extend([
+                    ("ctrl+p", "files"),
+                    ("ctrl+f", "text"),
+                    ("ctrl+1", "files"),
+                    ("ctrl+2", "search"),
+                    ("ctrl+3", "git"),
+                ]);
+            }
+            return hints;
+        }
         let mut hints: Vec<(&'static str, &'static str)> = vec![
             ("⏎", "stage"),
             ("t", if self.tree_view { "list" } else { "tree" }),
@@ -4773,7 +5433,7 @@ impl App {
             ("m", "menu"),
             ("b", "hide"),
             ("S", "sync"),
-            ("s", "settings"),
+            ("s/F8", "settings"),
             ("r", "refresh"),
             ("q", "quit"),
         ];
@@ -5455,26 +6115,6 @@ fn tree_dir_item(
     ListItem::new(Line::from(spans))
 }
 
-fn pane_focused_in(pane_list_json: &str, pane_id: &str) -> bool {
-    let Ok(value) =
-        serde_json::from_str::<serde_json::Value>(pane_list_json.trim_start_matches('\u{feff}'))
-    else {
-        return false;
-    };
-    value
-        .get("result")
-        .and_then(|result| result.get("panes"))
-        .and_then(|panes| panes.as_array())
-        .and_then(|panes| {
-            panes
-                .iter()
-                .find(|pane| pane.get("pane_id").and_then(|id| id.as_str()) == Some(pane_id))
-        })
-        .and_then(|pane| pane.get("focused"))
-        .and_then(|focused| focused.as_bool())
-        .unwrap_or(false)
-}
-
 fn no_repo_layout(area: Rect, merged: bool) -> [Rect; 2] {
     Layout::vertical([
         Constraint::Length(if merged { 3 } else { 0 }),
@@ -5486,6 +6126,169 @@ fn no_repo_layout(area: Rect, merged: bool) -> [Rect; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn status_results_from_an_older_generation_are_dropped() {
+        let t0 = Instant::now();
+        let mut gate = RefreshGate::new(t0);
+        gate.invalidate();
+        let first = gate.start(t0).unwrap();
+        // A git action lands while that read is in flight.
+        gate.invalidate();
+        assert!(
+            !gate.finish(Some(first), t0),
+            "pre-action result must be dropped"
+        );
+        let second = gate.start(t0).expect("the queued read starts next");
+        assert_ne!(first, second);
+        assert!(gate.finish(Some(second), t0));
+    }
+
+    #[test]
+    fn status_requests_coalesce_into_one_follow_up_read() {
+        let t0 = Instant::now();
+        let mut gate = RefreshGate::new(t0);
+        gate.invalidate();
+        let running = gate.start(t0).unwrap();
+        for _ in 0..5 {
+            gate.invalidate();
+            assert_eq!(gate.start(t0), None, "single flight");
+        }
+        assert!(!gate.periodic_due(t0 + Duration::from_secs(60)));
+        gate.finish(Some(running), t0);
+        assert!(gate.start(t0).is_some(), "exactly one follow-up");
+        assert_eq!(gate.start(t0), None);
+        // A dead worker frees the slot without applying anything.
+        assert!(!gate.finish(None, t0));
+        assert!(!gate.running());
+        assert_eq!(gate.start(t0), None, "nothing queued after the follow-up");
+    }
+
+    #[test]
+    fn periodic_status_reads_back_off_after_slow_reads() {
+        let t0 = Instant::now();
+        let mut gate = RefreshGate::new(t0);
+        assert!(gate.periodic_due(t0));
+        gate.queue();
+        let fast = gate.start(t0).unwrap();
+        gate.finish(Some(fast), t0 + Duration::from_millis(20));
+        let floor = t0 + Duration::from_millis(20) + STATUS_REFRESH_MIN;
+        assert!(!gate.periodic_due(floor - Duration::from_millis(1)));
+        assert!(gate.periodic_due(floor));
+
+        let slow_start = floor;
+        gate.queue();
+        let slow = gate.start(slow_start).unwrap();
+        let done = slow_start + Duration::from_secs(4);
+        gate.finish(Some(slow), done);
+        assert!(!gate.periodic_due(done + Duration::from_secs(11)));
+        assert!(gate.periodic_due(done + Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn reselect_follows_the_stable_id_then_falls_back_to_the_old_index() {
+        let ids = [
+            Some("changes-h:/r".to_string()),
+            Some("unstaged:/r:b.rs".to_string()),
+            None,
+            Some("unstaged:/r:a.rs".to_string()),
+        ];
+        // a.rs moved from index 1 to 3 when b.rs appeared above it.
+        assert_eq!(
+            reselect(Some(&ids), Some("unstaged:/r:a.rs"), Some(1)),
+            Some(3)
+        );
+        // The row is gone (staged meanwhile): keep the old position.
+        assert_eq!(
+            reselect(Some(&ids), Some("unstaged:/r:gone.rs"), Some(1)),
+            Some(1)
+        );
+        assert_eq!(reselect(None, None, Some(2)), Some(2));
+        assert_eq!(
+            reselect(Some(&ids), Some("unstaged:/r:a.rs"), None),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn failed_status_is_stale_only_for_that_repo_and_reports_once_until_recovery() {
+        let mut failed = StatusFreshness::default();
+        let mut healthy = StatusFreshness::default();
+        failed.succeeded(1);
+        healthy.succeeded(1);
+        assert!(failed.stale(2));
+
+        assert_eq!(failed.failed("timeout".into()).as_deref(), Some("timeout"));
+        assert!(
+            failed.stale(1),
+            "even a periodic read can invalidate old data"
+        );
+        assert!(!healthy.stale(1));
+        assert_eq!(failed.failed("timeout".into()), None);
+
+        failed.succeeded(2);
+        assert!(!failed.stale(2));
+        assert_eq!(failed.failed("timeout".into()).as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn applying_status_replaces_only_status_data() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-scm-apply-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let git = Git::discover(&root).unwrap();
+        let repo_root = git.root().to_path_buf();
+        let mut repos = vec![Repo::new(git)];
+        repos[0].message = "half-typed draft".chars().collect();
+        repos[0].cursor = 4;
+        repos[0].changes_collapsed_dirs.insert("src".to_string());
+        repos[0].staged_collapsed = true;
+
+        let fresh = Status {
+            branch: "main".to_string(),
+            unstaged: vec![FileEntry {
+                path: "src/a.rs".to_string(),
+                orig: None,
+                letter: 'M',
+            }],
+            ..Status::default()
+        };
+        let results = vec![
+            (
+                PathBuf::from("/not/a/visible/repo"),
+                Err("ignored".to_string()),
+            ),
+            (repo_root.clone(), Ok(fresh.clone())),
+        ];
+        let (changed, error) = apply_repo_statuses(&mut repos, 1, results);
+        assert!(changed);
+        assert_eq!(error, None, "a result for an unknown root is ignored");
+        let repo = &repos[0];
+        assert!(repo.loaded);
+        assert_eq!(repo.status, fresh);
+        assert_eq!(repo.message.iter().collect::<String>(), "half-typed draft");
+        assert_eq!(repo.cursor, 4);
+        assert!(repo.changes_collapsed_dirs.contains("src"));
+        assert!(repo.staged_collapsed);
+
+        // An identical periodic read is not a change (no rebuild churn).
+        let (changed, _) = apply_repo_statuses(&mut repos, 1, vec![(repo_root, Ok(fresh))]);
+        assert!(!changed);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn clean_diverged_repo_uses_sync_as_the_primary_action() {
@@ -5635,16 +6438,6 @@ mod tests {
     }
 
     #[test]
-    fn focused_pane_detection_is_scoped_to_our_pane_id() {
-        let panes = r#"{"result":{"panes":[
-            {"pane_id":"w1:p1","focused":false},
-            {"pane_id":"w1:p2","focused":true}
-        ]}}"#;
-        assert!(!pane_focused_in(panes, "w1:p1"));
-        assert!(pane_focused_in(panes, "w1:p2"));
-    }
-
-    #[test]
     fn background_refresh_is_opt_in() {
         assert!(!sidebar::background_refresh_enabled(None));
         assert!(!sidebar::background_refresh_enabled(Some("")));
@@ -5657,8 +6450,11 @@ mod tests {
     #[test]
     fn drawer_lines_parse_into_actionable_refs() {
         assert_eq!(
-            parse_drawer_ref(Drawer::Commits, "a1b2c3d Add telemetry module"),
-            DrawerRef::Commit("a1b2c3d".into())
+            parse_drawer_ref(
+                Drawer::Commits,
+                "a1b2c3d000000000000000000000000000000000\ta1b2c3d Add telemetry module"
+            ),
+            DrawerRef::Commit("a1b2c3d000000000000000000000000000000000".into())
         );
         // Graph edge-only lines carry no commit; subject words never match
         // (uppercase or non-hex letters, or too short).
@@ -5666,9 +6462,9 @@ mod tests {
         assert_eq!(
             parse_drawer_ref(
                 Drawer::Graph,
-                "* deadbee (HEAD -> main) Added decoded fallback"
+                "* deadbee000000000000000000000000000000000\tdeadbee (HEAD -> main) Added decoded fallback"
             ),
-            DrawerRef::Commit("deadbee".into())
+            DrawerRef::Commit("deadbee000000000000000000000000000000000".into())
         );
         assert_eq!(
             parse_drawer_ref(Drawer::Branches, "* main"),
@@ -5685,8 +6481,11 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_drawer_ref(Drawer::Stashes, "stash@{2}: WIP on main: 1a2b3c4 x"),
-            DrawerRef::Stash(2)
+            parse_drawer_ref(
+                Drawer::Stashes,
+                "stash@{2}\tdeadbee000000000000000000000000000000000\tWIP on main: 1a2b3c4 x"
+            ),
+            DrawerRef::Stash("deadbee000000000000000000000000000000000".into())
         );
         assert_eq!(
             parse_drawer_ref(Drawer::Remotes, "origin  https://github.com/a/b.git"),
@@ -5708,6 +6507,28 @@ mod tests {
             parse_drawer_ref(Drawer::Worktrees, "(none)"),
             DrawerRef::None
         );
+    }
+
+    #[test]
+    fn drawer_target_survives_a_refresh_and_file_history_change() {
+        let mut panel = DrawerPanel::default();
+        let previous = "a1b2c3d000000000000000000000000000000000";
+        let newer = "deadbee000000000000000000000000000000000";
+        panel.fill(
+            Drawer::FileHistory,
+            Ok(vec![format!("{previous}\ta1b2c3d previous")]),
+        );
+        let target =
+            DrawerTarget::capture(Path::new("original"), &panel, 0, Some("old.rs")).unwrap();
+        assert_eq!(panel.lines, vec!["a1b2c3d previous"]);
+        panel.fill(
+            Drawer::FileHistory,
+            Ok(vec![format!("{newer}\tdeadbee newer")]),
+        );
+        assert_eq!(target.reference, DrawerRef::Commit(previous.into()));
+        assert_eq!(target.root, Path::new("original"));
+        assert_eq!(target.path.as_deref(), Some("old.rs"));
+        assert_eq!(panel.refs[0], DrawerRef::Commit(newer.into()));
     }
 
     #[test]

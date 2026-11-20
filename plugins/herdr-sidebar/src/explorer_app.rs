@@ -19,18 +19,19 @@ use unicode_width::UnicodeWidthChar;
 
 use herdr_sidebar::actions::{self, MenuAction, MenuEntry};
 use herdr_sidebar::branch_ui::{BranchPicker, FooterZones, PickerAction, draw_git_footer};
-use herdr_sidebar::git::{Git, Status};
+use herdr_sidebar::git::{Git, Status, SyncTarget};
+use herdr_sidebar::gitconfirm;
 use herdr_sidebar::gitdeco::{Decorations, RepoStatus};
 use herdr_sidebar::icons::{IconTheme, icon};
-use herdr_sidebar::ipc;
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::tree::{Row, Tree};
 use herdr_sidebar::ui::{
-    TitleAction, activity_button_style, activity_icons, chrome_button_style, draw_activity_caps,
-    draw_scrollbar, gear_icon, hits, hits_activity_button, hits_collapse_button, hover_style,
-    icon_style as ui_icon_style, input_tail, keep_visible_scroll, palette, selection_style,
-    set_color_theme, sibling_panes_of, status_color, title_action_icon, title_action_spans,
-    title_actions_visible, title_actions_width, truncate_to, wrap_footer_message, wrap_hints,
+    LETTER_HOTKEYS_NOTICE, SETTINGS_KEY, TitleAction, activity_button_style, activity_icons,
+    chrome_button_style, draw_activity_caps, draw_scrollbar, fit_menu_hint, gear_icon, hits,
+    hits_activity_button, hits_collapse_button, hover_style, icon_style as ui_icon_style,
+    ignore_letter_hotkey, input_tail, keep_visible_scroll, palette, selection_style,
+    set_color_theme, status_color, title_action_icon, title_action_spans, title_actions_visible,
+    title_actions_width, truncate_to, wrap_footer_message, wrap_hints,
 };
 
 use herdr_sidebar::state::Exit;
@@ -195,6 +196,11 @@ enum Overlay {
         path: PathBuf,
         is_dir: bool,
     },
+    /// The opt-in y/N before the Git footer's Sync (`confirm_git_ops`).
+    ConfirmSync {
+        target: SyncTarget,
+        prompt: String,
+    },
     /// The ⚙ settings modal: mouse-toggleable panel settings.
     Settings {
         selected: usize,
@@ -287,19 +293,24 @@ enum Setting {
     UnifiedSidebar,
     DockRight,
     SidebarWidth,
+    AutoHideBelow,
     IconTheme,
     ColorTheme,
+    SyntaxTheme,
     PreviewPlacement,
     CustomEditorCommand,
     CustomEditorClick,
     AutoOpen,
+    CloseLonelyTab,
     StrictToggle,
     FocusOnOpen,
     FollowCwd,
     HiddenFiles,
     Hotkeys,
+    LetterHotkeys,
     GitDecorations,
     GitFooter,
+    ConfirmGitOps,
     Folder,
 }
 
@@ -326,6 +337,9 @@ pub struct App {
     /// Whole tab area width from the last layout snapshot. A divider drag
     /// changes only this pane; surrounding terminal chrome changes this too.
     last_layout_width: Option<i64>,
+    /// Auto-hide in narrow tabs (⚙ Settings); disarmed while the user keeps
+    /// a sidebar they opened in an already-narrow tab.
+    auto_hide: herdr_sidebar::autohide::Latch,
     last_height: u16,
     page: usize,
     /// Row index under the mouse cursor, for the hover highlight.
@@ -361,12 +375,9 @@ pub struct App {
     last_preview: Option<(String, herdr_sidebar::viewer::PreviewTarget)>,
     /// Last heartbeat stamp, throttling the token refresh.
     last_beat: std::time::Instant,
-    /// A native folder picker running on a background thread; its result
-    /// arrives here (None = cancelled).
+    /// Result of the background native folder picker (None = cancelled).
     picking: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
-    /// Shared across full app rebuilds and unified-view switches so manual
-    /// folder precedence is not lost when this view is recreated.
-    cwd_follower: std::rc::Rc<std::cell::RefCell<herdr_sidebar::launch::CwdFollower>>,
+    sidebar_activity: std::rc::Rc<std::cell::RefCell<herdr_sidebar::focus::SidebarActivity>>,
     /// Every repository the tree can see — the containing one plus child
     /// repos, exactly the set the Source Control view shows.
     repos: Vec<Git>,
@@ -396,7 +407,7 @@ pub struct App {
     search_result_rows: Vec<(Rect, usize)>,
     search_scroll: usize,
     search_snap: bool,
-    pending_unified_width: Option<(u16, std::time::Instant)>,
+    pending_unified_width: Option<herdr_sidebar::ensure::PendingUnifiedClose>,
 }
 
 /// How long two clicks on the same row still count as a double click.
@@ -441,7 +452,7 @@ struct SearchZones {
 impl App {
     pub fn new(
         root: PathBuf,
-        cwd_follower: std::rc::Rc<std::cell::RefCell<herdr_sidebar::launch::CwdFollower>>,
+        sidebar_activity: std::rc::Rc<std::cell::RefCell<herdr_sidebar::focus::SidebarActivity>>,
     ) -> Self {
         let mut tree = Tree::new(root);
         // Mirror the tree the user was already looking at. Idle ticks keep
@@ -480,6 +491,10 @@ impl App {
             pane_ctl,
             last_width: sidebar_state.sidebar_width,
             last_layout_width,
+            auto_hide: herdr_sidebar::autohide::Latch::new(
+                sidebar_state.auto_hide_below,
+                last_layout_width,
+            ),
             last_height: 24,
             page: 20,
             hovered: None,
@@ -498,7 +513,7 @@ impl App {
             last_preview: None,
             last_beat: std::time::Instant::now(),
             picking: None,
-            cwd_follower,
+            sidebar_activity,
             repos,
             deco: Decorations::empty(),
             // Overwritten when the first background refresh is queued below.
@@ -532,7 +547,6 @@ impl App {
     /// the sidebar (an agent editing files, a commit in another pane) show up
     /// on their own. Self-throttling, so the event loop may call it freely.
     pub fn tick(&mut self) {
-        self.sync_shared_settings();
         self.sync_shared_tree();
         self.collect_quick_index();
         self.collect_content_search();
@@ -552,14 +566,21 @@ impl App {
     /// A separated Source Control pane can change this shared setting while
     /// the Explorer keeps running. Re-read just this field so the tree reacts
     /// without adopting unrelated process-local mode changes.
-    fn sync_shared_settings(&mut self) {
+    pub fn sync_shared_settings(&mut self) {
         let shared = sidebar::load_state();
+        self.sync_follow_setting(shared.follow_cwd);
         self.sidebar_state.dock_right = shared.dock_right;
         self.sidebar_state.strict_toggle = shared.strict_toggle;
         self.sidebar_state.focus_on_open = shared.focus_on_open;
         self.sidebar_state.custom_editor_on_click = shared.custom_editor_on_click;
+        self.sidebar_state.auto_hide_below = shared.auto_hide_below;
+        self.sidebar_state.confirm_git_ops = shared.confirm_git_ops;
+        self.sidebar_state.close_lonely_tab = shared.close_lonely_tab;
+        self.sidebar_state.letter_hotkeys = shared.letter_hotkeys;
         let old_git_footer = self.sidebar_state.show_git_footer;
         self.sidebar_state.show_git_footer = shared.show_git_footer;
+        self.sidebar_state.syntax_dark = shared.syntax_dark;
+        self.sidebar_state.syntax_light = shared.syntax_light;
         if shared.color_theme != self.sidebar_state.color_theme {
             self.sidebar_state.color_theme = shared.color_theme;
             set_color_theme(shared.color_theme);
@@ -610,7 +631,13 @@ impl App {
                 .zip(layout_width)
                 .is_some_and(|(before, now)| before != now);
             self.last_layout_width = layout_width.or(self.last_layout_width);
-            if !unified_close_completed && surrounding_changed {
+            let auto_hide = layout_width.is_some_and(|width| {
+                self.auto_hide
+                    .observe(self.sidebar_state.auto_hide_below, width)
+            });
+            if !unified_close_completed && auto_hide {
+                self.auto_hide_now();
+            } else if !unified_close_completed && surrounding_changed {
                 ctl.resize_preferred(
                     width,
                     self.sidebar_state.sidebar_width,
@@ -624,8 +651,8 @@ impl App {
     /// a sidebar, so periodic refreshes back off while this pane is not
     /// focused; explicit refresh/stage actions pass `force = true`.
     fn request_decorations(&mut self, force: bool) {
-        self.last_deco = std::time::Instant::now();
         if !self.sidebar_state.git_deco && !self.sidebar_state.show_git_footer {
+            self.last_deco = std::time::Instant::now();
             self.deco = Decorations::empty();
             self.deco_rx = None;
             self.git_footer_status = None;
@@ -633,9 +660,10 @@ impl App {
             self.deco_backoff_until.clear();
             return;
         }
-        if self.deco_rx.is_some() || (!force && !self.pane_is_focused()) {
+        if self.deco_rx.is_some() || (!force && !self.sidebar_activity.borrow().pane_is_focused()) {
             return;
         }
+        self.last_deco = std::time::Instant::now();
         let ignored_backoffs = self.deco_backoff_until.clone();
         let scan_now = std::time::Instant::now();
         let include_ignored = self.sidebar_state.git_deco;
@@ -715,15 +743,6 @@ impl App {
         }
     }
 
-    fn pane_is_focused(&self) -> bool {
-        let Some(pane_id) = self.pane_ctl.as_ref().map(|ctl| ctl.pane_id.as_str()) else {
-            return true;
-        };
-        ipc::call_text("pane.list", serde_json::json!({}))
-            .ok()
-            .is_some_and(|json| pane_focused_in(&json, pane_id))
-    }
-
     /// Rediscover the repositories under the current root — after a re-root,
     /// or an explicit refresh that may have added or removed one.
     fn rediscover_repos(&mut self) {
@@ -745,6 +764,7 @@ impl App {
     /// seconds.
     pub fn heartbeat(&mut self) {
         self.poll_unified_close();
+        self.follow_sibling_cwd();
         if self.last_beat.elapsed() < std::time::Duration::from_secs(5) {
             return;
         }
@@ -752,51 +772,48 @@ impl App {
         if let Some(ctl) = &self.pane_ctl {
             ctl.report_tokens(MY_VIEW, self.merged());
         }
-        self.follow_sibling_cwd();
     }
 
     fn poll_unified_close(&mut self) -> bool {
-        let Some((target, started)) = self.pending_unified_width else {
+        use herdr_sidebar::ensure::UnifiedClose;
+
+        let Some(pending) = &mut self.pending_unified_width else {
             return false;
         };
-        let Some(pane_id) = self.pane_ctl.as_ref().map(|ctl| ctl.pane_id.clone()) else {
-            self.pending_unified_width = None;
-            return false;
-        };
-        let Ok(json) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) else {
-            return false;
-        };
-        if sibling_panes_of(&json, &pane_id, MY_VIEW.other()).is_empty() {
-            self.pending_unified_width = None;
-            if let Some(ctl) = &self.pane_ctl {
-                ctl.resize_to(self.last_width, target, self.sidebar_state.dock_right);
+        match pending.poll() {
+            UnifiedClose::Waiting => false,
+            UnifiedClose::Closed(width) => {
+                self.pending_unified_width = None;
+                if let Some(ctl) = &self.pane_ctl {
+                    ctl.resize_to(self.last_width, width, self.sidebar_state.dock_right);
+                }
+                true
             }
-            return true;
+            UnifiedClose::TimedOut => {
+                self.pending_unified_width = None;
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.merged = false;
+                    state.active = MY_VIEW;
+                });
+                self.apply_identity();
+                self.notice = Some("Source Control stayed open; unified mode cancelled".into());
+                false
+            }
         }
-        if started.elapsed() >= std::time::Duration::from_secs(2) {
-            self.pending_unified_width = None;
-            self.sidebar_state = sidebar::update_state(|state| {
-                state.merged = false;
-                state.active = MY_VIEW;
-            });
-            self.apply_identity();
-            self.notice = Some("Source Control stayed open; unified mode cancelled".into());
+    }
+
+    fn sync_follow_setting(&mut self, enabled: bool) {
+        if self.sidebar_state.follow_cwd != enabled {
+            self.sidebar_state.follow_cwd = enabled;
+            self.sidebar_activity.borrow_mut().reset_follower();
         }
-        false
     }
 
     fn follow_sibling_cwd(&mut self) {
-        if !self.sidebar_state.follow_cwd || self.overlay.is_some() || self.picking.is_some() {
-            return;
-        }
-        let Some(ctl) = &self.pane_ctl else { return };
-        let Ok(panes) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) else {
-            return;
-        };
-        let target = self
-            .cwd_follower
-            .borrow_mut()
-            .next_cwd(&panes, &ctl.pane_id);
+        let follow =
+            self.sidebar_state.follow_cwd && self.overlay.is_none() && self.picking.is_none();
+        let needs_focus = self.sidebar_state.git_deco || self.sidebar_state.show_git_footer;
+        let target = self.sidebar_activity.borrow_mut().poll(follow, needs_focus);
         if let Some(target) = target
             && Path::new(&target) != self.tree.root_path()
         {
@@ -867,6 +884,18 @@ impl App {
         self.close(true);
     }
 
+    /// The tab became too narrow (⚙ Auto-hide): close our pane without a
+    /// snooze marker, so the quiet ensure hook docks it again once the tab
+    /// is wide. Never the tab's last pane: that would close the whole tab.
+    fn auto_hide_now(&mut self) {
+        let Some(ctl) = &self.pane_ctl else { return };
+        let company = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({}))
+            .is_ok_and(|json| herdr_sidebar::autohide::has_company(&json, &ctl.pane_id));
+        if company {
+            self.close(false);
+        }
+    }
+
     fn close(&mut self, snooze: bool) {
         // Closing our own pane kills this process: save a pending remembered
         // root first (the outer loop's flush never runs on this path).
@@ -914,12 +943,13 @@ impl App {
         });
         self.apply_identity();
         if on {
-            let width = self.last_width;
-            match self.close_other_standalone_pane() {
-                Ok(true) => {
-                    self.pending_unified_width = Some((width, std::time::Instant::now()));
-                }
-                Ok(false) => {}
+            let Some(ctl) = &self.pane_ctl else { return };
+            match herdr_sidebar::ensure::PendingUnifiedClose::request(
+                &ctl.pane_id,
+                MY_VIEW.other(),
+                self.last_width,
+            ) {
+                Ok(pending) => self.pending_unified_width = pending,
                 Err(error) => {
                     self.sidebar_state = sidebar::update_state(|state| {
                         state.merged = false;
@@ -944,25 +974,6 @@ impl App {
             state.search_active = false;
         });
         Some(Exit::Switch)
-    }
-
-    /// Close the other panel's standalone pane in our tab, if one is open.
-    fn close_other_standalone_pane(&self) -> std::io::Result<bool> {
-        let Some(ctl) = &self.pane_ctl else {
-            return Ok(false);
-        };
-        let json = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({}))?;
-        let ids = sibling_panes_of(&json, &ctl.pane_id, MY_VIEW.other());
-        if ids.is_empty() {
-            return Ok(false);
-        }
-        let mut failure = None;
-        for id in ids {
-            if let Err(error) = herdr_sidebar::ensure::request_close(&json, &id) {
-                failure.get_or_insert(error);
-            }
-        }
-        failure.map_or(Ok(true), Err)
     }
 
     /// Open the other view in a fresh pane beside this one (detach).
@@ -1029,8 +1040,25 @@ impl App {
     }
 
     /// Handle one key press; `Some(exit)` ends the event loop.
-    pub fn on_key(&mut self, key: KeyEvent) -> Option<Exit> {
+    pub fn on_key(&mut self, key: KeyEvent, shortcut_notice_shown: &mut bool) -> Option<Exit> {
         if key.kind != KeyEventKind::Press {
+            return None;
+        }
+        if (self.overlay.is_none() || self.search_text_unfocused())
+            && ignore_letter_hotkey(key, self.sidebar_state.letter_hotkeys)
+        {
+            if !std::mem::replace(shortcut_notice_shown, true) {
+                self.notice = Some(LETTER_HOTKEYS_NOTICE.into());
+            }
+            return None;
+        }
+        if key.code == SETTINGS_KEY
+            && key.modifiers.is_empty()
+            && (self.overlay.is_none()
+                || matches!(self.overlay, Some(Overlay::ContentSearch { .. })))
+        {
+            self.notice = None;
+            self.open_settings();
             return None;
         }
         if key.code == KeyCode::Char('q')
@@ -1148,6 +1176,18 @@ impl App {
             KeyCode::Char('b') => self.hide(),
             KeyCode::Char('c') => self.change_folder_dialog(),
             KeyCode::Char('m') => self.open_menu_for_selection(),
+            KeyCode::Char('t') => {
+                let dir = match self.selected_row() {
+                    Some(row) if row.is_dir => row.path.clone(),
+                    Some(row) => row
+                        .path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| self.tree.root_path()),
+                    None => self.tree.root_path(),
+                };
+                self.open_in_new_tab(&dir);
+            }
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => self.open_content_search(false),
@@ -1393,7 +1433,9 @@ impl App {
             OpenContent(PathBuf, usize),
             ToggleSetting(usize),
             AdjustWidth(bool),
+            AdjustAutoHide(bool),
             DeleteConfirmed(PathBuf, bool),
+            SyncConfirmed(SyncTarget),
             Picker(PickerAction),
         }
         let settings = self.settings_rows();
@@ -1418,6 +1460,16 @@ impl App {
                     if settings.get(*selected).map(|row| row.0) == Some(Setting::SidebarWidth) =>
                 {
                     Cmd::AdjustWidth(true)
+                }
+                KeyCode::Left | KeyCode::Char('h')
+                    if settings.get(*selected).map(|row| row.0) == Some(Setting::AutoHideBelow) =>
+                {
+                    Cmd::AdjustAutoHide(false)
+                }
+                KeyCode::Right | KeyCode::Char('l')
+                    if settings.get(*selected).map(|row| row.0) == Some(Setting::AutoHideBelow) =>
+                {
+                    Cmd::AdjustAutoHide(true)
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => Cmd::ToggleSetting(*selected),
                 _ => Cmd::Nothing,
@@ -1713,6 +1765,10 @@ impl App {
                 }
                 _ => Cmd::Close,
             },
+            Some(Overlay::ConfirmSync { target, .. }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => Cmd::SyncConfirmed(target.clone()),
+                _ => Cmd::Close,
+            },
             None => Cmd::Nothing,
         };
         match cmd {
@@ -1738,12 +1794,18 @@ impl App {
             }
             Cmd::ToggleSetting(index) => self.toggle_setting(index),
             Cmd::AdjustWidth(wider) => self.adjust_sidebar_width(wider),
+            Cmd::AdjustAutoHide(wider) => self.adjust_auto_hide_below(wider),
             Cmd::DeleteConfirmed(path, is_dir) => {
                 self.overlay = None;
                 match actions::delete(&path, is_dir) {
                     Ok(()) => self.refresh_tree(),
                     Err(err) => self.notice = Some(format!("delete failed: {err}")),
                 }
+            }
+            Cmd::SyncConfirmed(target) => {
+                // Resume a Search overlay parked under the prompt (else → tree).
+                self.overlay = self.suspended_search.take();
+                self.start_git_footer_sync(Some(target));
             }
             Cmd::Picker(action) => self.handle_picker_action(action),
         }
@@ -1920,8 +1982,31 @@ impl App {
         let Some(status) = &self.git_footer_status else {
             return;
         };
-        if !status.has_upstream {
+        if self.sidebar_state.confirm_git_ops {
+            let Some(git) = self.repos.first() else {
+                return;
+            };
+            let target = match git.sync_target() {
+                Ok(target) => target,
+                Err(error) => {
+                    self.notice = Some(error);
+                    return;
+                }
+            };
+            let prompt = target.prompt(status);
+            // A notice would mask the prompt (footer_message shows it first).
+            self.notice = None;
+            self.suspend_search_for_modal();
+            self.overlay = Some(Overlay::ConfirmSync { target, prompt });
+        } else if status.has_upstream {
+            self.start_git_footer_sync(None);
+        } else {
             self.notice = Some("no upstream to sync with".into());
+        }
+    }
+
+    fn start_git_footer_sync(&mut self, target: Option<SyncTarget>) {
+        if self.git_syncing.is_some() {
             return;
         }
         let Some(git) = self.repos.first().cloned() else {
@@ -1929,7 +2014,11 @@ impl App {
         };
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(git.sync());
+            let result = match target {
+                Some(target) => git.sync_confirmed(&target),
+                None => git.sync(),
+            };
+            let _ = tx.send(result);
         });
         self.git_syncing = Some(rx);
     }
@@ -2407,6 +2496,22 @@ impl App {
         );
     }
 
+    /// `t` / the context menu: a new herdr tab with a shell in `dir`.
+    fn open_in_new_tab(&mut self, dir: &Path) {
+        let Some(pane_id) = self
+            .pane_ctl
+            .as_ref()
+            .map(|control| control.pane_id.clone())
+        else {
+            self.notice = Some("new tab needs a herdr pane".into());
+            return;
+        };
+        self.notice = Some(match actions::open_in_new_tab(&pane_id, dir) {
+            Ok(label) => format!("opened tab: {label}"),
+            Err(error) => format!("new tab failed: {error}"),
+        });
+    }
+
     /// The modal's rows for the current state.
     fn settings_rows(&self) -> Vec<SettingRow> {
         let update = herdr_sidebar::updates::row();
@@ -2442,6 +2547,12 @@ impl App {
                 true,
             ),
             (
+                Setting::AutoHideBelow,
+                "Auto-hide below",
+                sidebar::auto_hide_below_label(self.sidebar_state.auto_hide_below),
+                true,
+            ),
+            (
                 Setting::IconTheme,
                 "Icon theme",
                 match self.theme {
@@ -2457,6 +2568,10 @@ impl App {
                 self.sidebar_state.color_theme.label().to_string(),
                 true,
             ),
+            {
+                let (label, value) = self.sidebar_state.syntax_theme_row();
+                (Setting::SyntaxTheme, label, value, true)
+            },
             (
                 Setting::PreviewPlacement,
                 "Preview opens in",
@@ -2505,9 +2620,31 @@ impl App {
                 true,
             ),
             (
+                Setting::LetterHotkeys,
+                sidebar::LETTER_HOTKEYS_LABEL,
+                if self.sidebar_state.letter_hotkeys {
+                    "on"
+                } else {
+                    "off"
+                }
+                .into(),
+                true,
+            ),
+            (
                 Setting::AutoOpen,
                 "Auto-open sidebar",
                 if self.sidebar_state.auto_open {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
+                Setting::CloseLonelyTab,
+                sidebar::CLOSE_LONELY_TAB_LABEL,
+                if self.sidebar_state.close_lonely_tab {
                     "on"
                 } else {
                     "off"
@@ -2566,6 +2703,17 @@ impl App {
                 true,
             ),
             (
+                Setting::ConfirmGitOps,
+                gitconfirm::SETTING_LABEL,
+                if self.sidebar_state.confirm_git_ops {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
                 Setting::Folder,
                 "Change folder…",
                 self.tree.root_name(),
@@ -2601,12 +2749,16 @@ impl App {
                     sidebar::update_state(|state| state.dock_right = !state.dock_right);
             }
             Setting::SidebarWidth => self.adjust_sidebar_width(true),
+            Setting::AutoHideBelow => self.adjust_auto_hide_below(true),
             Setting::IconTheme => self.set_theme(self.theme.toggled()),
             Setting::ColorTheme => {
                 self.sidebar_state = sidebar::update_state(|state| {
                     state.color_theme = state.color_theme.next();
                 });
                 set_color_theme(self.sidebar_state.color_theme);
+            }
+            Setting::SyntaxTheme => {
+                self.sidebar_state = sidebar::update_state(sidebar::State::cycle_syntax_theme);
             }
             Setting::PreviewPlacement => {
                 self.sidebar_state = sidebar::update_state(|state| {
@@ -2634,9 +2786,18 @@ impl App {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.show_hotkeys = !state.show_hotkeys);
             }
+            Setting::LetterHotkeys => {
+                self.sidebar_state =
+                    sidebar::update_state(|state| state.letter_hotkeys = !state.letter_hotkeys);
+            }
             Setting::AutoOpen => {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.auto_open = !state.auto_open);
+            }
+            Setting::CloseLonelyTab => {
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.close_lonely_tab = !state.close_lonely_tab;
+                });
             }
             Setting::StrictToggle => {
                 self.sidebar_state =
@@ -2649,7 +2810,7 @@ impl App {
             Setting::FollowCwd => {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.follow_cwd = !state.follow_cwd);
-                self.cwd_follower.borrow_mut().reset();
+                self.sidebar_activity.borrow_mut().reset_follower();
             }
             Setting::GitDecorations => {
                 self.sidebar_state =
@@ -2664,11 +2825,22 @@ impl App {
                 self.rediscover_repos();
                 self.request_decorations(true);
             }
+            Setting::ConfirmGitOps => {
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.confirm_git_ops = !state.confirm_git_ops;
+                });
+            }
             Setting::Folder => {
                 self.overlay = None;
                 self.change_folder_dialog();
             }
         }
+    }
+
+    fn adjust_auto_hide_below(&mut self, wider: bool) {
+        self.sidebar_state = sidebar::update_state(|state| {
+            state.auto_hide_below = sidebar::step_auto_hide_below(state.auto_hide_below, wider);
+        });
     }
 
     fn adjust_sidebar_width(&mut self, wider: bool) {
@@ -2737,7 +2909,7 @@ impl App {
             Style::default().bold(),
         )));
         lines.extend(hint_lines);
-        lines.push(Line::from(" click/⏎ · ←/→ width · esc".dim()));
+        lines.push(Line::from(" click/⏎ · ←/→ adjust · esc".dim()));
 
         frame.render_widget(Clear, popup);
         frame.render_widget(
@@ -2836,6 +3008,7 @@ impl App {
                 let Some((path, _)) = target else { return };
                 self.stage(&path);
             }
+            MenuAction::OpenInNewTab => self.open_in_new_tab(&create_dir),
             MenuAction::Reveal => {
                 let (path, directory) = target.unwrap_or_else(|| (self.tree.root_path(), true));
                 actions::reveal(&path, directory);
@@ -2928,10 +3101,10 @@ impl App {
         }
         let root = std::env::current_dir().unwrap_or(target);
         if manual && self.sidebar_state.follow_cwd {
-            self.cwd_follower.borrow_mut().mark_manual_folder();
+            self.sidebar_activity.borrow_mut().mark_manual_folder();
         }
-        let cwd_follower = std::rc::Rc::clone(&self.cwd_follower);
-        *self = App::new(root, cwd_follower);
+        let activity = std::rc::Rc::clone(&self.sidebar_activity);
+        *self = App::new(root, activity);
         // Only confirm an explicit folder change; an automatic cwd-follow
         // re-root must not pop an unprompted "folder: …" notice.
         if manual {
@@ -3159,8 +3332,16 @@ impl App {
         // the pane label ("Explorer"/"Sidebar") — a second border read as a
         // double frame.
         let search_active = matches!(self.overlay, Some(Overlay::ContentSearch { .. }));
+        let search_notice = if search_active && let Some(notice) = &self.notice {
+            wrap_footer_message(notice, frame.area().width, 4)
+                .into_iter()
+                .map(|line| Line::styled(line, Style::default().fg(palette().modified)))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let footer_height = if search_active {
-            1
+            1 + search_notice.len() as u16
         } else {
             self.footer_height(frame.area().width)
         };
@@ -3187,8 +3368,11 @@ impl App {
                 header.height.saturating_add(body.height),
             );
             self.draw_content_search(frame, search_area);
+            let [notice_area, last_line] =
+                Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(footer);
+            frame.render_widget(Paragraph::new(search_notice), notice_area);
             let [hint, button] =
-                Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(footer);
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(last_line);
             self.git_footer_zones = FooterZones::default();
             if self.sidebar_state.show_git_footer
                 && let Some(status) = &self.git_footer_status
@@ -3317,9 +3501,12 @@ impl App {
         frame.render_widget(Paragraph::new(footer_lines), footer_content);
         if menu_hint {
             frame.render_widget(
-                Paragraph::new("m / ctrl+rclick for menus")
-                    .style(Style::default().fg(Color::DarkGray))
-                    .alignment(Alignment::Right),
+                Paragraph::new(fit_menu_hint(
+                    footer_content.width,
+                    self.sidebar_state.letter_hotkeys,
+                ))
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Right),
                 footer_content,
             );
         }
@@ -3349,7 +3536,17 @@ impl App {
                 1,
             );
             frame.render_widget(
-                Paragraph::new(" m / ctrl+rclick: menu".dim().italic()),
+                Paragraph::new(
+                    format!(
+                        " {}",
+                        fit_menu_hint(
+                            hint_area.width.saturating_sub(1),
+                            self.sidebar_state.letter_hotkeys
+                        )
+                    )
+                    .dim()
+                    .italic(),
+                ),
                 hint_area,
             );
         }
@@ -3439,6 +3636,41 @@ impl App {
 
     /// The hotkey hints for the current mode.
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        let searching = self.suspended_search.is_some()
+            || matches!(self.overlay, Some(Overlay::ContentSearch { .. }));
+        if searching {
+            let mut hints = vec![
+                ("↑↓", "results"),
+                ("⏎", "open match"),
+                ("tab", "change focus"),
+                ("ctrl+f", "query"),
+                ("F8", "settings"),
+                ("esc", "close search"),
+            ];
+            if self.merged() {
+                if self.sidebar_state.letter_hotkeys {
+                    hints.extend([("1", "files"), ("2", "search"), ("3", "git")]);
+                } else {
+                    hints.extend([("ctrl+1", "files"), ("ctrl+2", "search"), ("ctrl+3", "git")]);
+                }
+            }
+            return hints;
+        }
+        if !self.sidebar_state.letter_hotkeys {
+            let mut hints = vec![
+                ("↑↓", "move"),
+                ("←→", "fold"),
+                ("⏎", "toggle"),
+                ("F8", "settings"),
+                ("ctrl+p", "files"),
+                ("ctrl+f", "text"),
+                ("ctrl+q", "close"),
+            ];
+            if self.merged() {
+                hints.extend([("ctrl+1", "files"), ("ctrl+2", "search"), ("ctrl+3", "git")]);
+            }
+            return hints;
+        }
         let mut hints = vec![
             ("↑↓", "move"),
             ("←→", "fold"),
@@ -3449,7 +3681,7 @@ impl App {
             ("ctrl+p", "files"),
             ("ctrl+f", "text"),
             ("m", "menu"),
-            ("s", "settings"),
+            ("s/F8", "settings"),
             ("b", "hide"),
             ("q", "quit"),
         ];
@@ -3494,6 +3726,9 @@ impl App {
                 format!("Delete '{name}' permanently? (y/N)"),
                 palette().deleted,
             ));
+        }
+        if let Some(Overlay::ConfirmSync { prompt, .. }) = &self.overlay {
+            return Some((prompt.clone(), palette().deleted));
         }
         None
     }
@@ -4555,26 +4790,6 @@ fn truncate_path_tail(label: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
-fn pane_focused_in(pane_list_json: &str, pane_id: &str) -> bool {
-    let Ok(value) =
-        serde_json::from_str::<serde_json::Value>(pane_list_json.trim_start_matches('\u{feff}'))
-    else {
-        return false;
-    };
-    value
-        .get("result")
-        .and_then(|result| result.get("panes"))
-        .and_then(|panes| panes.as_array())
-        .and_then(|panes| {
-            panes
-                .iter()
-                .find(|pane| pane.get("pane_id").and_then(|id| id.as_str()) == Some(pane_id))
-        })
-        .and_then(|pane| pane.get("focused"))
-        .and_then(|focused| focused.as_bool())
-        .unwrap_or(false)
-}
-
 /// The right-aligned decoration for a status letter (issue #19): the letter
 /// itself for a file, a filled dot for a directory whose DESCENDANTS changed
 /// (VS Code's dirty-folder badge), and nothing at all for ignored paths —
@@ -4943,17 +5158,6 @@ mod tests {
             root.join("src")
         );
         assert_eq!(create_target_dir(None, root.clone()), root);
-    }
-
-    #[test]
-    fn focused_pane_detection_is_scoped_to_our_pane_id() {
-        let panes = r#"{"result":{"panes":[
-            {"pane_id":"w1:p1","focused":false},
-            {"pane_id":"w1:p2","focused":true}
-        ]}}"#;
-        assert!(!pane_focused_in(panes, "w1:p1"));
-        assert!(pane_focused_in(panes, "w1:p2"));
-        assert!(!pane_focused_in("garbage", "w1:p2"));
     }
 
     /// The rendered text of a row, decorations included.

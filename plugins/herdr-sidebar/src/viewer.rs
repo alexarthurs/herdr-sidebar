@@ -13,9 +13,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+    KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use html2text::render::{RichAnnotation, TaggedLine};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
@@ -43,9 +44,10 @@ const LOAD_POLL: Duration = Duration::from_millis(16);
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_LINES: usize = 5000;
 
-/// Body width from the most recent `draw_doc` call. Markdown loads happen on
-/// a worker before layout is available, so glow uses this snapshot and the
-/// event loop reloads a glow document if its actual body width differs.
+/// Body width from the most recent `draw_doc` call. Markdown and HTML loads
+/// happen on a worker before layout is available, so glow and html2text use
+/// this snapshot and the event loop reloads the document if its actual body
+/// width differs.
 static LAST_BODY_WIDTH: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(80);
 
 /// Directory for the sidebar's private scratch files (viewer control files).
@@ -382,14 +384,22 @@ struct Doc {
     /// Long lines wrap unless the user toggles them off (`w`). Per document:
     /// a newly loaded one starts wrapped again.
     wrap: bool,
-    /// Width glow formatted this markdown document for. A mismatch with the
-    /// live body triggers one background reload instead of generic rewrap.
+    /// Width glow (markdown) or html2text (HTML) laid this document out for.
+    /// A mismatch with the live body triggers one background reload instead
+    /// of generic rewrap.
     glow_width: Option<u16>,
     /// `lines` laid out for the pane, rebuilt only when the width or the
     /// wrap toggle changes (see [`Doc::relayout`]).
     rows: Vec<Row>,
-    /// The (width, height, wrap) `rows` was built for; `None` until first draw.
-    rows_key: Option<(u16, u16, bool)>,
+    /// The (width, height, wrap, side by side) `rows` was built for; `None`
+    /// until first draw.
+    rows_key: Option<(u16, u16, bool, bool)>,
+    /// A diff, already highlighted on the load worker, kept so it can be
+    /// laid out side by side at the pane's width without re-running syntect.
+    /// `None` for everything that is not a diff.
+    diff: Option<crate::diffview::StyledDiff>,
+    /// Show this diff side by side (`v`); starts from the saved setting.
+    split: bool,
     /// Source line to scroll back to once `rows` is rebuilt — how a wrap
     /// toggle and a diff refresh keep the reader's place even though the
     /// row index underneath them changed.
@@ -399,6 +409,10 @@ struct Doc {
     /// BEFORE the content was read: the baseline later polls compare against.
     stamp: Option<FileStamp>,
 }
+
+/// Narrower than this, a side-by-side diff leaves too little room per
+/// column, so the pane falls back to the unified layout.
+const MIN_SPLIT_WIDTH: u16 = 60;
 
 struct MediaPreview {
     pixels: image::RgbaImage,
@@ -431,13 +445,19 @@ impl Doc {
     /// Rebuild [`Doc::rows`] for the viewport when the layout inputs changed,
     /// then honour any pending source-line scroll request.
     fn relayout(&mut self, width: u16, height: u16) {
-        if self.rows_key != Some((width, height, self.wrap)) {
+        let split = self.side_by_side(width);
+        if self.rows_key != Some((width, height, self.wrap, split)) {
             self.rows = if let Some(media) = &self.media {
                 render_media_rows(media, width, height)
+            } else if let (true, Some(diff)) = (split, &self.diff) {
+                crate::diffview::render_split_styled(diff, usize::from(width), self.wrap)
+                    .into_iter()
+                    .map(|(src, line)| Row { src, line })
+                    .collect()
             } else {
                 build_rows(&self.lines, self.numbered, self.wrap, width)
             };
-            self.rows_key = Some((width, height, self.wrap));
+            self.rows_key = Some((width, height, self.wrap, split));
             self.selection = PreviewSelection::default();
         }
         if let Some(src) = self.pending_src.take() {
@@ -447,6 +467,12 @@ impl Doc {
                 .position(|r| r.src >= src)
                 .unwrap_or(self.rows.len().saturating_sub(1));
         }
+    }
+
+    /// Whether this document is laid out side by side at `width`: a diff,
+    /// with the toggle on, in a pane wide enough for two columns.
+    fn side_by_side(&self, width: u16) -> bool {
+        self.split && self.diff.is_some() && width >= MIN_SPLIT_WIDTH
     }
 
     /// The source line at the top of the body — the anchor a relayout
@@ -772,6 +798,8 @@ fn load(request: &Request) -> Doc {
             glow_width: None,
             rows: Vec::new(),
             rows_key: None,
+            diff: None,
+            split: false,
             pending_src: None,
             selection: PreviewSelection::default(),
             stamp: None,
@@ -818,6 +846,8 @@ fn loading_doc(request: &Request) -> Doc {
         glow_width: None,
         rows: Vec::new(),
         rows_key: None,
+        diff: None,
+        split: false,
         pending_src: None,
         selection: PreviewSelection::default(),
         stamp: None,
@@ -1140,7 +1170,9 @@ fn copy_selection(doc: &Doc) -> String {
     }
 }
 
-fn apply_diff_refresh(doc: &mut Doc, mut refreshed: Doc) {
+/// Swap in a re-loaded copy of the document on screen. Returns false (and
+/// keeps the current doc, selection included) when nothing changed.
+fn apply_diff_refresh(doc: &mut Doc, mut refreshed: Doc) -> bool {
     if doc.media.is_none()
         && doc.name == refreshed.name
         && doc.context == refreshed.context
@@ -1148,11 +1180,13 @@ fn apply_diff_refresh(doc: &mut Doc, mut refreshed: Doc) {
         && doc.lines == refreshed.lines
     {
         doc.stamp = refreshed.stamp;
-        return;
+        return false;
     }
     refreshed.wrap = doc.wrap;
+    refreshed.split = doc.split;
     refreshed.pending_src = Some(doc.top_src());
     *doc = refreshed;
+    true
 }
 
 enum ViewMode {
@@ -1279,6 +1313,8 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
         glow_width: None,
         rows: Vec::new(),
         rows_key: None,
+        diff: None,
+        split: false,
         pending_src: None,
         selection: PreviewSelection::default(),
         stamp: None,
@@ -1332,6 +1368,148 @@ fn glow_args(width: u16, light: bool) -> Vec<String> {
         width.to_string(),
         "-".into(),
     ]
+}
+
+/// Render an HTML document the way a text browser would, laid out for
+/// `width` columns. Returns `None` when nothing visible remains (a page that
+/// scripts fill in) or layout fails; the caller falls back to syntax
+/// highlight.
+///
+/// html2text only parses: scripts never run and nothing is fetched. Link
+/// targets are listed as numbered footnotes, since the preview cannot follow
+/// a link.
+fn html_document(text: &str, width: u16) -> Option<Vec<Line<'static>>> {
+    if text.len() > MAX_HTML_BYTES || html_nesting_exceeds(text, MAX_HTML_DEPTH) {
+        return None;
+    }
+    let rendered = html2text::config::rich()
+        .allow_width_overflow()
+        .link_footnotes(true)
+        // `<del>` gets the terminal's crossed-out style instead; combining
+        // U+0336 marks would also land in copied text.
+        .unicode_strikeout(false)
+        .lines_from_read(text.as_bytes(), usize::from(width))
+        .ok()?;
+    let colors = palette();
+    let mut lines: Vec<Line<'static>> = rendered
+        .iter()
+        .take(MAX_LINES)
+        .map(|line| html_line(line, &colors))
+        .collect();
+    let visible = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .any(|span| !span.content.trim().is_empty());
+    // The caller's truncation marker counts SOURCE lines, which a short
+    // document of long paragraphs can stay under.
+    if rendered.len() > MAX_LINES && text.lines().count() <= MAX_LINES {
+        lines.push(Line::raw("… (truncated)"));
+    }
+    visible.then_some(lines)
+}
+
+/// html2text's layout cost grows with the square of element nesting (its
+/// size estimate is recursive): 1 MiB of nested `<div>`s pinned a core for
+/// two minutes, and work inside the load worker cannot be cancelled — each
+/// resize would start another. Documents past these bounds show their source.
+const MAX_HTML_BYTES: usize = 256 * 1024;
+const MAX_HTML_DEPTH: usize = 1024;
+
+/// A cheap upper bound on element nesting: opening tags deepen, closing tags
+/// return. Void and self-closed elements never deepen, comments and
+/// declarations are skipped. Unclosed `<p>`/`<li>` only over-count, which
+/// errs toward showing the source.
+fn html_nesting_exceeds(text: &str, limit: usize) -> bool {
+    const VOID: &[&str] = &[
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source",
+        "track", "wbr",
+    ];
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while let Some(offset) = bytes[i..].iter().position(|&b| b == b'<') {
+        let start = i + offset + 1;
+        let Some(len) = bytes[start..].iter().position(|&b| b == b'>') else {
+            break;
+        };
+        let tag = &text[start..start + len];
+        i = start + len + 1;
+        if let Some(name) = tag.strip_prefix('/') {
+            if !name.is_empty() {
+                depth = depth.saturating_sub(1);
+            }
+            continue;
+        }
+        let name = tag
+            .split(|c: char| c.is_ascii_whitespace() || c == '/')
+            .next()
+            .unwrap_or_default();
+        if name.is_empty()
+            || name.starts_with(['!', '?'])
+            || tag.ends_with('/')
+            || VOID.iter().any(|v| name.eq_ignore_ascii_case(v))
+        {
+            continue;
+        }
+        depth += 1;
+        if depth > limit {
+            return true;
+        }
+    }
+    false
+}
+
+/// One rendered HTML line as styled spans. html2text marks a heading only by
+/// its `#` prefix, so a line opening with one (outside `<pre>` and `<code>`)
+/// takes the heading style. The prefix stays, keeping the level visible the
+/// way glow's default style does for markdown.
+fn html_line(line: &TaggedLine<Vec<RichAnnotation>>, colors: &crate::ui::Palette) -> Line<'static> {
+    let mut heading = false;
+    let mut spans = Vec::new();
+    for (index, piece) in line.tagged_strings().enumerate() {
+        let code = piece
+            .tag
+            .iter()
+            .any(|tag| matches!(tag, RichAnnotation::Code | RichAnnotation::Preformat(_)));
+        if index == 0 && !code && is_html_heading(&piece.s) {
+            heading = true;
+        }
+        let base = if heading {
+            Style::default().fg(colors.header_accent).bold()
+        } else {
+            Style::default()
+        };
+        if !piece.s.is_empty() {
+            spans.push(Span::styled(
+                piece.s.clone(),
+                html_style(base, &piece.tag, colors),
+            ));
+        }
+    }
+    Line::from(spans)
+}
+
+/// Whether `text` opens with a `# ` … `###### ` heading prefix.
+fn is_html_heading(text: &str) -> bool {
+    let rest = text.trim_start_matches('#');
+    let level = text.len() - rest.len();
+    (1..=6).contains(&level) && rest.starts_with(' ')
+}
+
+/// Annotations arrive outermost first, so `<code>` inside a link keeps its
+/// own chip colors.
+fn html_style(base: Style, tags: &[RichAnnotation], colors: &crate::ui::Palette) -> Style {
+    tags.iter().fold(base, |style, tag| match tag {
+        RichAnnotation::Strong => style.bold(),
+        RichAnnotation::Emphasis => style.italic(),
+        RichAnnotation::Strikeout => style.crossed_out(),
+        RichAnnotation::Link(_) => style.fg(colors.accent_focus).underlined(),
+        RichAnnotation::Image(_) => style.fg(colors.ignored).italic(),
+        RichAnnotation::Code => style.fg(colors.keycap_fg).bg(colors.keycap_bg),
+        RichAnnotation::Preformat(_) => style.fg(colors.modified),
+        // Plain text, and the CSS colors this build never enables.
+        _ => style,
+    })
 }
 
 fn choose_text_render<F>(
@@ -1427,20 +1605,19 @@ fn ffmpeg_in_path(path: &std::ffi::OsStr, cwd: Option<&Path>) -> Option<PathBuf>
         .filter_map(|directory| directory.canonicalize().ok())
         .filter(|directory| !cwd.is_some_and(|cwd| directory.starts_with(cwd)))
         .map(|directory| directory.join(executable))
-        .find(|candidate| {
-            if !candidate.is_file() {
-                return false;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                candidate
-                    .metadata()
-                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            }
-            #[cfg(not(unix))]
-            true
-        })
+        .find(|candidate| candidate.is_file() && is_executable(candidate))
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    path.metadata()
+        .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &Path) -> bool {
+    true
 }
 
 fn ffmpeg_on_path() -> Option<PathBuf> {
@@ -1597,6 +1774,8 @@ fn load_media_file(target: &Path, name: String, video_poster: bool) -> Doc {
         glow_width: None,
         rows: Vec::new(),
         rows_key: None,
+        diff: None,
+        split: false,
         pending_src: None,
         selection: PreviewSelection::default(),
         stamp: None,
@@ -1616,6 +1795,7 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
         return load_media_file(target, name, true);
     }
     let is_markdown = lower.ends_with(".md") || lower.ends_with(".markdown");
+    let is_html = has_extension(target, &["htm", "html"]);
     let (lines, numbered, glow_width) = match std::fs::read(target) {
         Err(e) => (vec![Line::raw(format!("(unreadable: {e})"))], true, None),
         Ok(bytes) => {
@@ -1628,13 +1808,18 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
             } else {
                 let truncated = bytes.len() > MAX_BYTES;
                 let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_BYTES)]);
-                // Markdown: render via glow; fall back to syntax highlight on failure.
-                let requested_glow_width = LAST_BODY_WIDTH
+                // Markdown renders via glow and HTML via html2text; either
+                // falls back to syntax highlight on failure. A line target
+                // shows the source so the line number means something.
+                let render_width = LAST_BODY_WIDTH
                     .load(std::sync::atomic::Ordering::Relaxed)
                     .max(20);
-                let glow_rendered = (is_markdown && target_line.is_none())
-                    .then(|| glow_markdown(&text, requested_glow_width))
-                    .flatten();
+                let rendered = match target_line {
+                    Some(_) => None,
+                    None if is_markdown => glow_markdown(&text, render_width),
+                    None if is_html => html_document(&text, render_width),
+                    None => None,
+                };
                 let fallback = || {
                     crate::syntax::highlight(&name, &text, MAX_LINES).unwrap_or_else(|| {
                         text.lines()
@@ -1644,7 +1829,7 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
                     })
                 };
                 let (mut lines, numbered, glow_width) =
-                    choose_text_render(glow_rendered, fallback, requested_glow_width);
+                    choose_text_render(rendered, fallback, render_width);
                 if truncated || text.lines().count() > MAX_LINES {
                     lines.push(Line::raw("… (truncated)"));
                 }
@@ -1662,11 +1847,14 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
         numbered,
         media: None,
         scroll: 0,
-        // Glow already laid out tables and paragraphs for `glow_width`.
+        // Glow or html2text already laid out tables and paragraphs for
+        // `glow_width`.
         wrap: glow_width.is_none(),
         glow_width,
         rows: Vec::new(),
         rows_key: None,
+        diff: None,
+        split: false,
         pending_src: target_line.map(|line| line.saturating_sub(1)),
         selection: PreviewSelection::default(),
         stamp: None,
@@ -1704,6 +1892,7 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         .args(&args)
         .current_dir(root)
         .output();
+    let mut diff = None;
     let lines = match output {
         Err(e) => vec![Line::raw(format!("(git failed: {e})"))],
         Ok(out) => {
@@ -1717,7 +1906,12 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
                     vec![Line::raw(format!("({})", err.trim()))]
                 }
             } else {
-                crate::diffview::render(rel, &text)
+                // Highlight once here, on the load worker; a resize only
+                // re-runs the side-by-side column layout from this.
+                let styled = crate::diffview::style(rel, &text);
+                let lines = crate::diffview::render_styled(&styled);
+                diff = Some(styled);
+                lines
             }
         }
     };
@@ -1737,6 +1931,8 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         glow_width: None,
         rows: Vec::new(),
         rows_key: None,
+        diff,
+        split: crate::state::load_state().diff_side_by_side,
         pending_src: None,
         selection: PreviewSelection::default(),
         stamp: None,
@@ -1767,11 +1963,8 @@ fn read_control_file(control: &Path) -> Option<Request> {
     parse_request(&buf)
 }
 
-/// Tag our pane (heartbeat-stamped, see launch::HEARTBEAT_STALE_SECS), record
-/// WHICH document we show so any sidebar can route clicks to us, and title the
-/// pane with the document's name. A `None` key clears the token — showing
-/// nothing must not look like a preview of the empty path.
-fn report_identity(mode: &ViewMode, doc_key: Option<&str>, control: &Path) {
+/// Stamp liveness and document routing independently of label maintenance.
+fn report_tokens(doc_key: Option<&str>, control: &Path) {
     let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else {
         return;
     };
@@ -1801,28 +1994,97 @@ fn report_identity(mode: &ViewMode, doc_key: Option<&str>, control: &Path) {
             "tokens": tokens,
         }),
     );
-    let _ = ipc::call_text(
-        "pane.rename",
-        serde_json::json!({ "pane_id": pane_id, "label": mode_pane_label(mode) }),
-    );
-    let Some(doc_key) = doc_key else { return };
-    // The tab is the user's, not the document's, when we share it.
-    if inline {
-        return;
+}
+
+#[derive(Default)]
+struct ViewerLabels {
+    pane: Option<String>,
+    tab: Option<(String, String)>,
+}
+
+fn label_changed(previous: Option<&str>, desired: &str) -> bool {
+    previous != Some(desired)
+}
+
+impl ViewerLabels {
+    fn report_identity(&mut self, mode: &ViewMode, doc_key: Option<&str>, control: &Path) {
+        self.update(mode, doc_key);
+        report_tokens(doc_key, control);
     }
-    if let Ok(list) = ipc::call_text("pane.list", serde_json::json!({}))
-        && let Some(preview) = previews_in(&list)
-            .into_iter()
-            .find(|p| p.pane_id == pane_id)
-    {
-        let _ = ipc::call_text(
+
+    fn update(&mut self, mode: &ViewMode, doc_key: Option<&str>) {
+        let pane_label = mode_pane_label(mode);
+        let pane_changed = label_changed(self.pane.as_deref(), &pane_label);
+        let doc_key = doc_key.filter(|_| !runs_inline());
+        if !pane_changed && doc_key.is_none() {
+            return;
+        }
+        let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else {
+            return;
+        };
+        let Some(pane) = viewer_pane_info(&pane_id) else {
+            return;
+        };
+        if pane_changed
+            && (!label_changed(pane["label"].as_str(), &pane_label)
+                || ipc::call_text(
+                    "pane.rename",
+                    serde_json::json!({ "pane_id": pane_id, "label": pane_label }),
+                )
+                .is_ok_and(|reply| ipc_succeeded(&reply)))
+        {
+            self.pane = Some(pane_label);
+        }
+        if let Some(key) = doc_key
+            && let Some(tab_id) = pane["tab_id"].as_str()
+        {
+            let pinned = pane["tokens"][TOKEN_PINNED].is_string();
+            let label = tab_label(key, pinned);
+            self.update_tab(tab_id, &label, rename_tab_if_changed);
+        }
+    }
+
+    fn update_tab(&mut self, tab_id: &str, label: &str, rename: impl FnOnce(&str, &str) -> bool) {
+        if self
+            .tab
+            .as_ref()
+            .is_some_and(|(id, applied)| id == tab_id && applied == label)
+        {
+            return;
+        }
+        if rename(tab_id, label) {
+            self.tab = Some((tab_id.to_owned(), label.to_owned()));
+        } else {
+            self.tab = None;
+        }
+    }
+}
+
+fn viewer_pane_info(pane_id: &str) -> Option<serde_json::Value> {
+    let response = ipc::call_text("pane.get", serde_json::json!({ "pane_id": pane_id })).ok()?;
+    let mut response: serde_json::Value =
+        serde_json::from_str(crate::launch::strip_bom(&response)).ok()?;
+    Some(response.get_mut("result")?.get_mut("pane")?.take())
+}
+
+fn rename_tab_if_changed(tab_id: &str, label: &str) -> bool {
+    let Ok(response) = ipc::call_text("tab.get", serde_json::json!({ "tab_id": tab_id })) else {
+        return false;
+    };
+    let Ok(response) =
+        serde_json::from_str::<serde_json::Value>(crate::launch::strip_bom(&response))
+    else {
+        return false;
+    };
+    let Some(current) = response["result"]["tab"]["label"].as_str() else {
+        return false;
+    };
+    !label_changed(Some(current), label)
+        || ipc::call_text(
             "tab.rename",
-            serde_json::json!({
-                "tab_id": preview.tab_id,
-                "label": tab_label(doc_key, preview.pinned),
-            }),
-        );
-    }
+            serde_json::json!({ "tab_id": tab_id, "label": label }),
+        )
+        .is_ok_and(|reply| ipc_succeeded(&reply))
 }
 
 /// This viewer shares the sidebar's tab. Read from the spawn env rather than
@@ -1967,13 +2229,12 @@ fn pin_own_tab(doc_key: &str) {
     let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else {
         return;
     };
-    let Ok(list) = ipc::call_text("pane.list", serde_json::json!({})) else {
+    let Some(pane) = viewer_pane_info(&pane_id) else {
         return;
     };
-    let tab_id = crate::launch::tab_of(&list, &pane_id);
-    if pane_id.is_empty() || tab_id.is_empty() {
+    let Some(tab_id) = pane["tab_id"].as_str() else {
         return;
-    }
+    };
     let _ = ipc::call_text(
         "pane.report_metadata",
         serde_json::json!({
@@ -1982,10 +2243,7 @@ fn pin_own_tab(doc_key: &str) {
             "tokens": { TOKEN_PINNED: "1" },
         }),
     );
-    let _ = ipc::call_text(
-        "tab.rename",
-        serde_json::json!({ "tab_id": tab_id, "label": tab_label(doc_key, true) }),
-    );
+    rename_tab_if_changed(tab_id, &tab_label(doc_key, true));
 }
 
 /// Delete control files whose pane is gone. `close_own_pane` handles the
@@ -2090,12 +2348,15 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         glow_width: None,
         rows: Vec::new(),
         rows_key: None,
+        diff: None,
+        split: false,
         pending_src: None,
         selection: PreviewSelection::default(),
         stamp: None,
     });
     let mut mode = ViewMode::Preview(doc);
-    report_identity(
+    let mut labels = ViewerLabels::default();
+    labels.report_identity(
         &mode,
         current.as_ref().map(Request::doc_key).as_deref(),
         control,
@@ -2110,7 +2371,9 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     );
     crossterm::style::force_color_output(true); // TUI colors ≠ pipeable output
     let mut terminal = ratatui::init();
-    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // herdr forwards focus reporting (CSI I / CSI O) when the user switches
+    // to or away from this pane, so returning to a preview checks it at once.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange);
     let mut page: usize = 20;
     let mut preview_body = Rect::default();
     let mut edit_width: usize = 1;
@@ -2126,7 +2389,16 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         std::sync::mpsc::Receiver<Option<Doc>>,
         Instant,
     )> = None;
+    // A refresh to run now rather than on the 2s tick: `Some(true)` for `r`
+    // (reloads even an unchanged stamp and reports the outcome), `Some(false)`
+    // for a regained focus. `refresh_manual` marks the one in flight.
+    let mut refresh_now: Option<bool> = None;
+    let mut refresh_manual = false;
     let mut copier: Option<ReleaseCopier> = None;
+    // The editor's copies run synchronously on this loop (like its Ctrl+C/X),
+    // so its copy-on-select reads herdr's setting here rather than on the
+    // preview worker: a queued release copy could land after a later Ctrl+C.
+    let mut editor_copy_on_select = None;
     let mut identity_pending = false;
     let result = loop {
         let loaded =
@@ -2169,7 +2441,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             break Err(e);
         }
         if identity_pending {
-            report_identity(
+            labels.report_identity(
                 &mode,
                 current.as_ref().map(Request::doc_key).as_deref(),
                 control,
@@ -2233,7 +2505,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                             }
                             (Prompt::Unsaved(_), KeyCode::Esc | KeyCode::Char('c')) => {
                                 restore_current_control(control, &current);
-                                report_identity(
+                                labels.report_identity(
                                     &mode,
                                     current.as_ref().map(Request::doc_key).as_deref(),
                                     control,
@@ -2288,7 +2560,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                             }
                             (Prompt::Conflict(_), KeyCode::Esc | KeyCode::Char('c')) => {
                                 restore_current_control(control, &current);
-                                report_identity(
+                                labels.report_identity(
                                     &mode,
                                     current.as_ref().map(Request::doc_key).as_deref(),
                                     control,
@@ -2344,7 +2616,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                                     mode = ViewMode::Edit(editor);
                                                     preview_load = None;
                                                     notice = None;
-                                                    report_identity(
+                                                    labels.report_identity(
                                                         &mode,
                                                         current
                                                             .as_ref()
@@ -2380,6 +2652,15 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     KeyCode::Char('w') if doc.media.is_none() => {
                                         doc.pending_src = Some(doc.top_src());
                                         doc.wrap = !doc.wrap;
+                                    }
+                                    KeyCode::Char('r') => refresh_now = Some(true),
+                                    // Side by side is remembered for every
+                                    // later diff, in every sidebar.
+                                    KeyCode::Char('v') if doc.diff.is_some() => {
+                                        doc.pending_src = Some(doc.top_src());
+                                        doc.split = !doc.split;
+                                        let split = doc.split;
+                                        crate::state::update_state(|s| s.diff_side_by_side = split);
                                     }
                                     _ => {}
                                 }
@@ -2479,9 +2760,21 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                 should_close = close_own_pane(control, &current, &mut notice);
                             }
                         }
-                        _ if prompt.is_none() => editor.on_mouse(&mouse, edit_body),
+                        _ if prompt.is_none()
+                            && editor.on_mouse(&mouse, edit_body)
+                            && herdr_copy_on_select(&mut editor_copy_on_select) =>
+                        {
+                            editor.copy_selection();
+                        }
                         _ => {}
                     },
+                },
+                Event::FocusGained => match &mut mode {
+                    ViewMode::Preview(_) => refresh_now = Some(refresh_now.unwrap_or(false)),
+                    ViewMode::Edit(editor) => {
+                        editor.poll_external(MAX_BYTES, MAX_LINES);
+                        last_external_check = Instant::now();
+                    }
                 },
                 _ => {} // resize etc: redraw
             }
@@ -2496,16 +2789,18 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         // after a resume the viewer would wait out the rest of its interval
         // while recovery code already reads the old stamp as stale.
         if heartbeat_due(last_heartbeat, crate::state::unix_now()) {
-            report_identity(
-                &mode,
-                current.as_ref().map(Request::doc_key).as_deref(),
-                control,
-            );
+            let doc_key = current.as_ref().map(Request::doc_key);
+            report_tokens(doc_key.as_deref(), control);
+            // A dedicated preview can move without a document change.
+            // Recheck membership and retry failed writes once per heartbeat.
+            labels.update(&mode, doc_key.as_deref());
             // Settings live in a shared file another pane may rewrite; the
             // heartbeat is the sidebar's own re-read cadence. Chrome, diff
             // tints and selection follow immediately — an already-highlighted
             // file keeps its syntax colors until it is reloaded.
-            crate::ui::set_color_theme(crate::state::load_state().color_theme);
+            let shared = crate::state::load_state();
+            crate::ui::set_color_theme(shared.color_theme);
+            crate::syntax::set_themes(shared.syntax_dark, shared.syntax_light);
             last_heartbeat = crate::state::unix_now();
         }
         if prompt.is_none() {
@@ -2527,6 +2822,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                     preview_load = Some(start_preview_load(request));
                     identity_pending = true;
                     notice = None;
+                    refresh_now = None;
                 }
             }
         }
@@ -2568,12 +2864,28 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         if let Some((started, request, refreshed)) = refreshed {
             diff_refresh = None;
             if refresh_is_current(started, &request, load_generation(), current.as_ref())
-                && let (ViewMode::Preview(doc), Some(refreshed)) = (&mut mode, refreshed)
+                && let ViewMode::Preview(doc) = &mut mode
             {
-                apply_diff_refresh(doc, refreshed);
+                let changed = refreshed.is_some_and(|refreshed| apply_diff_refresh(doc, refreshed));
+                if refresh_manual {
+                    notice = Some(if changed { "reloaded" } else { "no changes" }.into());
+                }
             }
         }
-        if last_diff_refresh.elapsed() >= Duration::from_secs(2) {
+        if refresh_now == Some(true)
+            && !matches!(
+                current,
+                Some(Request::Diff { .. } | Request::File { .. }) | None
+            )
+        {
+            // `git show` output is immutable; say so instead of ignoring `r`.
+            refresh_now = None;
+            notice = Some("nothing to reload".into());
+        }
+        let timed = last_diff_refresh.elapsed() >= Duration::from_secs(2);
+        if timed || refresh_now.is_some() {
+            // An on-demand refresh waits for one already in flight, so `r`
+            // is never swallowed by a timer check that started just before.
             if preview_load.is_none()
                 && diff_refresh.is_none()
                 && let ViewMode::Preview(doc) = &mode
@@ -2581,25 +2893,32 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                     current.clone()
                 && let Some(in_flight) = InFlight::claim()
             {
-                let baseline = doc.stamp;
+                refresh_manual = refresh_now.take().unwrap_or(false);
+                // `r` reloads regardless of the stamp: a coarse mtime or a
+                // same-size rewrite can leave it unchanged.
+                let baseline = (!refresh_manual).then_some(doc.stamp);
                 let worker_request = request.clone();
                 let (sender, receiver) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
                     let _in_flight = in_flight;
                     // Files stat first, here on the worker; only a changed
                     // stamp pays for a reload. Diffs always re-run.
-                    let reload = match &worker_request {
-                        Request::File { path, .. } => file_refresh_needed(path, baseline),
+                    let reload = match (&worker_request, baseline) {
+                        (Request::File { path, .. }, Some(baseline)) => {
+                            file_refresh_needed(path, baseline)
+                        }
                         _ => true,
                     };
                     let _ = sender.send(reload.then(|| load(&worker_request)));
                 });
                 diff_refresh = Some((load_generation(), request, receiver, Instant::now()));
             }
-            last_diff_refresh = Instant::now();
+            if timed {
+                last_diff_refresh = Instant::now();
+            }
         }
     };
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, DisableFocusChange);
     ratatui::restore();
     result
 }
@@ -2688,7 +3007,19 @@ fn draw_doc(
             " image preview  q close".into()
         }
     } else if editable {
-        preview_hint(&["e edit", "space/b page", wrap_hint], footer.width)
+        preview_hint(
+            &["e edit", "r reload", "space/b page", wrap_hint],
+            footer.width,
+        )
+    } else if doc.diff.is_some() {
+        let layout_hint = if doc.side_by_side(body.width) {
+            "v: side by side"
+        } else if doc.split {
+            "v: side by side (too narrow)"
+        } else {
+            "v: unified"
+        };
+        preview_hint(&["space/b page", layout_hint, wrap_hint], footer.width)
     } else {
         preview_hint(&["space/b page", "↑↓ scroll", wrap_hint], footer.width)
     };
@@ -3005,10 +3336,7 @@ pub fn pin_target(target: &PreviewTarget, doc_key: &str) -> bool {
             "tokens": { TOKEN_PINNED: "1" },
         }),
     );
-    let _ = ipc::call_text(
-        "tab.rename",
-        serde_json::json!({ "tab_id": target.tab_id, "label": tab_label(doc_key, true) }),
-    );
+    rename_tab_if_changed(&target.tab_id, &tab_label(doc_key, true));
     true
 }
 
@@ -3794,10 +4122,39 @@ mod tests {
             glow_width: None,
             rows: Vec::new(),
             rows_key: None,
+            diff: None,
+            split: false,
             pending_src: None,
             selection: PreviewSelection::default(),
             stamp: None,
         }
+    }
+
+    #[test]
+    fn diff_lays_out_side_by_side_when_toggled_and_wide_enough() {
+        let text = "@@ -1,2 +1,2 @@\n keep\n-old line\n+new line\n";
+        let mut doc = doc_of(crate::diffview::render("a.txt", text), false);
+        doc.diff = Some(crate::diffview::style("a.txt", text));
+
+        doc.relayout(80, 20);
+        assert_eq!(doc.rows.len(), 3, "unified: one row per diff line");
+        assert!(!row_texts(&doc.rows)[1].contains('│'));
+
+        // `v` keeps the reader's place by source line, like `w`.
+        doc.scroll = 2;
+        doc.pending_src = Some(doc.top_src());
+        doc.split = true;
+        doc.relayout(80, 20);
+        let texts = row_texts(&doc.rows);
+        assert_eq!(doc.rows.len(), 2, "side by side: the -/+ pair shares a row");
+        assert!(texts[1].contains("old line") && texts[1].contains("new line"));
+        assert!(texts[1].contains('│'));
+        assert_eq!(doc.scroll, 1, "still looking at the changed pair");
+
+        // Too narrow for two columns: back to unified, toggle kept.
+        doc.relayout(MIN_SPLIT_WIDTH - 1, 20);
+        assert_eq!(doc.rows.len(), 3);
+        assert!(doc.split);
     }
 
     fn row_texts(rows: &[Row]) -> Vec<String> {
@@ -4131,12 +4488,34 @@ mod tests {
         let rows_key = doc.rows_key;
 
         let refreshed = doc_of(vec![Line::raw("-old"), Line::raw("+new")], false);
-        apply_diff_refresh(&mut doc, refreshed);
+        assert!(!apply_diff_refresh(&mut doc, refreshed), "nothing changed");
 
         assert_eq!(doc.selection.anchor, selection.anchor);
         assert_eq!(doc.selection.cursor, selection.cursor);
         assert_eq!(doc.rows_key, rows_key);
         assert_eq!(doc.scroll, 1);
+    }
+
+    /// `r` reports "reloaded" only when the content actually changed, and a
+    /// changed reload keeps the reader's wrap mode and place by source line.
+    #[test]
+    fn changed_refresh_reports_and_keeps_wrap_and_position() {
+        let lines = |marker: &str| -> Vec<Line<'static>> {
+            (0..50)
+                .map(|i| Line::raw(format!("{marker} line {i}")))
+                .collect()
+        };
+        let mut doc = doc_of(lines("old"), true);
+        doc.wrap = false;
+        doc.relayout(40, 10);
+        doc.scroll = 20;
+
+        assert!(apply_diff_refresh(&mut doc, doc_of(lines("new"), true)));
+        doc.relayout(40, 10);
+
+        assert!(!doc.wrap, "the reader's wrap toggle survives a reload");
+        assert_eq!(doc.scroll, 20, "same source line stays at the top");
+        assert_eq!(doc.lines[0].to_string(), "new line 0");
     }
 
     /// Astra #3: a change saved before the first poll must still reload. The
@@ -4852,6 +5231,34 @@ mod tests {
     }
 
     #[test]
+    fn preview_relabels_a_new_tab_and_retries_a_failed_rename() {
+        let tab = tab_label("/a/main.rs", false);
+        let mut labels = ViewerLabels::default();
+        let renamed = |id: &str, label: &str| {
+            assert!(matches!(id, "w1:t1" | "w2:t2"));
+            assert_eq!(label, tab);
+            true
+        };
+        labels.update_tab("w1:t1", &tab, renamed);
+        labels.update_tab("w1:t1", &tab, |_, _| panic!("unchanged tab and label"));
+
+        labels.update_tab("w2:t2", &tab, |id, _| {
+            assert_eq!(id, "w2:t2");
+            false
+        });
+        assert!(labels.tab.is_none());
+        labels.update_tab("w2:t2", &tab, renamed);
+        assert_eq!(labels.tab.as_ref().unwrap().0, "w2:t2");
+
+        let pinned = tab_label("/a/main.rs", true);
+        labels.update_tab("w2:t2", &pinned, |_, label| {
+            assert_eq!(label, "main.rs");
+            true
+        });
+        assert_eq!(labels.tab, Some(("w2:t2".into(), pinned)));
+    }
+
+    #[test]
     fn tab_labels_mark_the_ephemeral_tab_not_the_pinned_one() {
         // `*` warns "this one is about to be overwritten".
         assert_eq!(tab_label("/repo/src/main.rs", false), "main.rs · preview");
@@ -5241,6 +5648,8 @@ mod tests {
             glow_width,
             rows: Vec::new(),
             rows_key: None,
+            diff: None,
+            split: false,
             pending_src: None,
             selection: PreviewSelection::default(),
             stamp: None,
@@ -5250,6 +5659,135 @@ mod tests {
         assert_eq!(doc.glow_width, Some(80));
         assert!(!glow_needs_reload(&doc, 80));
         assert!(glow_needs_reload(&doc, 60));
+    }
+
+    fn html_text(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.to_string().trim_end().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn html_document_styles_headings_emphasis_links_and_code() {
+        use ratatui::style::Modifier;
+        let html = "<h2>Title</h2><p>Some <strong>bold</strong>, a \
+                    <a href=\"https://example.test/\">link</a> and <code>x = 1</code>.</p>";
+        let lines = html_document(html, 80).expect("html renders");
+        let span = |text: &str| {
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .find(|span| span.content.contains(text))
+                .unwrap_or_else(|| panic!("no span containing {text:?}"))
+                .clone()
+        };
+        let title = span("Title");
+        assert_eq!(title.content, "## Title", "the level prefix stays");
+        assert!(title.style.add_modifier.contains(Modifier::BOLD));
+        assert!(title.style.fg.is_some(), "headings take the accent color");
+        assert!(span("bold").style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            span("link")
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
+        assert!(span("x = 1").style.bg.is_some(), "inline code is a chip");
+        assert!(
+            html_text(&lines).contains(&"[1]: https://example.test/".to_string()),
+            "link targets are listed as footnotes: {:?}",
+            html_text(&lines)
+        );
+    }
+
+    #[test]
+    fn html_preformatted_hash_lines_are_not_headings() {
+        use ratatui::style::Modifier;
+        let lines = html_document("<pre># a shell comment\nls</pre>", 80).expect("html renders");
+        let comment = lines
+            .iter()
+            .find(|line| line.to_string().contains("comment"))
+            .expect("comment line");
+        assert_eq!(comment.to_string().trim_end(), "# a shell comment");
+        assert!(
+            comment
+                .spans
+                .iter()
+                .all(|span| !span.style.add_modifier.contains(Modifier::BOLD))
+        );
+    }
+
+    #[test]
+    fn html_strikeout_uses_the_terminal_style_not_combining_marks() {
+        use ratatui::style::Modifier;
+        let lines = html_document("<p><del>gone</del></p>", 80).expect("html renders");
+        let gone = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("gone"))
+            .expect("struck span");
+        assert_eq!(gone.content, "gone", "no U+0336 marks in copied text");
+        assert!(gone.style.add_modifier.contains(Modifier::CROSSED_OUT));
+    }
+
+    #[test]
+    fn html_document_wraps_to_the_body_width() {
+        let words = "word ".repeat(60);
+        let lines = html_document(&format!("<p>{words}</p>"), 30).expect("html renders");
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|line| line.width() <= 30));
+    }
+
+    #[test]
+    fn html_document_never_shows_script_or_style_bodies() {
+        let html = "<style>body { color: red }</style><script>alert(1)</script><p>visible</p>";
+        let text = html_text(&html_document(html, 80).expect("html renders")).join("\n");
+        assert!(text.contains("visible"));
+        assert!(!text.contains("alert") && !text.contains("color"), "{text}");
+    }
+
+    #[test]
+    fn deep_or_huge_html_shows_its_source_instead_of_stalling_the_loader() {
+        let nested = |depth: usize| format!("{}x{}", "<div>".repeat(depth), "</div>".repeat(depth));
+        assert!(!html_nesting_exceeds(
+            &nested(MAX_HTML_DEPTH),
+            MAX_HTML_DEPTH
+        ));
+        assert!(html_nesting_exceeds(
+            &nested(MAX_HTML_DEPTH + 1),
+            MAX_HTML_DEPTH
+        ));
+        assert!(html_document(&nested(MAX_HTML_DEPTH + 1), 80).is_none());
+        // Siblings, void elements, self-closing tags and comments never deepen.
+        let flat = "<p>a</p><br><img src=x><hr/><!-- c --><!doctype html>".repeat(2000);
+        assert!(!html_nesting_exceeds(&flat, 8));
+        let huge = "<p>word</p>".repeat(MAX_HTML_BYTES / 11 + 1);
+        assert!(huge.len() > MAX_HTML_BYTES);
+        assert!(html_document(&huge, 80).is_none());
+    }
+
+    #[test]
+    fn html_document_without_visible_text_falls_back_to_source() {
+        assert!(html_document("<script>document.write('hi')</script>", 80).is_none());
+        assert!(html_document("", 80).is_none());
+    }
+
+    #[test]
+    fn html_files_render_at_the_body_width_and_line_targets_keep_source() {
+        let root = std::env::temp_dir().join(format!("herdr-sidebar-html-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("page.HTML");
+        std::fs::write(&path, "<h1>Hello</h1><p>world</p>\n").unwrap();
+        let doc = load_file(&path, None);
+        assert!(doc.glow_width.is_some(), "rendered HTML reloads on resize");
+        assert!(!doc.numbered && !doc.wrap);
+        assert!(html_text(&doc.lines).contains(&"# Hello".to_string()));
+        let source = load_file(&path, Some(1));
+        assert!(source.numbered, "a line target shows the source");
+        assert!(source.glow_width.is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
