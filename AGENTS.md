@@ -558,10 +558,12 @@ HACKING.md — budget time for that before promising a patched build.
   a missed focus hook is repaired without rewriting an agreeing marker. The
   other steady-state calls are the ~5 s identity heartbeat and the 30 s
   membership fallback above. The 20 s stale rule is unchanged. Root-label retries
-  wait while the tab is hidden. A preview heartbeat sends only the metadata
-  stamp. Document, mode, or pin changes compare labels before renaming;
-  dedicated preview heartbeats previously made four calls (metadata, pane rename,
-  global list, tab rename), and inline previews made two. Herdr's token-only
+  wait while the tab is hidden. On each ~5 s heartbeat, a dedicated preview sends
+  its metadata stamp and uses one `pane.get` to detect a move even when the document
+  is unchanged. The applied tab label is cached by (tab id, label), so a move
+  relabels its destination and a failed rename retries on the next heartbeat.
+  A steady inline preview sends only metadata. Document, mode, or pin changes
+  compare labels before renaming. Herdr's token-only
   metadata handler increments the pane revision and emits `pane.updated` when
   tokens change. It does not dirty the session or schedule a save, but headless
   `request_changes_ui` classifies metadata reports as UI-changing. Both rename
