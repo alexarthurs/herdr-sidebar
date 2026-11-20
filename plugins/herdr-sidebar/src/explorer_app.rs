@@ -27,12 +27,12 @@ use herdr_sidebar::ipc;
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::tree::{Row, Tree};
 use herdr_sidebar::ui::{
-    TitleAction, activity_button_style, activity_icons, chrome_button_style, draw_activity_caps,
-    draw_scrollbar, fit_menu_hint, gear_icon, hits, hits_activity_button, hits_collapse_button,
-    hover_style, icon_style as ui_icon_style, input_tail, keep_visible_scroll, palette,
-    selection_style, set_color_theme, sibling_panes_of, status_color, title_action_icon,
-    title_action_spans, title_actions_visible, title_actions_width, truncate_to,
-    wrap_footer_message, wrap_hints,
+    LETTER_HOTKEYS_NOTICE, SETTINGS_KEY, TitleAction, activity_button_style, activity_icons,
+    chrome_button_style, draw_activity_caps, draw_scrollbar, fit_menu_hint, gear_icon, hits,
+    hits_activity_button, hits_collapse_button, hover_style, icon_style as ui_icon_style,
+    ignore_letter_hotkey, input_tail, keep_visible_scroll, palette, selection_style,
+    set_color_theme, sibling_panes_of, status_color, title_action_icon, title_action_spans,
+    title_actions_visible, title_actions_width, truncate_to, wrap_footer_message, wrap_hints,
 };
 
 use herdr_sidebar::state::Exit;
@@ -307,6 +307,7 @@ enum Setting {
     FollowCwd,
     HiddenFiles,
     Hotkeys,
+    LetterHotkeys,
     GitDecorations,
     GitFooter,
     ConfirmGitOps,
@@ -582,6 +583,7 @@ impl App {
         self.sidebar_state.auto_hide_below = shared.auto_hide_below;
         self.sidebar_state.confirm_git_ops = shared.confirm_git_ops;
         self.sidebar_state.close_lonely_tab = shared.close_lonely_tab;
+        self.sidebar_state.letter_hotkeys = shared.letter_hotkeys;
         let old_git_footer = self.sidebar_state.show_git_footer;
         self.sidebar_state.show_git_footer = shared.show_git_footer;
         self.sidebar_state.syntax_dark = shared.syntax_dark;
@@ -1076,8 +1078,25 @@ impl App {
     }
 
     /// Handle one key press; `Some(exit)` ends the event loop.
-    pub fn on_key(&mut self, key: KeyEvent) -> Option<Exit> {
+    pub fn on_key(&mut self, key: KeyEvent, shortcut_notice_shown: &mut bool) -> Option<Exit> {
         if key.kind != KeyEventKind::Press {
+            return None;
+        }
+        if (self.overlay.is_none() || self.search_text_unfocused())
+            && ignore_letter_hotkey(key, self.sidebar_state.letter_hotkeys)
+        {
+            if !std::mem::replace(shortcut_notice_shown, true) {
+                self.notice = Some(LETTER_HOTKEYS_NOTICE.into());
+            }
+            return None;
+        }
+        if key.code == SETTINGS_KEY
+            && key.modifiers.is_empty()
+            && (self.overlay.is_none()
+                || matches!(self.overlay, Some(Overlay::ContentSearch { .. })))
+        {
+            self.notice = None;
+            self.open_settings();
             return None;
         }
         if key.code == KeyCode::Char('q')
@@ -2632,6 +2651,17 @@ impl App {
                 true,
             ),
             (
+                Setting::LetterHotkeys,
+                sidebar::LETTER_HOTKEYS_LABEL,
+                if self.sidebar_state.letter_hotkeys {
+                    "on"
+                } else {
+                    "off"
+                }
+                .into(),
+                true,
+            ),
+            (
                 Setting::AutoOpen,
                 "Auto-open sidebar",
                 if self.sidebar_state.auto_open {
@@ -2786,6 +2816,10 @@ impl App {
             Setting::Hotkeys => {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.show_hotkeys = !state.show_hotkeys);
+            }
+            Setting::LetterHotkeys => {
+                self.sidebar_state =
+                    sidebar::update_state(|state| state.letter_hotkeys = !state.letter_hotkeys);
             }
             Setting::AutoOpen => {
                 self.sidebar_state =
@@ -3329,8 +3363,16 @@ impl App {
         // the pane label ("Explorer"/"Sidebar") — a second border read as a
         // double frame.
         let search_active = matches!(self.overlay, Some(Overlay::ContentSearch { .. }));
+        let search_notice = if search_active && let Some(notice) = &self.notice {
+            wrap_footer_message(notice, frame.area().width, 4)
+                .into_iter()
+                .map(|line| Line::styled(line, Style::default().fg(palette().modified)))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let footer_height = if search_active {
-            1
+            1 + search_notice.len() as u16
         } else {
             self.footer_height(frame.area().width)
         };
@@ -3357,8 +3399,11 @@ impl App {
                 header.height.saturating_add(body.height),
             );
             self.draw_content_search(frame, search_area);
+            let [notice_area, last_line] =
+                Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(footer);
+            frame.render_widget(Paragraph::new(search_notice), notice_area);
             let [hint, button] =
-                Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(footer);
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(last_line);
             self.git_footer_zones = FooterZones::default();
             if self.sidebar_state.show_git_footer
                 && let Some(status) = &self.git_footer_status
@@ -3487,9 +3532,12 @@ impl App {
         frame.render_widget(Paragraph::new(footer_lines), footer_content);
         if menu_hint {
             frame.render_widget(
-                Paragraph::new(fit_menu_hint(footer_content.width))
-                    .style(Style::default().fg(Color::DarkGray))
-                    .alignment(Alignment::Right),
+                Paragraph::new(fit_menu_hint(
+                    footer_content.width,
+                    self.sidebar_state.letter_hotkeys,
+                ))
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Right),
                 footer_content,
             );
         }
@@ -3520,9 +3568,15 @@ impl App {
             );
             frame.render_widget(
                 Paragraph::new(
-                    format!(" {}", fit_menu_hint(hint_area.width.saturating_sub(1)))
-                        .dim()
-                        .italic(),
+                    format!(
+                        " {}",
+                        fit_menu_hint(
+                            hint_area.width.saturating_sub(1),
+                            self.sidebar_state.letter_hotkeys
+                        )
+                    )
+                    .dim()
+                    .italic(),
                 ),
                 hint_area,
             );
@@ -3613,6 +3667,41 @@ impl App {
 
     /// The hotkey hints for the current mode.
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        let searching = self.suspended_search.is_some()
+            || matches!(self.overlay, Some(Overlay::ContentSearch { .. }));
+        if searching {
+            let mut hints = vec![
+                ("↑↓", "results"),
+                ("⏎", "open match"),
+                ("tab", "change focus"),
+                ("ctrl+f", "query"),
+                ("F8", "settings"),
+                ("esc", "close search"),
+            ];
+            if self.merged() {
+                if self.sidebar_state.letter_hotkeys {
+                    hints.extend([("1", "files"), ("2", "search"), ("3", "git")]);
+                } else {
+                    hints.extend([("ctrl+1", "files"), ("ctrl+2", "search"), ("ctrl+3", "git")]);
+                }
+            }
+            return hints;
+        }
+        if !self.sidebar_state.letter_hotkeys {
+            let mut hints = vec![
+                ("↑↓", "move"),
+                ("←→", "fold"),
+                ("⏎", "toggle"),
+                ("F8", "settings"),
+                ("ctrl+p", "files"),
+                ("ctrl+f", "text"),
+                ("ctrl+q", "close"),
+            ];
+            if self.merged() {
+                hints.extend([("ctrl+1", "files"), ("ctrl+2", "search"), ("ctrl+3", "git")]);
+            }
+            return hints;
+        }
         let mut hints = vec![
             ("↑↓", "move"),
             ("←→", "fold"),
@@ -3623,7 +3712,7 @@ impl App {
             ("ctrl+p", "files"),
             ("ctrl+f", "text"),
             ("m", "menu"),
-            ("s", "settings"),
+            ("s/F8", "settings"),
             ("b", "hide"),
             ("q", "quit"),
         ];

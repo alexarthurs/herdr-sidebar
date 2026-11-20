@@ -32,6 +32,10 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
+When running tests with `TEMP` inside a worktree, set `GIT_CEILING_DIRECTORIES` to the
+absolute scratch directory. Otherwise the repository-discovery fixtures can walk up into
+the real worktree and report it as an extra repository.
+
 CI uses the LATEST stable toolchain (`dtolnay/rust-toolchain@stable`), so a stale local
 `stable` can pass clippy while CI fails on a newly deprecated API (v0.15.1: `fetch_update` →
 `try_update`, which is also newer than our `rust-version = 1.89` MSRV — rewrite instead of
@@ -567,9 +571,9 @@ HACKING.md — budget time for that before promising a patched build.
   no flash — the terminal session is held across switches). The old two-crate host/guest
   process-swap protocol is gone.
 - User-facing wording is **"Unified sidebar: on/off"**, toggled in the ⚙ Settings modal
-  (`s` key or the gear button) — never "merge"/"detach" in UI text, and the toggle is
-  silent (the layout change is the feedback). Off spawns a second pane of the same binary
-  pinned with `--view`, and each pane pins to its own view.
+  (`F8`, `s` with letter shortcuts enabled, or the gear button) — never "merge"/"detach" in
+  UI text, and the toggle is silent (the layout change is the feedback). Off spawns a second
+  pane of the same binary pinned with `--view`, and each pane pins to its own view.
 - The sticky setting lives in `HERDR_PLUGIN_STATE_DIR/state.json` (resolves to
   `%LOCALAPPDATA%\herdr\plugins\herdr-sidebar\` here) per the herdr plugin docs; herdr
   injects that env for hooks/actions but NOT panes, so every `pane.split` we issue
@@ -636,6 +640,14 @@ HACKING.md — budget time for that before promising a patched build.
   including `color_theme`, `strict_toggle`, and `focus_on_open`; theme changes also update
   the process palette immediately. The Settings modal scrolls to keep its selected row visible
   when the pane is too short for all rows and hotkey hints.
+- **Letter shortcuts** (`letter_hotkeys`, defaults to true, #130) applies to the Explorer tree,
+  Search results, and SCM list. Both apps re-read the shared value on tick and call
+  `ui::ignore_letter_hotkey` before handling list shortcuts. Explorer must filter Search's
+  results-focus digits before its global view-switch dispatch. Input fields (including AltGr
+  input), open overlays, and F9–F12 transport keys keep their existing handlers. The notice is
+  shown once per pane, including across in-process app rebuilds. Search draws its notice above
+  its dedicated Git/collapse footer. `F8` opens Settings in each view and uses the standard
+  VT sequence `ESC [ 19 ~`, which avoids reliance on modified punctuation being transmitted.
 - `git_footer` (default true) keeps a one-line branch + sync strip at the bottom of Explorer,
   Search, and Source Control whenever the root belongs to a repository. The normal
   compact `m / ctrl+rclick for menus` hint stays dark-gray and right-aligned directly above it when

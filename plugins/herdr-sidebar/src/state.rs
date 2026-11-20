@@ -12,6 +12,7 @@
 //! - `auto_hide_below`: hide the sidebar while the tab is at most this many
 //!   columns wide (0 = off).
 //! - `close_lonely_tab`: close a tab once only sidebars are left in it.
+//! - `letter_hotkeys`: enable printable-key shortcuts in sidebar lists.
 //!
 //! Both views live in ONE binary; switching is an in-process re-render, and
 //! separated panes are the same binary pinned to a starting view with
@@ -31,6 +32,7 @@ pub const SIDEBAR_WIDTH_STEP: u16 = 4;
 /// ⚙ Settings label for `close_lonely_tab`, shared by both views' modals.
 /// Short enough to sit beside "off" in a default-width pane.
 pub const CLOSE_LONELY_TAB_LABEL: &str = "Close emptied tabs";
+pub const LETTER_HOTKEYS_LABEL: &str = "Letter shortcuts";
 
 pub fn clamp_sidebar_width(width: u16) -> u16 {
     width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH)
@@ -409,6 +411,7 @@ pub struct State {
     /// Show the hotkey chips at the bottom of the sidebar (they always
     /// live in the ⚙ Settings modal; the footer copy is opt-in).
     pub show_hotkeys: bool,
+    pub letter_hotkeys: bool,
     /// Show the compact branch + sync strip at the bottom while the current
     /// folder belongs to a Git repository.
     pub show_git_footer: bool,
@@ -509,6 +512,7 @@ impl Default for State {
             active: View::Explorer,
             search_active: false,
             show_hotkeys: false,
+            letter_hotkeys: true,
             show_git_footer: true,
             icons: None,
             color_theme: ColorTheme::VsCode,
@@ -694,11 +698,12 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"auto_hide_below\":{},\"colors\":\"{}\",\"syntax_dark\":\"{}\",\"syntax_light\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{},\"diff_side_by_side\":{},\"confirm_git_ops\":{},\"close_lonely_tab\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"letter_hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"auto_hide_below\":{},\"colors\":\"{}\",\"syntax_dark\":\"{}\",\"syntax_light\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{},\"diff_side_by_side\":{},\"confirm_git_ops\":{},\"close_lonely_tab\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.search_active,
         state.show_hotkeys,
+        state.letter_hotkeys,
         state.show_git_footer,
         state.font_prompt_done,
         state.auto_open,
@@ -1106,6 +1111,10 @@ pub fn parse_state(json: &str) -> State {
             .get("hotkeys")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.show_hotkeys),
+        letter_hotkeys: value
+            .get("letter_hotkeys")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.letter_hotkeys),
         show_git_footer: value
             .get("git_footer")
             .and_then(|v| v.as_bool())
@@ -1354,6 +1363,7 @@ mod tests {
     fn syntax_theme_row_fits_the_settings_modal() {
         let longest_existing = "Updates".len() + "local checkout".len();
         assert!(CLOSE_LONELY_TAB_LABEL.len() + "off".len() <= longest_existing);
+        assert!(LETTER_HOTKEYS_LABEL.len() + "off".len() <= longest_existing);
         for color_theme in [ColorTheme::VsCode, ColorTheme::Light, ColorTheme::Terminal] {
             for theme in SyntaxTheme::ALL {
                 let state = State {
@@ -1386,6 +1396,7 @@ mod tests {
             active: View::SourceControl,
             search_active: true,
             show_hotkeys: true,
+            letter_hotkeys: false,
             show_git_footer: false,
             icons: Some(crate::icons::IconTheme::Emoji),
             color_theme: ColorTheme::Terminal,
@@ -1407,8 +1418,12 @@ mod tests {
             confirm_git_ops: true,
             close_lonely_tab: false,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"auto_hide_below\":96,\"colors\":\"terminal\",\"syntax_dark\":\"base16-mocha.dark\",\"syntax_light\":\"Solarized (light)\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"diff_side_by_side\":true,\"confirm_git_ops\":true,\"close_lonely_tab\":false,\"icons\":\"emoji\"}";
-        assert_eq!(parse_state(json), state);
+        let file = std::env::temp_dir().join(format!("hs-state-{}.json", std::process::id()));
+        write_state(&file, state);
+        let json = std::fs::read_to_string(&file).unwrap();
+        std::fs::remove_file(file).unwrap();
+        assert_eq!(parse_state(&json), state);
+        assert!(parse_state("{\"merged\":true}").letter_hotkeys);
         // Files written before the setting existed close a tab left with
         // only sidebars, like herdr closes a tab whose last pane exits.
         assert!(parse_state("{\"merged\":true}").close_lonely_tab);

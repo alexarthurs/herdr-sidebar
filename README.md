@@ -107,9 +107,15 @@ Settings persist across tabs and restarts. Configure:
 - Tab (default), split-pane, or temporary takeover previews and optional custom editor
 - Source Control list/tree view (shared across sidebars)
 - Hidden files, Git decorations, Git footer, and footer hotkeys
+- Letter shortcuts (on by default)
 - Auto-open, strict open/close toggle, focus-on-open, and live folder following
 - Confirm risky Git ops (off by default; see below)
 - Close emptied tabs (on by default; see below)
+
+Turn **Letter shortcuts** off to ignore unmodified or Shift-modified letters, numbers, and punctuation
+in the Explorer tree, Search results, and Source Control list. Text fields and open menus and
+prompts still accept typing. Navigation keys and existing modifier shortcuts still work.
+Press `F8` or click the gear in any sidebar view to open Settings and turn the shortcuts back on.
 
 **Confirm risky Git ops** asks y/N before Git actions that rewrite history or touch the
 remote: Sync (from `S`, the sync buttons, a repository row, the Git footer in any view, or
@@ -146,7 +152,7 @@ folder stays put until that pane changes directory again.
 | `r` | refresh | `r` | refresh |
 | `m` | context menu | `m` | context menu |
 | `t` | open folder in new tab | `t` | tree / list |
-| `s` | settings | `s` | settings |
+| `F8` / `s` | settings | `F8` / `s` | settings |
 | `b` | hide | `b` | hide |
 | `1` / `2` / `3` | change view | `1` / `2` / `3` | change view |
 
