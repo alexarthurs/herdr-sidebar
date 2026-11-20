@@ -529,37 +529,38 @@ HACKING.md — budget time for that before promising a patched build.
   obsolete event data. Publication runs before auto-open and the launch lock.
 - `focus.rs` atomically replaces a small workspace/tab/pane JSON marker in the private
   `rundir`, keyed by socket hash like snooze. A sidebar resolves its membership with
-  `pane.get` at startup and checks a pre-existing marker against `pane.current` once.
-  Missing, unreadable, malformed, or startup-mismatched markers use one shared slow
-  sample every 5 s when cwd or focus is needed. A startup mismatch also retries
-  publication on the worker, which clears the fallback after the host responds.
-  A valid marker has no time expiry
-  because the focused tab may sit idle indefinitely. Visibility follows Herdr's
+  `pane.get` at startup. A pre-existing marker is provisionally ignored until a
+  new publication or a coalesced worker check validates it. Missing, unreadable,
+  malformed, or unvalidated startup markers use a slow sample every 5 s when
+  cwd or focus is needed. Validated markers have no expiry while the tab sits idle. Visibility follows Herdr's
   session-wide default pane. Herdr 0.9.5 tracks displayed tabs privately in
   `src/server/headless/client_views.rs`. Its public API schema offers no per-client
   visibility list, and `session.snapshot` exposes one focused tab. A second client's
   tab catches up on its next focus event.
-- `pane.moved` writes an invalidation for the sidebar's stable terminal id. The
-  sidebar resolves its new tab and canonical pane id with one `pane.get` using its
-  original environment id, which Herdr 0.9.5 aliases after a cross-workspace move.
-  The existing single-flight worker handles the lookup. One fallback `pane.get`
-  per 30 s recovers missed or failed move invalidations, including when cwd follow
-  is off. Move markers are small per-terminal files and are reused on subsequent
-  moves. Marker writes, including move invalidations, retry once on failure.
+- `pane.moved` writes an invalidation for the sidebar's stable terminal id and
+  discards in-flight cwd samples. Membership is resolved by the next good cwd
+  list or a worker `pane.get` using the original environment id, which Herdr
+  0.9.5 aliases across workspace moves. Each sidebar attempts at most one
+  membership recheck per 60 s, including after a move, and skips if the publish
+  lock is busy. The same fallback recovers missed invalidations. Marker writes,
+  including move invalidations, retry once on failure.
 - With a usable marker, hidden sidebars issue zero periodic `pane.list` calls.
   Visible sidebars issue at most one full list every 300 ms while following
   (first request due when the tab becomes visible). Explorer keeps its 2 s
-  decoration refresh and SCM its adaptive worker schedule, both reading pane
-  focus from the marker. SCM's explicit background-refresh bypass still runs
+  decoration refresh and SCM its adaptive worker schedule. Visible sidebars use
+  their pane's focus from the existing cwd list until a newer hook publication
+  arrives. A visible sidebar with cwd follow off uses the 10 s focus check. SCM's explicit background-refresh bypass still runs
   local Git. Before this change, each sidebar sampled cwd every 300 ms visible
   or 5 s hidden, plus separate global lists about every 2 s for Explorer
   decorations or on due SCM status reads. Herdr supports workspace-scoped lists,
   but the follow sample stays session-wide for the #119 capability check.
-- Hidden sidebars revalidate with at most one `pane.current` per 10 s on the
-  same worker. The publish lock covers the read and conditional replacement, so
-  a missed focus hook is repaired without rewriting an agreeing marker. The
-  other steady-state calls are the ~5 s identity heartbeat and the 30 s
-  membership fallback above. The 20 s stale rule is unchanged. Root-label retries
+- Opportunistic focus checks use at most one `pane.current` per 10 s across the
+  entire session, shared by hidden panes, startup validation and visible panes
+  with cwd follow off. The worker try-locks publication and skips if busy. Under
+  the lock, a sibling timestamp reserves the interval before IPC, even on failed
+  reads, and a changed focus is published before unlock. Only real focus hooks
+  wait for the lock. Each sidebar still sends its ~5 s identity heartbeat and may
+  use the 60 s membership fallback. The 20 s stale rule is unchanged. Root-label retries
   wait while the tab is hidden. On each ~5 s heartbeat, a dedicated preview sends
   its metadata stamp and uses one `pane.get` to detect a move even when the document
   is unchanged. The applied tab label is cached by (tab id, label), so a move
@@ -692,16 +693,17 @@ HACKING.md — budget time for that before promising a patched build.
     launch / refresh / takeover / unified-toggle flows, which all mutate under that lock.
   - Reap uses the exiting pane's tab from the hook context for `pane.exited`. For
     `pane.closed`, Herdr has already removed the pane, so reap is limited to the event's
-    workspace. An event without a usable scope does nothing. Reap re-lists before each
+    workspace. A close can therefore also reap a sidebar-only sibling tab in that workspace,
+    consistent with Close emptied tabs. An event without a usable scope does nothing. Reap re-lists before each
     request to verify the tab is still sidebar-only and the pane's close policy still applies.
     Each remaining pane must be a sidebar: an Explorer / Source Control token, or one of our labels
     without one. Any other pane — shell, agent, preview / editor viewer (token or label),
     an id that is not flag-safe — keeps the tab. Null token values count as absent.
   - Live TUIs get Ctrl+Q only (save drafts, close own pane, no snooze marker); a draft that
     cannot be saved keeps the pane open with its notice, and nothing waits for or kills it.
-    Only panes that cannot hold TUI state are `pane.close`d directly: `herdr-sidebar-starting`,
-    and label-only server-resume corpses with no tokens. A stale or malformed sidebar
-    heartbeat still gets Ctrl+Q. A blocked TUI may have an unsaved draft.
+    Only label-only server-resume corpses with no tokens are closed directly. A starting
+    token may survive the first full metadata report failing after the TUI takes input,
+    so starting panes get Ctrl+Q too, along with stale or malformed sidebar heartbeats.
   - Tabs named by a THIS-session (or session-less legacy) takeover journal — previewed tab
     and parking tab — are skipped (`takeover::journaled_tabs`); the restore owns them. After an
     abandoned restore the journal is gone, so a previewed tab left with only its sidebar is
@@ -937,8 +939,11 @@ HACKING.md — budget time for that before promising a patched build.
   path, see `parse_drawer_ref`). An open menu keeps its repository root, ref and
   file-history path even when status replaces the rows. Confirmation keeps the same
   root. Stash apply/pop/drop look up the current selector by object ID immediately
-  before invoking Git, including after y/N, and refuse a missing stash. Git has no
-  atomic selector check and mutation. Click or ⏎ shows the ref
+  before invoking Git, including after y/N, and refuse a missing stash. Selector
+  lookup uses the same 2 s bound as the Sync prompt lookup. Pop and Drop
+  refuse when the object appears multiple times in the stash reflog. A concurrent
+  stash operation from another process can still shift the selector between
+  lookup and mutation because Git has no atomic check-and-mutate operation. Click or ⏎ shows the ref
   via colored `git show --stat --patch` in the SAME preview pane (`show/<root>/<spec>[/<path>]`
   control requests; FILE HISTORY narrows to the followed file). Ctrl+right-click opens
   per-type menus (checkout / merge / cherry-pick / revert / reset / stash apply-pop-drop /
@@ -960,10 +965,11 @@ HACKING.md — budget time for that before promising a patched build.
   same way, parking a live Search overlay like the branch picker does. Never start a sync
   worker except through those, or the setting silently stops covering that button. Sync runs
   on a worker, not `run_git`, so it has its own `ConfirmSync` overlay. It captures the
-  root, branch and full upstream ref with a bounded ref lookup when the prompt opens.
+  root, branch and full upstream ref with a 2 s ref lookup when the prompt opens.
   The worker re-reads them immediately before pull and refuses if the checkout or upstream
   changed. Git has no transaction covering check, pull and push, so keep the recheck next
-  to the operation. The drawer ops reuse
+  to the operation. Push uses Git's current configuration, so changing
+  `branch.<name>.pushRemote` between opening the prompt and confirming can redirect it. The drawer ops reuse
   `ConfirmGit{args}` through `run_git_guarded`. Deliberately NOT guarded: Fetch (only moves
   remote-tracking refs), stash apply / stash push (the stash entry or the work survives),
   and the branch picker (already a deliberate open → choose two-step). Destructive ops

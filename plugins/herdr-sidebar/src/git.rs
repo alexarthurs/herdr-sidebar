@@ -161,10 +161,9 @@ impl Git {
 
     /// One bounded ref lookup, with no worktree scan.
     pub fn sync_target(&self) -> Result<SyncTarget, String> {
-        let refs = run_read_in_with_timeout(
+        let refs = run_action_lookup(
             &self.root,
             &["rev-parse", "--symbolic-full-name", "HEAD", "@{upstream}"],
-            std::time::Duration::from_secs(2),
         )?;
         SyncTarget::from_refs(&self.root, &refs)
             .ok_or_else(|| "No tracking branch to sync.".to_string())
@@ -657,11 +656,11 @@ impl Git {
         )?)
     }
 
-    pub fn stash_selector(&self, object: &str) -> Result<String, String> {
-        let list = run_drawer(&self.root, &["stash", "list", "--format=%gd%x09%H"])?;
-        stash_selector(&list, object)
+    pub fn stash_selector(&self, object: &str, require_unique: bool) -> Result<String, String> {
+        let list = run_action_lookup(&self.root, &["stash", "list", "--format=%gd%x09%H"])?;
+        stash_selector(&list, object, require_unique)
             .map(str::to_owned)
-            .ok_or_else(|| "The selected stash no longer exists.".to_string())
+            .map_err(str::to_owned)
     }
 
     pub fn tags(&self) -> Result<Vec<String>, String> {
@@ -681,11 +680,24 @@ impl Git {
     }
 }
 
-fn stash_selector<'a>(list: &'a str, object: &str) -> Option<&'a str> {
-    list.lines().find_map(|line| {
+fn stash_selector<'a>(
+    list: &'a str,
+    object: &str,
+    require_unique: bool,
+) -> Result<&'a str, &'static str> {
+    let mut matches = list.lines().filter_map(|line| {
         let (selector, id) = line.split_once('\t')?;
         (id == object).then_some(selector)
-    })
+    });
+    let selector = matches
+        .next()
+        .ok_or("The selected stash no longer exists.")?;
+    if require_unique && matches.next().is_some() {
+        return Err(
+            "The selected stash appears more than once. Pop and Drop require a unique entry.",
+        );
+    }
+    Ok(selector)
 }
 
 fn lines(out: String) -> Result<Vec<String>, String> {
@@ -726,6 +738,11 @@ fn parse_branch_choices(out: &str) -> Vec<Branch> {
         branches.rotate_left(current);
     }
     branches
+}
+
+/// Confirmation and stash selector reads can run on the input thread.
+fn run_action_lookup(dir: &Path, args: &[&str]) -> Result<String, String> {
+    run_read_in_with_timeout(dir, args, Duration::from_secs(2))
 }
 
 /// Drawer listings are read-only and run on the SCM status worker, so they
@@ -1272,11 +1289,36 @@ mod tests {
     }
 
     #[test]
+    fn action_lookup_caps_a_stalled_git_read_at_two_seconds() {
+        let git = repo_with_head("action-lookup-timeout");
+        let result = run_action_lookup(
+            git.root(),
+            &["-c", "alias.sidebar-slow=!sleep 4", "sidebar-slow"],
+        );
+        assert_eq!(result.unwrap_err(), "git -c timed out after 2s");
+    }
+
+    #[test]
     fn stash_selector_follows_the_object_after_insertion_and_refuses_removed_objects() {
         let list = "stash@{0}\tnew\nstash@{1}\tselected\nstash@{2}\tolder\n";
-        assert_eq!(stash_selector(list, "selected"), Some("stash@{1}"));
-        assert_eq!(stash_selector(list, "removed"), None);
-        assert_eq!(stash_selector(list, "select"), None);
+        assert_eq!(stash_selector(list, "selected", true), Ok("stash@{1}"));
+        for missing in ["removed", "select"] {
+            assert_eq!(
+                stash_selector(list, missing, true),
+                Err("The selected stash no longer exists.")
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_stash_actions_require_a_unique_object() {
+        let list = "stash@{0}\tduplicate\nstash@{1}\tother\nstash@{2}\tduplicate\n";
+        assert_eq!(
+            stash_selector(list, "duplicate", true),
+            Err("The selected stash appears more than once. Pop and Drop require a unique entry.")
+        );
+        assert_eq!(stash_selector(list, "duplicate", false), Ok("stash@{0}"));
+        assert_eq!(stash_selector(list, "other", true), Ok("stash@{1}"));
     }
 
     #[test]

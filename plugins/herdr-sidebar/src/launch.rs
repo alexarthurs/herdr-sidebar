@@ -498,8 +498,7 @@ pub fn pane_is_starting(pane_list_json: &str, pane_id: &str) -> bool {
 pub enum ReapClose {
     /// A live TUI: Ctrl+Q, so it saves its drafts and closes its own pane.
     Graceful,
-    /// No TUI state can exist (still starting, a label-only server-resume
-    /// corpse):
+    /// No TUI state can exist (a label-only server-resume corpse):
     /// `pane.close` directly, since nothing would answer Ctrl+Q.
     Direct,
 }
@@ -550,18 +549,15 @@ pub fn lonely_sidebar_tabs(pane_list_json: &str) -> Vec<LonelyTab> {
 impl Pane {
     /// `Some` when this pane is one of our sidebars, saying how to close it.
     fn reap_close(&self) -> Option<ReapClose> {
-        // A cleared token is reported as null; never read one as present,
-        // or a cleared starting marker would hard-close a live draft.
+        // A cleared token is reported as null. A starting token can survive
+        // a failed metadata report after the TUI has started accepting input.
         let has = |key: &str| self.tokens.get(key).is_some_and(|value| !value.is_null());
         let viewer =
             has(PREVIEW_METADATA_SOURCE) || self.label.as_deref().is_some_and(is_preview_label);
         if viewer {
             return None;
         }
-        if has(STARTING_TOKEN) {
-            return Some(ReapClose::Direct);
-        }
-        if has(METADATA_SOURCE) || has(SC_METADATA_SOURCE) {
+        if has(STARTING_TOKEN) || has(METADATA_SOURCE) || has(SC_METADATA_SOURCE) {
             return Some(ReapClose::Graceful);
         }
         let ours = matches!(
@@ -2103,7 +2099,7 @@ mod tests {
                 tab("w1:alone", &[("w1:p3", Graceful)]),
                 tab("w1:corpses", &[("w1:pb", Direct), ("w1:pc", Graceful)]),
                 tab("w1:pair", &[("w1:p8", Graceful), ("w1:p9", Graceful)]),
-                tab("w1:young", &[("w1:pa", Direct)]),
+                tab("w1:young", &[("w1:pa", Graceful)]),
             ]
         );
         assert!(lonely_sidebar_tabs("not json").is_empty());

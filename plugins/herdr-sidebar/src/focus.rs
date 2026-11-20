@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 
 use crate::{ipc, launch, rundir};
 
-const HIDDEN_FOCUS_EVERY: Duration = Duration::from_secs(10);
-const MEMBERSHIP_EVERY: Duration = Duration::from_secs(30);
+const FOCUS_CHECK_EVERY: Duration = Duration::from_secs(10);
+const MEMBERSHIP_EVERY: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 struct Focus {
@@ -132,28 +132,68 @@ pub(crate) fn publish_focus() -> std::io::Result<()> {
     let Some(dir) = session_dir() else {
         return Ok(());
     };
-    update_focus(&dir, true)
+    let lock = publish_lock(&dir)?;
+    lock.lock()?;
+    write_focus(&dir, None, true, current_focus)
 }
 
-fn update_focus(dir: &Path, force: bool) -> std::io::Result<()> {
+fn publish_lock(dir: &Path) -> std::io::Result<File> {
     prepare_dir(dir)?;
-    let lock = File::options()
+    File::options()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(dir.join("publish.lock"))?;
-    lock.lock()?;
+        .open(dir.join("publish.lock"))
+}
+
+fn recheck_focus(
+    dir: &Path,
+    startup_marker: Option<&Marker>,
+    clock: impl FnOnce() -> SystemTime,
+    fetch: impl FnOnce() -> std::io::Result<Option<Focus>>,
+) -> std::io::Result<()> {
+    let lock = publish_lock(dir)?;
+    if lock.try_lock().is_err() {
+        return Ok(());
+    }
+    let checked = dir.join("last-check.txt");
+    let now = clock()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let last = read_local(&checked).and_then(|text| text.parse::<u128>().ok());
+    if last.is_some_and(|last| now >= last && now - last < FOCUS_CHECK_EVERY.as_millis()) {
+        return Ok(());
+    }
+    // Reserve the session's interval before IPC, even if the host times out.
+    retry_once(|| write_local(&checked, &now.to_string()))?;
+    write_focus(dir, startup_marker, false, fetch)
+}
+
+fn recheck_membership(dir: &Path, id: &str) -> Option<launch::Pane> {
+    let lock = publish_lock(dir).ok()?;
+    lock.try_lock().ok()?;
+    get_pane(id)
+}
+
+fn write_focus(
+    dir: &Path,
+    startup_marker: Option<&Marker>,
+    force: bool,
+    fetch: impl FnOnce() -> std::io::Result<Option<Focus>>,
+) -> std::io::Result<()> {
     let path = dir.join("current.json");
     let previous = read_marker(&path);
-    let Some(focus) = current_focus()? else {
+    let Some(focus) = fetch()? else {
         // A missing marker lets older hosts keep following at the idle cadence.
         return retry_once(|| match fs::remove_file(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             result => result,
         });
     };
-    let Some(marker) = next_marker(previous.as_ref(), focus, force) else {
+    let refresh_startup = startup_marker.is_some() && startup_marker == previous.as_ref();
+    let Some(marker) = next_marker(previous.as_ref(), focus, force || refresh_startup) else {
         return Ok(());
     };
     let text = serde_json::to_string(&marker)?;
@@ -231,12 +271,11 @@ impl Visibility {
     }
 }
 
-fn stale_at_startup(marker: Option<Marker>, snapshot: Option<&Focus>) -> Option<Marker> {
-    marker.filter(|marker| Some(&marker.focus) != snapshot)
-}
-
 enum ActivitySample {
-    Panes(String),
+    Panes {
+        json: String,
+        marker: Option<Marker>,
+    },
     Revalidated(Option<launch::Pane>),
 }
 
@@ -254,7 +293,6 @@ pub struct SidebarActivity {
     terminal_id: Option<String>,
     marker_path: Option<PathBuf>,
     move_path: Option<PathBuf>,
-    observed_move: Option<String>,
     last_move: Option<String>,
     last_membership: Option<Instant>,
     last_focus_check: Option<Instant>,
@@ -262,6 +300,8 @@ pub struct SidebarActivity {
     last_read: Option<Instant>,
     visibility: Visibility,
     pane_focused: bool,
+    last_marker: Option<Marker>,
+    visible_list_focus: Option<bool>,
     fallback_focused: bool,
     following: bool,
     poller: launch::FollowPoller<ActivitySample>,
@@ -278,19 +318,16 @@ impl SidebarActivity {
         }
         let dir = session_dir();
         let marker_path = dir.as_ref().map(|dir| dir.join("current.json"));
-        // A persisted marker can outlive the server or an interval with the
-        // plugin disabled. Validate it once against the host. A publication
-        // that lands during startup wins on the first local read.
-        let before = marker_path.as_deref().and_then(read_marker);
-        let focused = before.as_ref().and_then(|_| current_focus().ok().flatten());
+        // A marker can outlive the host. The shared worker validates it
+        // under the session limit. A fresh publication wins on first read.
+        let startup_marker = marker_path.as_deref().and_then(read_marker);
         let own = get_pane(&original_pane_id);
         let mut activity = Self {
-            startup_marker: stale_at_startup(before, focused.as_ref()),
+            startup_marker,
             pane_id: original_pane_id.clone(),
             original_pane_id,
             marker_path,
             last_membership: Some(Instant::now()),
-            last_focus_check: Some(Instant::now()),
             ..Self::default()
         };
         if let Some(own) = &own {
@@ -351,7 +388,7 @@ impl SidebarActivity {
                     }
                     self.read_focus();
                 }
-                Some(ActivitySample::Panes(json)) => {
+                Some(ActivitySample::Panes { json, marker }) => {
                     if let Some(panes) = launch::parse_panes(&json) {
                         if let Some(own) = panes.iter().find(|pane| {
                             pane.pane_id.as_deref() == Some(&self.pane_id)
@@ -359,11 +396,10 @@ impl SidebarActivity {
                                     && pane.terminal_id == self.terminal_id
                         }) {
                             self.update_membership(own);
+                            self.last_membership = Some(now);
                             self.read_focus();
+                            self.observe_list_focus(marker.as_ref(), own.focused);
                         }
-                        self.fallback_focused = panes.iter().any(|pane| {
-                            pane.focused && pane.pane_id.as_deref() == Some(&self.pane_id)
-                        });
                         if follow && self.visibility.cadence(follow, needs_focus).is_some() {
                             target = self
                                 .poller
@@ -385,32 +421,39 @@ impl SidebarActivity {
     }
 
     fn membership_due(&self, now: Instant) -> bool {
-        (self.observed_move.is_some() && self.observed_move != self.last_move)
-            || sample_due(self.last_membership, now, MEMBERSHIP_EVERY)
+        sample_due(self.last_membership, now, MEMBERSHIP_EVERY)
+    }
+
+    fn focus_check_due(&self, now: Instant, follow: bool) -> bool {
+        (self.startup_marker.is_some()
+            || self.visibility == Visibility::Hidden
+            || self.visibility == Visibility::Visible && !follow)
+            && sample_due(self.last_focus_check, now, FOCUS_CHECK_EVERY)
     }
 
     fn request_sample(&mut self, now: Instant, follow: bool, needs_focus: bool) {
         let membership_due = self.membership_due(now);
-        let startup_retry = self.startup_marker.is_some();
-        let focus_due = (startup_retry || self.visibility == Visibility::Hidden)
-            && sample_due(self.last_focus_check, now, HIDDEN_FOCUS_EVERY);
+        let focus_due = self.focus_check_due(now, follow);
         if membership_due || focus_due {
-            let dir = self
-                .marker_path
-                .as_deref()
-                .and_then(Path::parent)
-                .map(Path::to_path_buf);
+            let Some(dir) = self.marker_path.as_deref().and_then(Path::parent) else {
+                return;
+            };
+            let dir = dir.to_path_buf();
             let id = self.original_pane_id.clone();
+            let startup = self.startup_marker.clone();
             let started = self.poller.maybe_start(now, Duration::ZERO, move || {
-                if focus_due && let Some(dir) = dir {
-                    let _ = update_focus(&dir, startup_retry);
+                if focus_due {
+                    let _ = recheck_focus(&dir, startup.as_ref(), SystemTime::now, current_focus);
                 }
-                let own = if membership_due { get_pane(&id) } else { None };
+                let own = if membership_due {
+                    recheck_membership(&dir, &id)
+                } else {
+                    None
+                };
                 Some(ActivitySample::Revalidated(own))
             });
             if started {
                 if membership_due {
-                    self.last_move.clone_from(&self.observed_move);
                     self.last_membership = Some(now);
                 }
                 if focus_due {
@@ -418,16 +461,20 @@ impl SidebarActivity {
                 }
             }
         } else if let Some(every) = self.visibility.cadence(follow, needs_focus) {
-            self.poller.maybe_start(now, every, || {
-                ipc::call_text("pane.list", json!({}))
-                    .ok()
-                    .map(ActivitySample::Panes)
+            let marker = self.last_marker.clone();
+            self.poller.maybe_start(now, every, move || {
+                let json = ipc::call_text("pane.list", json!({})).ok()?;
+                Some(ActivitySample::Panes { json, marker })
             });
         }
     }
 
     fn read_focus(&mut self) {
-        self.observed_move = self.move_path.as_deref().and_then(read_local);
+        let moved = self.move_path.as_deref().and_then(read_local);
+        if moved.is_some() && moved != self.last_move {
+            self.last_move = moved;
+            self.poller.reset();
+        }
         let marker = self.marker_path.as_deref().and_then(read_marker);
         self.apply_marker(marker.as_ref());
     }
@@ -442,16 +489,33 @@ impl SidebarActivity {
             self.visibility = next;
             self.poller.reset();
         }
-        if let Some(marker) = marker {
-            self.pane_focused = next == Visibility::Visible && marker.focus.pane_id == self.pane_id;
-        } else {
-            self.pane_focused = self.fallback_focused;
+        if marker != self.last_marker.as_ref() {
+            self.last_marker = marker.cloned();
+            self.visible_list_focus = None;
+        }
+        self.pane_focused = match (next, marker) {
+            (Visibility::Visible, Some(marker)) => self
+                .visible_list_focus
+                .unwrap_or(marker.focus.pane_id == self.pane_id),
+            (Visibility::Unknown, _) => self.fallback_focused,
+            _ => false,
+        };
+    }
+
+    fn observe_list_focus(&mut self, marker: Option<&Marker>, focused: bool) {
+        self.fallback_focused = focused;
+        // A hook can publish while a list is in flight. Its marker wins
+        // until a sample started against that publication comes back.
+        if self.visibility == Visibility::Visible && marker == self.last_marker.as_ref() {
+            self.visible_list_focus = Some(focused);
+            self.pane_focused = focused;
         }
     }
 
     fn update_membership(&mut self, own: &launch::Pane) {
         if let (Some(id), Some(tab)) = (&own.pane_id, &own.tab_id) {
             if self.pane_id != *id || self.tab != *tab {
+                self.visible_list_focus = None;
                 self.poller.reset();
             }
             self.pane_id.clone_from(id);
@@ -509,14 +573,10 @@ mod tests {
     fn stale_startup_marker_falls_back_until_a_new_publication() {
         let old = marker(2, "w1:t1", "w1:p1");
         let current = marker(3, "w1:t2", "w1:p2");
-        assert_eq!(
-            stale_at_startup(Some(current.clone()), Some(&current.focus)),
-            None
-        );
         let mut own = SidebarActivity {
             pane_id: "w1:p2".into(),
             tab: "w1:t2".into(),
-            startup_marker: stale_at_startup(Some(old.clone()), Some(&current.focus)),
+            startup_marker: Some(old.clone()),
             ..Default::default()
         };
         own.apply_marker(Some(&old));
@@ -560,17 +620,50 @@ mod tests {
     }
 
     #[test]
+    fn visible_sidebar_uses_list_focus_until_a_new_marker_and_checks_without_a_list() {
+        let shell = marker(1, "w1:t2", "w1:p1");
+        let newer = marker(2, "w1:t2", "w1:p1");
+        let mut own = SidebarActivity {
+            pane_id: "w1:p2".into(),
+            tab: "w1:t2".into(),
+            ..Default::default()
+        };
+        own.apply_marker(Some(&shell));
+        assert!(!own.pane_is_focused());
+        own.observe_list_focus(Some(&shell), true);
+        own.apply_marker(Some(&shell));
+        assert!(
+            own.pane_is_focused(),
+            "rereading the old marker preserves the sample"
+        );
+        own.observe_list_focus(Some(&shell), false);
+        assert!(!own.pane_is_focused());
+        own.apply_marker(Some(&newer));
+        own.observe_list_focus(Some(&shell), true);
+        assert!(
+            !own.pane_is_focused(),
+            "a newer hook wins over an in-flight list"
+        );
+
+        let now = Instant::now();
+        own.last_focus_check = Some(now);
+        assert!(!own.focus_check_due(now, false));
+        assert!(own.focus_check_due(now + FOCUS_CHECK_EVERY, false));
+        assert!(!own.focus_check_due(now + FOCUS_CHECK_EVERY, true));
+    }
+
+    #[test]
     fn hidden_revalidation_repairs_only_a_disagreeing_marker_and_retries_once() {
         let now = Instant::now();
         assert!(!sample_due(
             Some(now),
             now + Duration::from_secs(9),
-            HIDDEN_FOCUS_EVERY
+            FOCUS_CHECK_EVERY
         ));
         assert!(sample_due(
             Some(now),
-            now + HIDDEN_FOCUS_EVERY,
-            HIDDEN_FOCUS_EVERY
+            now + FOCUS_CHECK_EVERY,
+            FOCUS_CHECK_EVERY
         ));
         let old = marker(1, "w1:t1", "w1:p1");
         let mut own = SidebarActivity {
@@ -605,6 +698,40 @@ mod tests {
     }
 
     #[test]
+    fn opportunistic_checks_share_the_session_interval_and_skip_a_busy_lock() {
+        let start = SystemTime::now();
+        let unique = start
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("sidebar-focus-{}-{unique}", std::process::id()));
+        let dir = root.join("session");
+        let hook = publish_lock(&dir).unwrap();
+        hook.lock().unwrap();
+        recheck_focus(&dir, None, || start, || panic!("focus hook holds the lock")).unwrap();
+        assert!(recheck_membership(&dir, "w1:p2").is_none());
+        drop(hook);
+
+        let fetch = || Ok(Some(Focus::new("w1", "w1:t2", "w1:p2").unwrap()));
+        recheck_focus(&dir, None, || start, fetch).unwrap();
+        let current = read_marker(&dir.join("current.json")).unwrap();
+        recheck_focus(
+            &dir,
+            Some(&current),
+            || start + FOCUS_CHECK_EVERY - Duration::from_millis(1),
+            || panic!("another sidebar already checked"),
+        )
+        .unwrap();
+        recheck_focus(&dir, Some(&current), || start + FOCUS_CHECK_EVERY, fetch).unwrap();
+        assert_eq!(
+            read_marker(&dir.join("current.json")).unwrap().generation,
+            2
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn moves_are_keyed_by_terminal_across_public_pane_id_changes() {
         let event = json!({"data": {
             "previous_pane_id": "w1:p1",
@@ -636,10 +763,10 @@ mod tests {
         own.last_membership = Some(now);
         assert!(!own.membership_due(now));
         assert!(own.membership_due(now + MEMBERSHIP_EVERY));
-        own.observed_move = Some("move".into());
+        own.last_move = Some("move".into());
         assert!(
-            own.membership_due(now),
-            "a published invalidation skips the wait"
+            !own.membership_due(now),
+            "move events share the lookup limit"
         );
 
         own.update_membership(&panes[0]);
