@@ -3671,7 +3671,8 @@ impl App {
     }
 
     fn run_stash(&mut self, repo: usize, subcommand: &str, object: &str) {
-        match self.repos[repo].git.stash_selector(object) {
+        let require_unique = matches!(subcommand, "pop" | "drop");
+        match self.repos[repo].git.stash_selector(object, require_unique) {
             Ok(selector) => self.run_git(repo, &["stash", subcommand, "--", &selector]),
             Err(error) => {
                 self.flash = Some((error, true));
