@@ -1964,11 +1964,9 @@ fn read_control_file(control: &Path) -> Option<Request> {
     parse_request(&buf)
 }
 
-/// Tag our pane (heartbeat-stamped, see launch::HEARTBEAT_STALE_SECS), record
-/// WHICH document we show so any sidebar can route clicks to us, and title the
-/// pane with the document's name. A `None` key clears the token — showing
-/// nothing must not look like a preview of the empty path.
-fn report_identity(mode: &ViewMode, doc_key: Option<&str>, control: &Path) {
+/// Stamp liveness and the document routing tokens. The steady-state heartbeat
+/// only calls this function, so it never dirties the session with a rename.
+fn report_tokens(doc_key: Option<&str>, control: &Path) {
     let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else {
         return;
     };
@@ -1998,28 +1996,92 @@ fn report_identity(mode: &ViewMode, doc_key: Option<&str>, control: &Path) {
             "tokens": tokens,
         }),
     );
-    let _ = ipc::call_text(
-        "pane.rename",
-        serde_json::json!({ "pane_id": pane_id, "label": mode_pane_label(mode) }),
-    );
-    let Some(doc_key) = doc_key else { return };
-    // The tab is the user's, not the document's, when we share it.
-    if inline {
-        return;
+}
+
+#[derive(Default)]
+struct ViewerLabels {
+    pane: Option<String>,
+    tab_doc: Option<String>,
+}
+
+fn label_changed(previous: Option<&str>, desired: &str) -> bool {
+    previous != Some(desired)
+}
+
+impl ViewerLabels {
+    fn report_identity(&mut self, mode: &ViewMode, doc_key: Option<&str>, control: &Path) {
+        self.update(mode, doc_key);
+        report_tokens(doc_key, control);
     }
-    if let Ok(list) = ipc::call_text("pane.list", serde_json::json!({}))
-        && let Some(preview) = previews_in(&list)
-            .into_iter()
-            .find(|p| p.pane_id == pane_id)
-    {
-        let _ = ipc::call_text(
+
+    fn update(&mut self, mode: &ViewMode, doc_key: Option<&str>) {
+        let pane_label = mode_pane_label(mode);
+        let tab_doc = doc_key
+            .filter(|_| !runs_inline())
+            .map(|key| tab_label(key, false));
+        let (pane_changed, tab_changed) = self.changes(&pane_label, tab_doc.as_deref());
+        if !pane_changed && !tab_changed {
+            return;
+        }
+        let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else {
+            return;
+        };
+        let Some(pane) = viewer_pane_info(&pane_id) else {
+            return;
+        };
+        if pane_changed
+            && (!label_changed(pane["label"].as_str(), &pane_label)
+                || ipc::call_text(
+                    "pane.rename",
+                    serde_json::json!({ "pane_id": pane_id, "label": pane_label }),
+                )
+                .is_ok_and(|reply| ipc_succeeded(&reply)))
+        {
+            self.pane = Some(pane_label);
+        }
+        if let Some(key) = doc_key.filter(|_| tab_changed)
+            && let Some(tab_id) = pane["tab_id"].as_str()
+        {
+            let pinned = pane["tokens"].get(TOKEN_PINNED).is_some();
+            if rename_tab_if_changed(tab_id, &tab_label(key, pinned)) {
+                self.tab_doc = tab_doc;
+            }
+        }
+    }
+
+    fn changes(&self, pane: &str, tab: Option<&str>) -> (bool, bool) {
+        (
+            label_changed(self.pane.as_deref(), pane),
+            tab.is_some_and(|label| label_changed(self.tab_doc.as_deref(), label)),
+        )
+    }
+}
+
+fn viewer_pane_info(pane_id: &str) -> Option<serde_json::Value> {
+    let response = ipc::call_text("pane.get", serde_json::json!({ "pane_id": pane_id })).ok()?;
+    let mut response: serde_json::Value =
+        serde_json::from_str(crate::launch::strip_bom(&response)).ok()?;
+    Some(response.get_mut("result")?.get_mut("pane")?.take())
+}
+
+fn rename_tab_if_changed(tab_id: &str, label: &str) -> bool {
+    let Ok(response) = ipc::call_text("tab.get", serde_json::json!({ "tab_id": tab_id })) else {
+        return false;
+    };
+    let Ok(response) =
+        serde_json::from_str::<serde_json::Value>(crate::launch::strip_bom(&response))
+    else {
+        return false;
+    };
+    let Some(current) = response["result"]["tab"]["label"].as_str() else {
+        return false;
+    };
+    !label_changed(Some(current), label)
+        || ipc::call_text(
             "tab.rename",
-            serde_json::json!({
-                "tab_id": preview.tab_id,
-                "label": tab_label(doc_key, preview.pinned),
-            }),
-        );
-    }
+            serde_json::json!({ "tab_id": tab_id, "label": label }),
+        )
+        .is_ok_and(|reply| ipc_succeeded(&reply))
 }
 
 /// This viewer shares the sidebar's tab. Read from the spawn env rather than
@@ -2164,13 +2226,12 @@ fn pin_own_tab(doc_key: &str) {
     let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else {
         return;
     };
-    let Ok(list) = ipc::call_text("pane.list", serde_json::json!({})) else {
+    let Some(pane) = viewer_pane_info(&pane_id) else {
         return;
     };
-    let tab_id = crate::launch::tab_of(&list, &pane_id);
-    if pane_id.is_empty() || tab_id.is_empty() {
+    let Some(tab_id) = pane["tab_id"].as_str() else {
         return;
-    }
+    };
     let _ = ipc::call_text(
         "pane.report_metadata",
         serde_json::json!({
@@ -2179,10 +2240,7 @@ fn pin_own_tab(doc_key: &str) {
             "tokens": { TOKEN_PINNED: "1" },
         }),
     );
-    let _ = ipc::call_text(
-        "tab.rename",
-        serde_json::json!({ "tab_id": tab_id, "label": tab_label(doc_key, true) }),
-    );
+    rename_tab_if_changed(tab_id, &tab_label(doc_key, true));
 }
 
 /// Delete control files whose pane is gone. `close_own_pane` handles the
@@ -2294,7 +2352,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         stamp: None,
     });
     let mut mode = ViewMode::Preview(doc);
-    report_identity(
+    let mut labels = ViewerLabels::default();
+    labels.report_identity(
         &mode,
         current.as_ref().map(Request::doc_key).as_deref(),
         control,
@@ -2379,7 +2438,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             break Err(e);
         }
         if identity_pending {
-            report_identity(
+            labels.report_identity(
                 &mode,
                 current.as_ref().map(Request::doc_key).as_deref(),
                 control,
@@ -2443,7 +2502,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                             }
                             (Prompt::Unsaved(_), KeyCode::Esc | KeyCode::Char('c')) => {
                                 restore_current_control(control, &current);
-                                report_identity(
+                                labels.report_identity(
                                     &mode,
                                     current.as_ref().map(Request::doc_key).as_deref(),
                                     control,
@@ -2498,7 +2557,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                             }
                             (Prompt::Conflict(_), KeyCode::Esc | KeyCode::Char('c')) => {
                                 restore_current_control(control, &current);
-                                report_identity(
+                                labels.report_identity(
                                     &mode,
                                     current.as_ref().map(Request::doc_key).as_deref(),
                                     control,
@@ -2554,7 +2613,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                                     mode = ViewMode::Edit(editor);
                                                     preview_load = None;
                                                     notice = None;
-                                                    report_identity(
+                                                    labels.report_identity(
                                                         &mode,
                                                         current
                                                             .as_ref()
@@ -2727,11 +2786,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         // after a resume the viewer would wait out the rest of its interval
         // while recovery code already reads the old stamp as stale.
         if heartbeat_due(last_heartbeat, crate::state::unix_now()) {
-            report_identity(
-                &mode,
-                current.as_ref().map(Request::doc_key).as_deref(),
-                control,
-            );
+            report_tokens(current.as_ref().map(Request::doc_key).as_deref(), control);
             // Settings live in a shared file another pane may rewrite; the
             // heartbeat is the sidebar's own re-read cadence. Chrome, diff
             // tints and selection follow immediately — an already-highlighted
@@ -3274,10 +3329,7 @@ pub fn pin_target(target: &PreviewTarget, doc_key: &str) -> bool {
             "tokens": { TOKEN_PINNED: "1" },
         }),
     );
-    let _ = ipc::call_text(
-        "tab.rename",
-        serde_json::json!({ "tab_id": target.tab_id, "label": tab_label(doc_key, true) }),
-    );
+    rename_tab_if_changed(&target.tab_id, &tab_label(doc_key, true));
     true
 }
 
@@ -5169,6 +5221,27 @@ mod tests {
         assert_ne!(d, s, "a diff and a git-show are different documents");
         assert!(d.starts_with("diff:"), "{d}");
         assert!(s.starts_with("show:"), "{s}");
+    }
+
+    #[test]
+    fn preview_renames_only_changed_display_labels() {
+        let pane = preview_pane_label("main.rs");
+        let tab = tab_label("/a/main.rs", false);
+        let mut labels = ViewerLabels::default();
+        assert_eq!(labels.changes(&pane, Some(&tab)), (true, true));
+        labels.pane = Some(pane.clone());
+        labels.tab_doc = Some(tab.clone());
+        assert_eq!(labels.changes(&pane, Some(&tab)), (false, false));
+        assert_eq!(
+            labels.changes(&pane, Some(&tab_label("/b/main.rs", false))),
+            (false, false)
+        );
+        assert_eq!(
+            labels.changes("main.rs · editor", Some(&tab)),
+            (true, false)
+        );
+        assert_eq!(labels.changes(&pane, None), (false, false));
+        assert!(label_changed(Some(&tab), &tab_label("/a/main.rs", true)));
     }
 
     #[test]

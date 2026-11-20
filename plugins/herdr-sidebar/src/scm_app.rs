@@ -35,9 +35,9 @@ use herdr_sidebar::ui::{
     TitleAction, activity_button_style, activity_icons, branch_icon, chrome_button_style,
     draw_activity_caps, draw_scrollbar, fit_menu_hint, gear_icon, hits, hits_activity_button,
     hits_collapse_button, hover_style, icon_style as ui_icon_style, keep_visible_scroll, palette,
-    selection_style, set_color_theme, sibling_panes_of, sparkle_icon, status_color,
-    title_action_spans, title_actions_visible, title_actions_width, truncate_to, within,
-    wrap_footer_message, wrap_hints,
+    selection_style, set_color_theme, sparkle_icon, status_color, title_action_spans,
+    title_actions_visible, title_actions_width, truncate_to, within, wrap_footer_message,
+    wrap_hints,
 };
 
 /// How many log lines the history-ish drawers fetch.
@@ -1216,20 +1216,14 @@ pub struct App {
     pane_ctl: Option<PaneCtl>,
     /// Last heartbeat stamp, throttling the token refresh.
     last_beat: std::time::Instant,
-    /// Background `pane.list` sampling for cwd following (see
-    /// `launch::FollowPoller`).
-    follow_poll: herdr_sidebar::launch::FollowPoller,
-    /// A native folder picker running on a background thread; its result
-    /// arrives here (None = cancelled).
-    picking: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
-    /// Shared across rebuilds and unified-view switches so a manual folder
-    /// choice keeps its precedence until a known neighbour actually moves.
-    cwd_follower: std::rc::Rc<std::cell::RefCell<herdr_sidebar::launch::CwdFollower>>,
+    /// Result of the background native folder picker (None = cancelled).
+    picking: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
+    sidebar_activity: std::rc::Rc<std::cell::RefCell<herdr_sidebar::focus::SidebarActivity>>,
     /// Draft roots this pane loaded or successfully persisted. An empty box
     /// only clears one of these roots, so a stale sibling pane cannot erase a
     /// newer draft it never observed.
     persisted_draft_roots: std::collections::BTreeSet<String>,
-    pending_unified_width: Option<(u16, std::time::Instant)>,
+    pending_unified_width: Option<herdr_sidebar::ensure::PendingUnifiedClose>,
     pub tree_view: bool,
     /// Keep polling Git status while unfocused ([`sidebar::BACKGROUND_REFRESH_ENV`]).
     background_refresh: bool,
@@ -1246,7 +1240,7 @@ const MY_VIEW: View = View::SourceControl;
 impl App {
     pub fn new(
         cwd: PathBuf,
-        cwd_follower: std::rc::Rc<std::cell::RefCell<herdr_sidebar::launch::CwdFollower>>,
+        sidebar_activity: std::rc::Rc<std::cell::RefCell<herdr_sidebar::focus::SidebarActivity>>,
     ) -> Self {
         let mut repos: Vec<Repo> = Git::discover_all(&cwd).into_iter().map(Repo::new).collect();
         let discover_err = if repos.is_empty() {
@@ -1354,9 +1348,8 @@ impl App {
             other_exe,
             pane_ctl,
             last_beat: std::time::Instant::now(),
-            follow_poll: Default::default(),
             picking: None,
-            cwd_follower,
+            sidebar_activity,
             persisted_draft_roots,
             pending_unified_width: None,
             tree_view,
@@ -1587,79 +1580,66 @@ impl App {
     }
 
     fn poll_unified_close(&mut self) -> bool {
-        let Some((target, started)) = self.pending_unified_width else {
+        use herdr_sidebar::ensure::UnifiedClose;
+
+        let Some(pending) = &mut self.pending_unified_width else {
             return false;
         };
-        let Some(pane_id) = self.pane_ctl.as_ref().map(|ctl| ctl.pane_id.clone()) else {
-            self.pending_unified_width = None;
-            return false;
-        };
-        let Ok(json) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) else {
-            return false;
-        };
-        if sibling_panes_of(&json, &pane_id, MY_VIEW.other()).is_empty() {
-            self.pending_unified_width = None;
-            if let Some(ctl) = &self.pane_ctl {
-                ctl.resize_to(self.last_width, target, self.sidebar_state.dock_right);
+        match pending.poll() {
+            UnifiedClose::Waiting => false,
+            UnifiedClose::Closed(width) => {
+                self.pending_unified_width = None;
+                if let Some(ctl) = &self.pane_ctl {
+                    ctl.resize_to(self.last_width, width, self.sidebar_state.dock_right);
+                }
+                true
             }
-            return true;
+            UnifiedClose::TimedOut => {
+                self.pending_unified_width = None;
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.merged = false;
+                    state.active = MY_VIEW;
+                });
+                self.apply_identity();
+                self.flash = Some(("Explorer stayed open; unified mode cancelled".into(), true));
+                false
+            }
         }
-        if started.elapsed() >= std::time::Duration::from_secs(2) {
-            self.pending_unified_width = None;
-            self.sidebar_state = sidebar::update_state(|state| {
-                state.merged = false;
-                state.active = MY_VIEW;
-            });
-            self.apply_identity();
-            self.flash = Some(("Explorer stayed open; unified mode cancelled".into(), true));
-        }
-        false
     }
 
-    fn pane_is_focused(&self) -> bool {
-        let Some(pane_id) = self.pane_ctl.as_ref().map(|ctl| ctl.pane_id.as_str()) else {
-            return true;
-        };
-        herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({}))
-            .ok()
-            .is_some_and(|json| pane_focused_in(&json, pane_id))
+    fn sync_follow_setting(&mut self, enabled: bool) {
+        if self.sidebar_state.follow_cwd != enabled {
+            self.sidebar_state.follow_cwd = enabled;
+            self.sidebar_activity.borrow_mut().reset_follower();
+        }
     }
 
     fn follow_sibling_cwd(&mut self) {
-        if !self.sidebar_state.follow_cwd
-            || self.overlay.is_some()
-            || self.picking.is_some()
-            || self.suggesting.is_some()
-            || self.syncing.is_some()
-            || commit_draft_present(self.repos.iter().map(|repo| repo.message.as_slice()))
-        {
-            return;
-        }
-        let Some(pane_id) = self.pane_ctl.as_ref().map(|ctl| ctl.pane_id.clone()) else {
-            return;
-        };
-        let sample = self.follow_poll.take();
-        self.follow_poll.maybe_start(std::time::Instant::now(), || {
-            herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})).ok()
-        });
-        let Some(Some(panes)) = sample else { return };
+        let follow = self.sidebar_state.follow_cwd
+            && self.overlay.is_none()
+            && self.picking.is_none()
+            && self.suggesting.is_none()
+            && self.syncing.is_none()
+            && !commit_draft_present(self.repos.iter().map(|repo| repo.message.as_slice()));
         let target = self
-            .follow_poll
-            .accept(&panes, &pane_id, &mut self.cwd_follower.borrow_mut());
+            .sidebar_activity
+            .borrow_mut()
+            .poll(follow, !self.background_refresh);
         let Some(target) = target else { return };
         let target = PathBuf::from(target);
         if target == self.cwd || !target.is_dir() || std::env::set_current_dir(&target).is_err() {
             return;
         }
         let root = std::env::current_dir().unwrap_or(target);
-        let cwd_follower = std::rc::Rc::clone(&self.cwd_follower);
-        *self = App::new(root, cwd_follower);
+        let activity = std::rc::Rc::clone(&self.sidebar_activity);
+        *self = App::new(root, activity);
     }
 
     /// Periodic timer tick: retry repo discovery if we started outside one,
     /// pick up external changes, and collect finished ✧ suggestion / sync runs.
     pub fn tick(&mut self) {
         let shared = sidebar::load_state();
+        self.sync_follow_setting(shared.follow_cwd);
         self.sidebar_state.git_deco = shared.git_deco;
         self.sidebar_state.show_git_footer = shared.show_git_footer;
         self.sidebar_state.dock_right = shared.dock_right;
@@ -1727,7 +1707,7 @@ impl App {
         // Periodic reads are throttled by the gate (adaptive to the last
         // read's duration), and back off while this pane is unfocused.
         if !self.status_gate.periodic_due(std::time::Instant::now())
-            || (!self.background_refresh && !self.pane_is_focused())
+            || (!self.background_refresh && !self.sidebar_activity.borrow().pane_is_focused())
         {
             return;
         }
@@ -3101,7 +3081,7 @@ impl App {
             Setting::FollowCwd => {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.follow_cwd = !state.follow_cwd);
-                self.cwd_follower.borrow_mut().reset();
+                self.sidebar_activity.borrow_mut().reset_follower();
             }
             Setting::GitDecorations => {
                 self.sidebar_state =
@@ -3179,10 +3159,10 @@ impl App {
                 if std::env::set_current_dir(&path).is_ok() {
                     let root = std::env::current_dir().unwrap_or(path);
                     if self.sidebar_state.follow_cwd {
-                        self.cwd_follower.borrow_mut().mark_manual_folder();
+                        self.sidebar_activity.borrow_mut().mark_manual_folder();
                     }
-                    let cwd_follower = std::rc::Rc::clone(&self.cwd_follower);
-                    *self = App::new(root, cwd_follower);
+                    let activity = std::rc::Rc::clone(&self.sidebar_activity);
+                    *self = App::new(root, activity);
                 } else {
                     self.flash = Some((format!("cannot open {}", path.display()), true));
                 }
@@ -3943,12 +3923,13 @@ impl App {
         });
         self.apply_identity();
         if on {
-            let width = self.last_width;
-            match self.close_other_standalone_pane() {
-                Ok(true) => {
-                    self.pending_unified_width = Some((width, std::time::Instant::now()));
-                }
-                Ok(false) => {}
+            let Some(ctl) = &self.pane_ctl else { return };
+            match herdr_sidebar::ensure::PendingUnifiedClose::request(
+                &ctl.pane_id,
+                MY_VIEW.other(),
+                self.last_width,
+            ) {
+                Ok(pending) => self.pending_unified_width = pending,
                 Err(error) => {
                     self.sidebar_state = sidebar::update_state(|state| {
                         state.merged = false;
@@ -3984,25 +3965,6 @@ impl App {
             state.search_active = true;
         });
         Some(Exit::Search { focus_query })
-    }
-
-    /// Close the other panel's standalone pane in our tab, if one is open.
-    fn close_other_standalone_pane(&self) -> std::io::Result<bool> {
-        let Some(ctl) = &self.pane_ctl else {
-            return Ok(false);
-        };
-        let json = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({}))?;
-        let ids = sibling_panes_of(&json, &ctl.pane_id, MY_VIEW.other());
-        if ids.is_empty() {
-            return Ok(false);
-        }
-        let mut failure = None;
-        for id in ids {
-            if let Err(error) = herdr_sidebar::ensure::request_close(&json, &id) {
-                failure.get_or_insert(error);
-            }
-        }
-        failure.map_or(Ok(true), Err)
     }
 
     /// Open the other view in a fresh pane beside this one (detach).
@@ -5964,26 +5926,6 @@ fn tree_dir_item(
     ListItem::new(Line::from(spans))
 }
 
-fn pane_focused_in(pane_list_json: &str, pane_id: &str) -> bool {
-    let Ok(value) =
-        serde_json::from_str::<serde_json::Value>(pane_list_json.trim_start_matches('\u{feff}'))
-    else {
-        return false;
-    };
-    value
-        .get("result")
-        .and_then(|result| result.get("panes"))
-        .and_then(|panes| panes.as_array())
-        .and_then(|panes| {
-            panes
-                .iter()
-                .find(|pane| pane.get("pane_id").and_then(|id| id.as_str()) == Some(pane_id))
-        })
-        .and_then(|pane| pane.get("focused"))
-        .and_then(|focused| focused.as_bool())
-        .unwrap_or(false)
-}
-
 fn no_repo_layout(area: Rect, merged: bool) -> [Rect; 2] {
     Layout::vertical([
         Constraint::Length(if merged { 3 } else { 0 }),
@@ -6285,16 +6227,6 @@ mod tests {
         let draft = ['d', 'r', 'a', 'f', 't'];
         assert!(!commit_draft_present([empty, empty]));
         assert!(commit_draft_present([empty, draft.as_slice()]));
-    }
-
-    #[test]
-    fn focused_pane_detection_is_scoped_to_our_pane_id() {
-        let panes = r#"{"result":{"panes":[
-            {"pane_id":"w1:p1","focused":false},
-            {"pane_id":"w1:p2","focused":true}
-        ]}}"#;
-        assert!(!pane_focused_in(panes, "w1:p1"));
-        assert!(pane_focused_in(panes, "w1:p2"));
     }
 
     #[test]

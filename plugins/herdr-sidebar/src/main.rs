@@ -16,7 +16,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
-use herdr_sidebar::{ensure, launch, state, viewer};
+use herdr_sidebar::{ensure, focus::SidebarActivity, launch, state, viewer};
 use state::{Exit, View};
 
 /// How often the source-control view re-reads `git status` while idle.
@@ -247,8 +247,13 @@ fn main() -> std::io::Result<()> {
     // itself (the app loops haven't started yet, and a token-less pane gets
     // REPLACE-killed by the corpse rule while the user reads the prompt).
     herdr_sidebar::fontsetup::maybe_prompt(&mut terminal, view, persisted.merged)?;
-    let cwd_follower = Rc::new(RefCell::new(launch::CwdFollower::default()));
-    let workspace_label = workspace_label();
+    let activity = Rc::new(RefCell::new(SidebarActivity::from_env()));
+    let workspace_id = activity
+        .borrow()
+        .workspace_id()
+        .map(str::to_owned)
+        .or_else(|| std::env::var("HERDR_WORKSPACE_ID").ok());
+    let workspace_label = live_workspace_label(workspace_id.as_deref()).unwrap_or_default();
     let spawn_cwd = std::env::current_dir()?;
     let root_key = remembered_root_key(&workspace_label, &spawn_cwd);
     // Resolved ONCE per process. A view switch rebuilds the app but keeps
@@ -256,6 +261,7 @@ fn main() -> std::io::Result<()> {
     // (see `RootMemory`) silently re-root a healthy sidebar.
     let mut roots = RootMemory {
         root: resolve_root(&root_key, &workspace_label, &spawn_cwd)?,
+        workspace_id,
         startup_label: workspace_label,
         spawn_cwd,
         pending: false,
@@ -277,12 +283,12 @@ fn main() -> std::io::Result<()> {
         let exit = match view {
             View::Explorer => run_explorer(
                 &mut terminal,
-                Rc::clone(&cwd_follower),
+                Rc::clone(&activity),
                 &mut roots,
                 std::mem::take(&mut search_on_open),
                 std::mem::take(&mut quick_open_on_open),
             ),
-            View::SourceControl => run_scm(&mut terminal, Rc::clone(&cwd_follower), &mut roots),
+            View::SourceControl => run_scm(&mut terminal, Rc::clone(&activity), &mut roots),
         };
         match exit {
             Ok(Exit::Quit) => {
@@ -330,6 +336,7 @@ fn read_stdin() -> std::io::Result<String> {
 #[derive(Clone)]
 struct RootMemory {
     root: std::path::PathBuf,
+    workspace_id: Option<String>,
     startup_label: String,
     spawn_cwd: std::path::PathBuf,
     /// A root change not yet persisted because the live label was unknown.
@@ -343,8 +350,18 @@ struct RootMemory {
 const ROOT_SAVE_RETRY: Duration = Duration::from_secs(15);
 
 impl RootMemory {
-    fn record(&mut self, root: &std::path::Path) {
-        if let Some(key) = self.record_with(root, std::time::Instant::now, live_workspace_label) {
+    fn record(&mut self, root: &std::path::Path, activity: &SidebarActivity) {
+        let changed = root != self.root;
+        if !changed && (!self.pending || activity.tab_is_hidden()) {
+            return;
+        }
+        if changed && let Some(workspace) = activity.workspace_id() {
+            self.workspace_id = Some(workspace.to_owned());
+        }
+        let workspace = self.workspace_id.clone();
+        if let Some(key) = self.record_with(root, std::time::Instant::now, || {
+            live_workspace_label(workspace.as_deref())
+        }) {
             herdr_sidebar::state::save_root(&key, &self.root);
         }
         publish_pending(self);
@@ -377,7 +394,10 @@ impl RootMemory {
         }
         self.last_attempt = None;
         let root = self.root.clone();
-        if let Some(key) = self.save_key(&root, std::time::Instant::now(), live_workspace_label) {
+        let workspace = self.workspace_id.clone();
+        if let Some(key) = self.save_key(&root, std::time::Instant::now(), || {
+            live_workspace_label(workspace.as_deref())
+        }) {
             herdr_sidebar::state::save_root(&key, &self.root);
         } else {
             eprintln!(
@@ -444,24 +464,13 @@ pub(crate) fn flush_pending_root() {
 
 /// The workspace's CURRENT label, or `None` when it cannot be determined
 /// (socket error, workspace not listed). Outside herdr there is no label.
-fn live_workspace_label() -> Option<String> {
-    let Ok(ws_id) = std::env::var("HERDR_WORKSPACE_ID") else {
+fn live_workspace_label(workspace_id: Option<&str>) -> Option<String> {
+    let Some(ws_id) = workspace_id else {
         return Some(String::new());
     };
     let json = herdr_sidebar::ipc::call_text("workspace.list", serde_json::json!({})).ok()?;
-    let label = herdr_sidebar::launch::workspace_label(&json, &ws_id);
+    let label = herdr_sidebar::launch::workspace_label(&json, ws_id);
     (!label.is_empty()).then_some(label)
-}
-
-/// The label of the space this pane lives in, or "" when it can't be
-/// resolved — the caller then falls back to the pane's cwd.
-fn workspace_label() -> String {
-    let Ok(ws_id) = std::env::var("HERDR_WORKSPACE_ID") else {
-        return String::new();
-    };
-    herdr_sidebar::ipc::call_text("workspace.list", serde_json::json!({}))
-        .map(|json| herdr_sidebar::launch::workspace_label(&json, &ws_id))
-        .unwrap_or_default()
 }
 
 /// Roots are project state, not workspace state: one Herdr workspace may host
@@ -508,12 +517,12 @@ fn resolve_root(
 /// stamping even while idle.
 fn run_explorer(
     terminal: &mut ratatui::DefaultTerminal,
-    cwd_follower: Rc<RefCell<launch::CwdFollower>>,
+    activity: Rc<RefCell<SidebarActivity>>,
     roots: &mut RootMemory,
     search_on_open: Option<bool>,
     quick_open_on_open: bool,
 ) -> std::io::Result<Exit> {
-    let mut app = explorer_app::App::new(roots.root.clone(), cwd_follower);
+    let mut app = explorer_app::App::new(roots.root.clone(), Rc::clone(&activity));
     if let Some(focus_query) = search_on_open {
         app.open_content_search(focus_query);
     }
@@ -546,10 +555,11 @@ fn run_explorer(
                 return Ok(exit);
             }
         }
+        app.sync_shared_settings();
         app.heartbeat();
         app.poll_picker();
         app.tick();
-        roots.record(&app.root_path());
+        roots.record(&app.root_path(), &activity.borrow());
     }
 }
 
@@ -557,10 +567,10 @@ fn run_explorer(
 /// finished background work (✧ suggestions, syncs) show up on their own.
 fn run_scm(
     terminal: &mut ratatui::DefaultTerminal,
-    cwd_follower: Rc<RefCell<launch::CwdFollower>>,
+    activity: Rc<RefCell<SidebarActivity>>,
     roots: &mut RootMemory,
 ) -> std::io::Result<Exit> {
-    let mut app = scm_app::App::new(roots.root.clone(), cwd_follower);
+    let mut app = scm_app::App::new(roots.root.clone(), Rc::clone(&activity));
     let mut last_tick = std::time::Instant::now();
     loop {
         terminal.draw(|frame| app.draw(frame))?;
@@ -602,7 +612,7 @@ fn run_scm(
             app.tick();
             last_tick = std::time::Instant::now();
         }
-        roots.record(app.root_path());
+        roots.record(app.root_path(), &activity.borrow());
     }
 }
 
@@ -614,6 +624,7 @@ mod tests {
     fn memory(root: &str, label: &str, spawn_cwd: &str) -> RootMemory {
         RootMemory {
             root: root.into(),
+            workspace_id: None,
             startup_label: label.into(),
             spawn_cwd: spawn_cwd.into(),
             pending: false,

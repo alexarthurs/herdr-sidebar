@@ -642,39 +642,65 @@ pub fn recover(tab: &str) -> Result<(), String> {
 }
 
 /// Hook-driven recovery; the caller already holds the launcher lock.
-pub(crate) fn recover_locked(tab: &str, panes_json: &str) {
+/// True when the caller must discard its snapshot after possible mutations.
+pub(crate) fn recover_locked(tab: &str, panes_json: &str) -> bool {
     let mut env = RealEnv;
-    sweep_with(&mut env, panes_json);
-    let _ = recover_from_hook(&mut env, tab);
+    let swept = sweep_with(&mut env, panes_json);
+    let attempt = hook_recovery_attempt(&mut env, tab, |env| {
+        if !swept
+            && let Ok(list) = serde_json::from_str::<Value>(crate::launch::strip_bom(panes_json))
+            && list["result"]["panes"].is_array()
+        {
+            return Ok(list["result"].clone());
+        }
+        env.call("pane.list", json!({}))
+    });
+    if let Ok(Some(plan)) = attempt {
+        let _ = restore_with(&mut env, &plan, Trigger::Recover);
+        return true;
+    }
+    swept
 }
 
+#[cfg(test)]
 fn recover_from_hook(env: &mut impl Env, tab: &str) -> Result<(), String> {
+    if let Some(plan) = hook_recovery_attempt(env, tab, |env| env.call("pane.list", json!({})))? {
+        restore_with(env, &plan, Trigger::Recover)?;
+    }
+    Ok(())
+}
+
+fn hook_recovery_attempt<E: Env>(
+    env: &mut E,
+    tab: &str,
+    list: impl FnOnce(&mut E) -> Result<Value, String>,
+) -> Result<Option<Plan>, String> {
     let Some(mut plan) = env.load(tab)? else {
-        return Ok(());
+        return Ok(None);
     };
     let now = env.now();
     if now.saturating_sub(plan.last_hook_attempt) >= HOOK_WINDOW_SECS {
         plan.hook_attempts = 0;
     }
     if plan.hook_attempts >= HOOK_ATTEMPTS_PER_WINDOW {
-        return Ok(());
+        return Ok(None);
     }
     // The common case — the viewer is simply still open — is not an attempt,
     // or ordinary focus traffic would exhaust the budget before the user
     // ever closes it.
-    let listed = env.call("pane.list", json!({}));
+    let listed = list(env);
     if let Ok(list) = &listed
         && let Some(viewer) = plan.viewer.as_deref()
         && live_panes(list).is_ok_and(|panes| panes.iter().any(|pane| pane.id == viewer))
     {
-        return Ok(());
+        return Ok(None);
     }
     // Count the attempt BEFORE it runs: a crash mid-restore still spends it.
     plan.hook_attempts += 1;
     plan.last_hook_attempt = now;
     env.store(&plan)?;
     listed?;
-    restore_with(env, &plan, Trigger::Recover).map(drop)
+    Ok(Some(plan))
 }
 
 /// Tabs a takeover journal of this session is responsible for: the previewed
@@ -699,24 +725,27 @@ fn journaled_tabs_with(env: &mut impl Env) -> BTreeSet<String> {
 
 /// Journals of this session whose previewed tab no longer exists (tab closed,
 /// or ids changed across a server restart) can never apply: abandon them.
-fn sweep_with(env: &mut impl Env, panes_json: &str) {
+fn sweep_with(env: &mut impl Env, panes_json: &str) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(crate::launch::strip_bom(panes_json)) else {
-        return;
+        return false;
     };
     let Ok(panes) = live_panes(&value["result"]) else {
-        return;
+        return false;
     };
     // An empty snapshot is far more likely a transient host failure than a
     // session with no tabs at all; never abandon on it.
     if panes.is_empty() {
-        return;
+        return false;
     }
     let session = env.session();
+    let mut changed = false;
     for plan in env.plans() {
         if plan.session == session && !panes.iter().any(|pane| pane.tab == plan.tab) {
+            changed |= panes.iter().any(|pane| pane.tab == plan.parking_tab);
             let _ = abandon(env, &plan, &panes);
         }
     }
+    changed
 }
 
 pub fn open(
@@ -1355,6 +1384,20 @@ mod tests {
     /// Healthy focus traffic must not spend the retry budget: after a burst
     /// of hooks while the viewer is open, the first hook after it is closed
     /// from herdr restores immediately.
+    #[test]
+    fn a_focus_hook_reuses_its_entry_snapshot_while_the_viewer_is_live() {
+        let (mut fake, _) = fake_with_takeover(false);
+        let list = fake.call("pane.list", json!({})).unwrap();
+        let attempt = hook_recovery_attempt(&mut fake, "w1:main", |_| Ok(list)).unwrap();
+        assert!(attempt.is_none());
+        assert_eq!(plan(&fake).hook_attempts, 0);
+        let attempt = hook_recovery_attempt(&mut fake, "w1:unrelated", |_| {
+            panic!("no journal means no snapshot needed")
+        })
+        .unwrap();
+        assert!(attempt.is_none());
+    }
+
     #[test]
     fn healthy_focus_bursts_do_not_spend_the_recovery_budget() {
         let (mut fake, original) = fake_with_takeover(false);
