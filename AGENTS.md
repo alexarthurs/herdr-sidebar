@@ -939,7 +939,8 @@ HACKING.md — budget time for that before promising a patched build.
   path, see `parse_drawer_ref`). An open menu keeps its repository root, ref and
   file-history path even when status replaces the rows. Confirmation keeps the same
   root. Stash apply/pop/drop look up the current selector by object ID immediately
-  before invoking Git, including after y/N, and refuse a missing stash. Git has no
+  before invoking Git, including after y/N, and refuse a missing stash. Selector
+  lookup uses the same 2 s bound as the Sync prompt lookup. Git has no
   atomic selector check and mutation. Click or ⏎ shows the ref
   via colored `git show --stat --patch` in the SAME preview pane (`show/<root>/<spec>[/<path>]`
   control requests; FILE HISTORY narrows to the followed file). Ctrl+right-click opens
@@ -962,10 +963,11 @@ HACKING.md — budget time for that before promising a patched build.
   same way, parking a live Search overlay like the branch picker does. Never start a sync
   worker except through those, or the setting silently stops covering that button. Sync runs
   on a worker, not `run_git`, so it has its own `ConfirmSync` overlay. It captures the
-  root, branch and full upstream ref with a bounded ref lookup when the prompt opens.
+  root, branch and full upstream ref with a 2 s ref lookup when the prompt opens.
   The worker re-reads them immediately before pull and refuses if the checkout or upstream
   changed. Git has no transaction covering check, pull and push, so keep the recheck next
-  to the operation. The drawer ops reuse
+  to the operation. Push uses Git's current configuration, so changing
+  `branch.<name>.pushRemote` between opening the prompt and confirming can redirect it. The drawer ops reuse
   `ConfirmGit{args}` through `run_git_guarded`. Deliberately NOT guarded: Fetch (only moves
   remote-tracking refs), stash apply / stash push (the stash entry or the work survives),
   and the branch picker (already a deliberate open → choose two-step). Destructive ops

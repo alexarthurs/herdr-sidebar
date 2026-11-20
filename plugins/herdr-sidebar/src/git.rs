@@ -161,10 +161,9 @@ impl Git {
 
     /// One bounded ref lookup, with no worktree scan.
     pub fn sync_target(&self) -> Result<SyncTarget, String> {
-        let refs = run_read_in_with_timeout(
+        let refs = run_action_lookup(
             &self.root,
             &["rev-parse", "--symbolic-full-name", "HEAD", "@{upstream}"],
-            std::time::Duration::from_secs(2),
         )?;
         SyncTarget::from_refs(&self.root, &refs)
             .ok_or_else(|| "No tracking branch to sync.".to_string())
@@ -658,7 +657,7 @@ impl Git {
     }
 
     pub fn stash_selector(&self, object: &str) -> Result<String, String> {
-        let list = run_drawer(&self.root, &["stash", "list", "--format=%gd%x09%H"])?;
+        let list = run_action_lookup(&self.root, &["stash", "list", "--format=%gd%x09%H"])?;
         stash_selector(&list, object)
             .map(str::to_owned)
             .ok_or_else(|| "The selected stash no longer exists.".to_string())
@@ -726,6 +725,11 @@ fn parse_branch_choices(out: &str) -> Vec<Branch> {
         branches.rotate_left(current);
     }
     branches
+}
+
+/// Confirmation and stash selector reads can run on the input thread.
+fn run_action_lookup(dir: &Path, args: &[&str]) -> Result<String, String> {
+    run_read_in_with_timeout(dir, args, Duration::from_secs(2))
 }
 
 /// Drawer listings are read-only and run on the SCM status worker, so they
@@ -1269,6 +1273,16 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn action_lookup_caps_a_stalled_git_read_at_two_seconds() {
+        let git = repo_with_head("action-lookup-timeout");
+        let result = run_action_lookup(
+            git.root(),
+            &["-c", "alias.sidebar-slow=!sleep 4", "sidebar-slow"],
+        );
+        assert_eq!(result.unwrap_err(), "git -c timed out after 2s");
     }
 
     #[test]
