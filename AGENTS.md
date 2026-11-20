@@ -542,7 +542,9 @@ HACKING.md — budget time for that before promising a patched build.
   list or a worker `pane.get` using the original environment id, which Herdr
   0.9.5 aliases across workspace moves. A delivered invalidation schedules a
   lookup promptly. A busy publish lock leaves the lookup pending and the worker
-  can retry after 1 s. A failed move lookup also retries on the short cadence.
+  can retry after 1 s. The worker releases the lock before `pane.get`, so membership
+  IPC cannot delay a focus hook's lock acquisition. A failed move lookup also
+  retries on the short cadence.
   The idle membership fallback stays at 60 s and recovers missed invalidations.
   Marker writes, including move invalidations, retry once on failure.
 - With a usable marker, hidden sidebars issue zero periodic `pane.list` calls.

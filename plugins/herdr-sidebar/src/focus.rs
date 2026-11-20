@@ -183,6 +183,9 @@ fn recheck_membership(dir: &Path, fetch: impl FnOnce() -> Option<launch::Pane>) 
     if lock.try_lock().is_err() {
         return MembershipCheck::Skipped;
     }
+    // Check for a busy publisher, then release the lock before pane.get.
+    // Membership does not publish focus and must not hold up a real hook.
+    drop(lock);
     MembershipCheck::Fetched(fetch())
 }
 
@@ -760,6 +763,26 @@ mod tests {
             read_marker(&dir.join("current.json")).unwrap().generation,
             2
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn membership_ipc_leaves_the_publication_lock_available() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "sidebar-membership-{}-{unique}",
+            std::process::id()
+        ));
+        let dir = root.join("session");
+        let result = recheck_membership(&dir, || {
+            let hook = publish_lock(&dir).unwrap();
+            assert!(hook.try_lock().is_ok(), "a hook can lock during pane.get");
+            None
+        });
+        assert!(matches!(result, MembershipCheck::Fetched(None)));
         fs::remove_dir_all(&root).unwrap();
     }
 
