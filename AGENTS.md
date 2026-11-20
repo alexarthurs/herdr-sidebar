@@ -482,30 +482,95 @@ HACKING.md — budget time for that before promising a patched build.
 
 ### Following the neighbour pane's folder
 
-- A pane's `cwd` is its SPAWN directory; only `foreground_cwd` is live after a shell
-  `cd` or an agent project switch. Following therefore requires `foreground_cwd` and
-  deliberately has NO fallback to `cwd`: an absent live value is safer than silently
-  re-rooting to a stale directory.
+- Herdr 0.9.5 emits `foreground_cwd` only on Unix and omits the field when it has no
+  value. Issue #119 uses `cwd` only if the field is absent from the ENTIRE session
+  snapshot. Any field presence (including explicit null) keeps the strict rule, so
+  a missing observation on one pane cannot silently redirect the sidebar to an old cwd.
+- Windows `cwd` can be live. Herdr's `pane_metadata` reads `Tab::cwd_for_pane`, which
+  prefers a usable terminal-reported absolute directory (e.g. OSC 7), then reads
+  the native child shell's process cwd, and finally falls back to terminal state
+  seeded at spawn. It can follow native shell `cd` when that cwd is observable.
+  A WSL guest `cd` may never change the Windows launcher cwd or produce a Windows
+  path report. Following then tracks Herdr's available spawn/reported UNC directory
+  and sibling focus. Plain UNC paths such as `\\wsl.localhost\Ubuntu\repo` are kept,
+  and a verbatim UNC prefix is normalized to a UNC root.
 - "Follow pane folder" is persisted as `follow_cwd` in `state.json` and defaults on,
   including for state files written before the field existed. Both views share one
-  process-local `CwdFollower`, so precedence survives an app rebuild and unified-view switch.
-- Sampling (#104) runs on `launch::FollowPoller`'s worker thread, every 300 ms while any pane
-  in the sidebar's tab has focus and every 5 s otherwise (the old heartbeat cadence; one
-  sidebar per preview tab makes background polling multiply). It must stay off the UI loop:
-  at 300 ms a synchronous `pane.list` (5 s IPC timeout) would stall input several times a
-  second on a busy server. A sample reaches the follower only once the next sample agrees —
-  fast sampling otherwise catches transient `foreground_cwd` values, and each would re-root
-  the view (SCM rebuilds its whole app) and release a manual folder choice.
+  process-local `CwdFollower` and sampler, so precedence survives an app rebuild and
+  unified-view switch. Both live views re-read the setting along with their shared settings.
+- Sampling (#104) stays on `launch::FollowPoller`'s single-flight worker. A synchronous
+  `pane.list` (5 s IPC timeout) would stall input several times a second on a busy server.
+  A sample reaches the follower only when two consecutive samples agree. Fast sampling
+  otherwise catches transient cwd values that would re-root the view (SCM rebuilds
+  its whole app) and release a manual folder choice.
 - Multi-pane precedence is deterministic: focused eligible sibling, then the previously
   followed sibling, then lexical pane id. Candidate lists are sorted before selection;
   `pane.list` response order is never treated as meaningful. Explorer, Source Control,
   Sidebar, and Preview panes are ineligible so plugin panes cannot chase each other.
 - A successful typed/native folder choice is a manual override. Focus changes, response
   reordering, and newly-created panes do not overwrite it; following resumes only when an
-  already-observed eligible pane's `foreground_cwd` changes. Turning following back on
-  resets the baseline and immediately adopts the deterministic neighbour on the next beat.
+  already-observed eligible pane's observed cwd changes. Turning following back on
+  resets the baseline and makes the first eligible sample due immediately.
 - Source Control pauses cwd-follow while any repository has a non-empty commit-message draft;
   rebuilding the app for another cwd would otherwise destroy that in-memory draft.
+
+### Session focus and idle socket traffic (#125)
+
+- Herdr 0.9.5's `tab.focused` payload identifies the workspace and tab. The
+  `workspace.focused` payload contains the workspace and its plugin context resolves
+  the active tab. The `pane.focused` payload contains the pane and workspace, and its
+  context resolves the pane's tab. Herdr injects `HERDR_TAB_ID` and `HERDR_PANE_ID`
+  from that context. Keep using the event scope for docking and focus repair. For
+  visibility, hook children run concurrently and the event envelope has no sequence
+  or client id. An independent per-session file lock serializes `pane.current` and
+  marker publication so a delayed hook observes current focus instead of publishing
+  obsolete event data. Publication runs before auto-open and the launch lock.
+- `focus.rs` atomically replaces a small workspace/tab/pane JSON marker in the private
+  `rundir`, keyed by socket hash like snooze. A sidebar resolves its membership with
+  `pane.get` at startup and checks a pre-existing marker against `pane.current` once.
+  Missing, unreadable, malformed, or startup-mismatched markers use one shared slow
+  sample every 5 s when cwd or focus is needed. A valid marker has no time expiry
+  because the focused tab may sit idle indefinitely. Visibility follows Herdr's
+  session-wide default pane. An attached client independently displaying a second
+  tab has no focus marker of its own. A missed focus-hook burst may leave the last
+  observation in use until the next hook.
+- `pane.moved` writes an invalidation for the sidebar's stable terminal id. The
+  sidebar resolves its new tab and canonical pane id with one `pane.get` using its
+  original environment id, which Herdr 0.9.5 aliases after a cross-workspace move.
+  This keeps normal background membership checks local. Older hosts without the
+  event may discover a move in a subsequent pane sample. Move markers are small
+  per-terminal files and are reused if the same terminal moves again.
+- With a usable marker, hidden sidebars issue zero periodic `pane.list` calls.
+  Visible sidebars issue at most one full list every 300 ms while following
+  (first request due when the tab becomes visible). Explorer keeps its 2 s
+  decoration refresh and SCM its adaptive worker schedule, both reading pane
+  focus from the marker. SCM's explicit background-refresh bypass still runs
+  local Git. Before this change, each sidebar sampled cwd every 300 ms visible
+  or 5 s hidden, plus separate global lists about every 2 s for Explorer
+  decorations or on due SCM status reads. Herdr supports workspace-scoped lists,
+  but the follow sample stays session-wide for the #119 capability check.
+- The ~5 s identity metadata stamp remains the only steady-state socket call
+  for a hidden sidebar, and the 20 s stale rule is unchanged. Root-label retries
+  wait while the tab is hidden. A preview heartbeat sends only the metadata
+  stamp. Document, mode, or pin changes compare labels before renaming;
+  dedicated preview heartbeats previously made four calls (metadata, pane rename,
+  global list, tab rename), and inline previews made two. Herdr's token-only
+  metadata handler increments the pane revision and emits `pane.updated` when
+  tokens change. It does not dirty the session or schedule a save, but headless
+  `request_changes_ui` classifies metadata reports as UI-changing. Both rename
+  handlers dirty or schedule session persistence even for unchanged names.
+- A healthy ensure hook that takes the launch lock uses one full pane snapshot
+  (previously at least two); a live takeover viewer is checked against that
+  snapshot. Keep fresh reads after any possible recovery/corpse mutation and
+  the before/after focus-repair reads for docking. Absorbing separated panes
+  now checks only requested sibling IDs via `pane.get` at a bounded cadence
+  during the explicit close handshake, preserving the draft-save and timeout paths.
+- Windows manifest paths in TOML basic strings need doubled backslashes.
+  The two reap entries on the integration base used single backslashes and
+  made the manifest unparsable. Keep the move and reap hooks on the GUI sidecar.
+  For offline tests whose scratch dir is inside the worktree, set
+  `GIT_CEILING_DIRECTORIES` to the worktree root. Otherwise Git discovers the
+  outer repository in fixtures that intentionally start outside any repo.
 
 ### Pane liveness (heartbeat tokens)
 

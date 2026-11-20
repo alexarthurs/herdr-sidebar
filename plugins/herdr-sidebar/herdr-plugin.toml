@@ -243,6 +243,17 @@ on = "tab.focused"
 platforms = ["windows"]
 command = [".\\target\\release\\herdr-sidebar-ensure.exe"]
 
+# Update a moved sidebar's tab membership on demand.
+[[events]]
+on = "pane.moved"
+platforms = ["linux", "macos"]
+command = ["./target/release/herdr-sidebar", "--ensure"]
+
+[[events]]
+on = "pane.moved"
+platforms = ["windows"]
+command = [".\\target\\release\\herdr-sidebar-ensure.exe"]
+
 # Close a tab left holding only sidebars once its last other pane goes away
 # (issue #108), the way herdr closes a tab whose last pane exits. A shell
 # exit (Ctrl+D) emits pane.exited; a herdr close emits pane.closed. Both
@@ -258,7 +269,7 @@ command = ["./target/release/herdr-sidebar", "--reap"]
 [[events]]
 on = "pane.exited"
 platforms = ["windows"]
-command = [".\target\release\herdr-sidebar-ensure.exe", "--reap"]
+command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--reap"]
 
 [[events]]
 on = "pane.closed"
@@ -268,4 +279,4 @@ command = ["./target/release/herdr-sidebar", "--reap"]
 [[events]]
 on = "pane.closed"
 platforms = ["windows"]
-command = [".\target\release\herdr-sidebar-ensure.exe", "--reap"]
+command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--reap"]

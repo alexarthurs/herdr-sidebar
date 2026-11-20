@@ -6,6 +6,7 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::{autohide, ipc, launch, state::View};
 
@@ -492,6 +493,19 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
         _ => None,
     };
     let explicit = toggle || activation.is_some();
+    let event_json = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
+    let event_kind = launch::event_kind(&event_json);
+    if mode == Mode::Ensure {
+        match event_kind.as_str() {
+            "pane_moved" => return crate::focus::publish_move(&event_json),
+            "pane_focused" | "tab_focused" | "workspace_focused" => {
+                // Focus is useful even when auto-open is off or the launch
+                // lock is busy. A publication failure must not stop docking.
+                let _ = crate::focus::publish_focus();
+            }
+            _ => {}
+        }
+    }
     let state = crate::state::load_state();
     let view = match mode {
         Mode::Ensure | Mode::Reap => View::Explorer,
@@ -503,12 +517,8 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
     if !explicit && !state.auto_open {
         return Ok(());
     }
-    let event_json = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
-    let creation_event = !explicit
-        && matches!(
-            launch::event_kind(&event_json).as_str(),
-            "tab_created" | "workspace_created"
-        );
+    let creation_event =
+        !explicit && matches!(event_kind.as_str(), "tab_created" | "workspace_created");
     let wait_for_lock = must_wait_for_lock(explicit, &event_json);
     let Some(_lock) = LaunchLock::acquire(wait_for_lock) else {
         return Ok(());
@@ -525,9 +535,9 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
         launch::event_scope_with_tab_context(&event_json, &panes, &context_tab)
     };
     let tab = snooze_tab_for_scope(&panes, &scope);
-    if !tab.is_empty() {
-        // Budgeted, and never touches a viewer that is still present.
-        crate::takeover::recover_locked(&tab, &panes);
+    // Budgeted, and never touches a viewer that is still present. The
+    // no-op path leaves the snapshot valid; recovery may change layout.
+    if !tab.is_empty() && crate::takeover::recover_locked(&tab, &panes) {
         panes = ipc::call_text("pane.list", serde_json::json!({}))?;
     }
     let snooze_dir = snooze::dir();
@@ -688,6 +698,84 @@ pub fn request_close(panes_json: &str, pane_id: &str) -> std::io::Result<()> {
         )?;
     }
     Ok(())
+}
+
+pub struct PendingUnifiedClose {
+    width: u16,
+    tab: String,
+    siblings: Vec<String>,
+    started: Instant,
+    last_check: Option<Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum UnifiedClose {
+    Waiting,
+    Closed(u16),
+    TimedOut,
+}
+
+impl PendingUnifiedClose {
+    pub fn request(pane_id: &str, other: View, width: u16) -> std::io::Result<Option<Self>> {
+        let list = ipc::call_text("pane.list", serde_json::json!({}))?;
+        ipc_ok(&list).map_err(std::io::Error::other)?;
+        let siblings = crate::ui::sibling_panes_of(&list, pane_id, other);
+        if siblings.is_empty() {
+            return Ok(None);
+        }
+        let mut failure = None;
+        for id in &siblings {
+            if let Err(error) = request_close(&list, id) {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(Some(Self {
+            width,
+            tab: launch::tab_of(&list, pane_id),
+            siblings,
+            started: Instant::now(),
+            last_check: None,
+        }))
+    }
+
+    pub fn poll(&mut self) -> UnifiedClose {
+        self.check(Instant::now(), |pane, tab| {
+            ipc::call_text("pane.get", serde_json::json!({"pane_id": pane}))
+                .ok()
+                .is_some_and(|reply| sibling_gone(&reply, tab))
+        })
+    }
+
+    fn check(&mut self, now: Instant, mut gone: impl FnMut(&str, &str) -> bool) -> UnifiedClose {
+        if self
+            .last_check
+            .is_none_or(|at| now.duration_since(at) >= Duration::from_millis(120))
+        {
+            self.last_check = Some(now);
+            self.siblings.retain(|pane| !gone(pane, &self.tab));
+            if self.siblings.is_empty() {
+                return UnifiedClose::Closed(self.width);
+            }
+        }
+        if now.duration_since(self.started) >= Duration::from_secs(2) {
+            return UnifiedClose::TimedOut;
+        }
+        UnifiedClose::Waiting
+    }
+}
+
+fn sibling_gone(reply: &str, tab: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(launch::strip_bom(reply))
+        .ok()
+        .is_some_and(|value| {
+            value["error"]["code"] == "pane_not_found"
+                || value["result"]["pane"]["tab_id"]
+                    .as_str()
+                    .is_some_and(|current| current != tab)
+        })
 }
 
 fn replace_backoff_path(dir: &Path, scope: &str, view: View) -> PathBuf {
@@ -1052,6 +1140,60 @@ fn must_wait_for_lock(explicit: bool, event_json: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unified_close_checks_only_requested_siblings_and_times_out() {
+        let start = Instant::now();
+        let mut pending = PendingUnifiedClose {
+            width: 32,
+            tab: "w1:t1".into(),
+            siblings: vec!["w1:p1".into(), "w1:p2".into()],
+            started: start,
+            last_check: None,
+        };
+        assert_eq!(
+            pending.check(start, |pane, tab| tab == "w1:t1" && pane == "w1:p1"),
+            UnifiedClose::Waiting
+        );
+        assert_eq!(
+            pending.check(start + Duration::from_millis(50), |_, _| panic!(
+                "throttled"
+            )),
+            UnifiedClose::Waiting
+        );
+        assert_eq!(
+            pending.check(start + Duration::from_secs(2), |pane, _| {
+                assert_eq!(pane, "w1:p2");
+                false
+            }),
+            UnifiedClose::TimedOut
+        );
+        assert_eq!(
+            pending.check(start + Duration::from_secs(3), |_, _| true),
+            UnifiedClose::Closed(32)
+        );
+    }
+
+    #[test]
+    fn unified_close_recognizes_missing_or_moved_panes_but_not_api_errors() {
+        assert!(sibling_gone(
+            r#"{"error":{"code":"pane_not_found"}}"#,
+            "w1:t1"
+        ));
+        assert!(sibling_gone(
+            r#"{"result":{"pane":{"tab_id":"w1:t2"}}}"#,
+            "w1:t1"
+        ));
+        assert!(!sibling_gone(
+            r#"{"result":{"pane":{"tab_id":"w1:t1"}}}"#,
+            "w1:t1"
+        ));
+        assert!(!sibling_gone(
+            r#"{"error":{"code":"unavailable"}}"#,
+            "w1:t1"
+        ));
+        assert!(!sibling_gone("truncated{", "w1:t1"));
+    }
 
     /// A simulated herdr for `refresh_with`: panes are (id, tab, tokens).
     /// Sidebars in `closes` save and close themselves a few waits after

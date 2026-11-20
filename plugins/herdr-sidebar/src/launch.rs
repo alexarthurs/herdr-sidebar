@@ -42,21 +42,34 @@ struct PaneListResult {
 }
 
 #[derive(Deserialize)]
-struct Pane {
-    pane_id: Option<String>,
+pub(crate) struct Pane {
+    pub(crate) pane_id: Option<String>,
+    pub(crate) terminal_id: Option<String>,
     label: Option<String>,
     cwd: Option<String>,
     /// Live cwd of the foreground process. Unlike `cwd`, this changes after
     /// a shell `cd` or when an agent switches projects.
-    foreground_cwd: Option<String>,
+    #[serde(default, deserialize_with = "present_cwd")]
+    foreground_cwd: Option<Option<String>>,
     #[serde(default)]
-    focused: bool,
-    tab_id: Option<String>,
-    workspace_id: Option<String>,
+    pub(crate) focused: bool,
+    pub(crate) tab_id: Option<String>,
+    pub(crate) workspace_id: Option<String>,
     /// Metadata tokens reported via `pane.report_metadata`; shape of the
     /// values is host-defined, only key presence matters here.
     #[serde(default)]
     tokens: serde_json::Map<String, serde_json::Value>,
+}
+
+fn present_cwd<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+pub(crate) fn parse_panes(json: &str) -> Option<Vec<Pane>> {
+    let msg: PaneListMsg = serde_json::from_str(strip_bom(json)).ok()?;
+    Some(msg.result.panes)
 }
 
 /// A non-sidebar pane in the same tab whose live cwd can be followed.
@@ -72,33 +85,8 @@ struct SiblingCwd {
 /// how long the tree lags behind the terminal; the 5 s heartbeat felt stuck.
 pub const FOLLOW_CWD_EVERY: std::time::Duration = std::time::Duration::from_millis(300);
 
-/// Background tabs keep the historical heartbeat cadence: every sidebar (one
-/// per preview tab) is a `pane.list` client, and nobody watches a tab that is
-/// not on screen.
+/// Hosts without a usable focus marker keep the historical idle cadence.
 pub const FOLLOW_CWD_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// The next cwd-poll interval: fast while any pane in this sidebar's tab has
-/// focus, slow otherwise (including on unparsable input).
-pub fn follow_cwd_interval(pane_list_json: &str, my_pane_id: &str) -> std::time::Duration {
-    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
-        return FOLLOW_CWD_IDLE;
-    };
-    let panes = &msg.result.panes;
-    let my_tab = panes
-        .iter()
-        .find(|p| p.pane_id.as_deref() == Some(my_pane_id))
-        .and_then(|p| p.tab_id.as_deref());
-    let tab_focused = my_tab.is_some_and(|tab| {
-        panes
-            .iter()
-            .any(|p| p.focused && p.tab_id.as_deref() == Some(tab))
-    });
-    if tab_focused {
-        FOLLOW_CWD_EVERY
-    } else {
-        FOLLOW_CWD_IDLE
-    }
-}
 
 /// Samples `pane.list` for cwd following on a worker thread: at the focused
 /// cadence that is ~3 socket round trips a second, and each can wait out the
@@ -108,23 +96,11 @@ pub fn follow_cwd_interval(pane_list_json: &str, my_pane_id: &str) -> std::time:
 /// agree. Fast sampling otherwise catches transient `foreground_cwd` values
 /// (a tool that briefly runs elsewhere), and each one would re-root the view
 /// and release a manual folder choice that 5 s sampling used to miss.
-#[derive(Debug)]
-pub struct FollowPoller {
+#[derive(Debug, Default)]
+pub(crate) struct FollowPoller {
     inflight: Option<std::sync::mpsc::Receiver<Option<String>>>,
     last_start: Option<std::time::Instant>,
-    every: std::time::Duration,
     last_sample: Option<Vec<SiblingCwd>>,
-}
-
-impl Default for FollowPoller {
-    fn default() -> Self {
-        Self {
-            inflight: None,
-            last_start: None,
-            every: FOLLOW_CWD_EVERY,
-            last_sample: None,
-        }
-    }
 }
 
 impl FollowPoller {
@@ -132,12 +108,13 @@ impl FollowPoller {
     pub fn maybe_start(
         &mut self,
         now: std::time::Instant,
+        every: std::time::Duration,
         fetch: impl FnOnce() -> Option<String> + Send + 'static,
     ) {
         if self.inflight.is_some()
             || self
                 .last_start
-                .is_some_and(|started| now.saturating_duration_since(started) < self.every)
+                .is_some_and(|started| now.saturating_duration_since(started) < every)
         {
             return;
         }
@@ -158,7 +135,7 @@ impl FollowPoller {
     pub fn take(&mut self) -> Option<Option<String>> {
         let rx = self.inflight.as_ref()?;
         let sample = match rx.try_recv() {
-            Ok(sample) => sample,
+            Ok(sample) => sample.filter(|_| self.last_start.is_some()),
             Err(std::sync::mpsc::TryRecvError::Empty) => return None,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
         };
@@ -166,22 +143,28 @@ impl FollowPoller {
         Some(sample)
     }
 
-    /// Adapt the cadence to this sample and, once it is confirmed by the
-    /// previous one, ask the follower where to go.
-    pub fn accept(
+    /// Discard any old sample and make the next request due immediately.
+    pub(crate) fn reset(&mut self) {
+        self.last_start = None;
+        self.break_confirmation();
+    }
+
+    pub(crate) fn break_confirmation(&mut self) {
+        self.last_sample = None;
+    }
+
+    /// Ask the follower where to go once the previous sample agrees.
+    pub(crate) fn accept(
         &mut self,
-        pane_list_json: &str,
+        panes: &[Pane],
         my_pane_id: &str,
         follower: &mut CwdFollower,
     ) -> Option<String> {
-        self.every = follow_cwd_interval(pane_list_json, my_pane_id);
-        let sample = sibling_cwds(pane_list_json, my_pane_id);
+        let sample = sibling_cwds(panes, my_pane_id);
         let confirmed = self.last_sample.as_ref() == Some(&sample);
+        let target = confirmed.then(|| follower.next_from(&sample)).flatten();
         self.last_sample = Some(sample);
-        if !confirmed {
-            return None;
-        }
-        follower.next_cwd(pane_list_json, my_pane_id)
+        target
     }
 }
 
@@ -213,7 +196,11 @@ impl CwdFollower {
     /// Return the next live cwd to follow, if this sample changes the chosen
     /// root according to the deterministic/manual-precedence rules above.
     pub fn next_cwd(&mut self, pane_list_json: &str, my_pane_id: &str) -> Option<String> {
-        let siblings = sibling_cwds(pane_list_json, my_pane_id);
+        let panes = parse_panes(pane_list_json)?;
+        self.next_from(&sibling_cwds(&panes, my_pane_id))
+    }
+
+    fn next_from(&mut self, siblings: &[SiblingCwd]) -> Option<String> {
         let next_seen = siblings
             .iter()
             .map(|s| (s.pane_id.clone(), s.cwd.clone()))
@@ -598,9 +585,10 @@ fn pane_spawn_target(pane: &Pane) -> String {
     };
     let cwd = pane
         .foreground_cwd
-        .as_deref()
+        .as_ref()
+        .and_then(|cwd| cwd.as_deref())
         .or(pane.cwd.as_deref())
-        .map(strip_verbatim)
+        .map(normalize_cwd)
         .unwrap_or_default();
     format!("{id}\t{cwd}")
 }
@@ -614,13 +602,10 @@ pub(crate) fn is_preview_label(label: &str) -> bool {
 }
 
 /// Eligible panes in our tab, sorted by pane id so the fallback is stable.
-/// `foreground_cwd` is deliberately required: falling back to `cwd` would
-/// resurrect a stale spawn directory when the host has no live cwd signal.
-fn sibling_cwds(pane_list_json: &str, my_pane_id: &str) -> Vec<SiblingCwd> {
-    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
-        return Vec::new();
-    };
-    let panes = &msg.result.panes;
+/// Only a host that omits the foreground field session-wide can fall back to
+/// its reported shell cwd.
+fn sibling_cwds(panes: &[Pane], my_pane_id: &str) -> Vec<SiblingCwd> {
+    let has_foreground_cwd = panes.iter().any(|p| p.foreground_cwd.is_some());
     let Some(me) = panes
         .iter()
         .find(|p| p.pane_id.as_deref() == Some(my_pane_id))
@@ -640,10 +625,15 @@ fn sibling_cwds(pane_list_json: &str, my_pane_id: &str) -> Vec<SiblingCwd> {
         })
         .filter_map(|p| {
             let pane_id = p.pane_id.as_deref().filter(|id| is_flag_safe(id))?;
-            let cwd = p.foreground_cwd.as_deref().map(strip_verbatim)?;
+            let cwd = if has_foreground_cwd {
+                p.foreground_cwd.as_ref()?.as_deref()?
+            } else {
+                p.cwd.as_deref()?
+            };
+            let cwd = normalize_cwd(cwd);
             (!cwd.is_empty()).then(|| SiblingCwd {
                 pane_id: pane_id.to_string(),
-                cwd: cwd.to_string(),
+                cwd: cwd.into_owned(),
                 focused: p.focused,
             })
         })
@@ -1257,7 +1247,7 @@ fn resize_plan_inner(
 
 /// True when the id can be passed as a positional argument to the herdr CLI
 /// without any risk of being parsed as a flag.
-fn is_flag_safe(id: &str) -> bool {
+pub(crate) fn is_flag_safe(id: &str) -> bool {
     !id.is_empty()
         && !id.starts_with('-')
         && id
@@ -1265,8 +1255,12 @@ fn is_flag_safe(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '_' | '-'))
 }
 
-fn strip_verbatim(path: &str) -> &str {
-    path.strip_prefix(r"\\?\").unwrap_or(path)
+fn normalize_cwd(path: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}").into()
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(path).into()
+    }
 }
 
 #[cfg(test)]
@@ -1448,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn cwd_follower_uses_only_live_foreground_cwd() {
+    fn cwd_follower_requires_a_live_cwd_when_the_host_emits_the_field() {
         let mut follower = CwdFollower::default();
         let live = pane_list(
             r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar","tokens":{"herdr-sidebar-explorer":"1"}},
@@ -1462,9 +1456,38 @@ mod tests {
         follower.reset();
         let stale_only = pane_list(
             r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"},
-               {"pane_id":"w1:p1","tab_id":"w1:t1","cwd":"/stale/spawn"}"#,
+               {"pane_id":"w1:p1","tab_id":"w1:t1","cwd":"/stale/spawn"},
+               {"pane_id":"w2:p2","tab_id":"w2:t1","foreground_cwd":null}"#,
         );
         assert_eq!(follower.next_cwd(&stale_only, "w1:p3"), None);
+    }
+
+    #[test]
+    fn cwd_follower_uses_shell_cwd_when_the_host_omits_foreground_cwd() {
+        let mut follower = CwdFollower::default();
+        let at = |cwd: &str| {
+            pane_list(&format!(
+                r#"{{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"}},
+                   {{"pane_id":"w1:p1","tab_id":"w1:t1","cwd":{},"focused":true}}"#,
+                serde_json::json!(cwd),
+            ))
+        };
+        for (reported, expected) in [
+            (r"C:\project", r"C:\project"),
+            (
+                r"\\wsl.localhost\Ubuntu\repo",
+                r"\\wsl.localhost\Ubuntu\repo",
+            ),
+            (
+                r"\\?\UNC\wsl.localhost\Ubuntu\other",
+                r"\\wsl.localhost\Ubuntu\other",
+            ),
+        ] {
+            assert_eq!(
+                follower.next_cwd(&at(reported), "w1:p3").as_deref(),
+                Some(expected)
+            );
+        }
     }
 
     #[test]
@@ -1541,42 +1564,13 @@ mod tests {
     }
 
     #[test]
-    fn follow_cwd_polls_fast_only_in_the_focused_tab() {
-        let terminal_focused = pane_list(
-            r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"},
-               {"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"/one","focused":true}"#,
-        );
-        assert_eq!(
-            follow_cwd_interval(&terminal_focused, "w1:p3"),
-            FOLLOW_CWD_EVERY
-        );
-        let sidebar_focused = pane_list(
-            r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar","focused":true},
-               {"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"/one"}"#,
-        );
-        assert_eq!(
-            follow_cwd_interval(&sidebar_focused, "w1:p3"),
-            FOLLOW_CWD_EVERY
-        );
-        let other_tab_focused = pane_list(
-            r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"},
-               {"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"/one"},
-               {"pane_id":"w1:p4","tab_id":"w1:t2","foreground_cwd":"/other","focused":true}"#,
-        );
-        assert_eq!(
-            follow_cwd_interval(&other_tab_focused, "w1:p3"),
-            FOLLOW_CWD_IDLE
-        );
-        assert_eq!(follow_cwd_interval("garbage", "w1:p3"), FOLLOW_CWD_IDLE);
-    }
-
-    #[test]
     fn the_poller_follows_a_cd_only_once_two_samples_agree() {
         let at = |cwd: &str| {
-            pane_list(&format!(
+            parse_panes(&pane_list(&format!(
                 r#"{{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"}},
                    {{"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"{cwd}","focused":true}}"#
-            ))
+            )))
+            .unwrap()
         };
         let mut follower = CwdFollower::default();
         let mut poll = FollowPoller::default();
@@ -1600,6 +1594,21 @@ mod tests {
     }
 
     #[test]
+    fn the_poller_discards_an_inflight_sample_on_visibility_transition() {
+        let now = std::time::Instant::now();
+        let mut poll = FollowPoller::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        poll.inflight = Some(rx);
+        poll.last_start = Some(now);
+        poll.reset();
+        poll.maybe_start(now, FOLLOW_CWD_EVERY, || panic!("still single-flight"));
+        tx.send(Some("stale".into())).unwrap();
+        assert_eq!(poll.take(), Some(None));
+        poll.maybe_start(now, FOLLOW_CWD_EVERY, || Some("fresh".into()));
+        assert_eq!(poll.last_start, Some(now));
+    }
+
+    #[test]
     fn the_poller_samples_off_thread_at_the_tabs_cadence() {
         let unfocused = pane_list(
             r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"},
@@ -1610,14 +1619,14 @@ mod tests {
         let now = std::time::Instant::now();
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let json = unfocused.clone();
-        poll.maybe_start(now, move || {
+        poll.maybe_start(now, FOLLOW_CWD_IDLE, move || {
             rx.recv().ok()?;
             Some(json)
         });
         // Still running: no result, and no second sample is started.
         assert_eq!(poll.take(), None);
         let first = poll.last_start;
-        poll.maybe_start(now + FOLLOW_CWD_IDLE, || None);
+        poll.maybe_start(now + FOLLOW_CWD_IDLE, FOLLOW_CWD_IDLE, || None);
         assert_eq!(poll.last_start, first, "a sample is already in flight");
         tx.send(()).unwrap();
         let sample = loop {
@@ -1627,11 +1636,10 @@ mod tests {
             std::thread::yield_now();
         };
         assert_eq!(sample.as_deref(), Some(unfocused.as_str()));
-        poll.accept(&unfocused, "w1:p3", &mut CwdFollower::default());
         // A background tab keeps the 5 s cadence.
-        poll.maybe_start(now + FOLLOW_CWD_EVERY, || None);
+        poll.maybe_start(now + FOLLOW_CWD_EVERY, FOLLOW_CWD_IDLE, || None);
         assert!(poll.inflight.is_none(), "a background tab is not due yet");
-        poll.maybe_start(now + FOLLOW_CWD_IDLE, || None);
+        poll.maybe_start(now + FOLLOW_CWD_IDLE, FOLLOW_CWD_IDLE, || None);
         let failed = loop {
             if let Some(sample) = poll.take() {
                 break sample;
