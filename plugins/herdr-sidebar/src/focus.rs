@@ -11,6 +11,7 @@ use crate::{ipc, launch, rundir};
 
 const FOCUS_CHECK_EVERY: Duration = Duration::from_secs(10);
 const MEMBERSHIP_EVERY: Duration = Duration::from_secs(60);
+const MEMBERSHIP_RETRY_EVERY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 struct Focus {
@@ -170,10 +171,19 @@ fn recheck_focus(
     write_focus(dir, fetch)
 }
 
-fn recheck_membership(dir: &Path, id: &str) -> Option<launch::Pane> {
-    let lock = publish_lock(dir).ok()?;
-    lock.try_lock().ok()?;
-    get_pane(id)
+enum MembershipCheck {
+    Skipped,
+    Fetched(Option<launch::Pane>),
+}
+
+fn recheck_membership(dir: &Path, fetch: impl FnOnce() -> Option<launch::Pane>) -> MembershipCheck {
+    let Ok(lock) = publish_lock(dir) else {
+        return MembershipCheck::Skipped;
+    };
+    if lock.try_lock().is_err() {
+        return MembershipCheck::Skipped;
+    }
+    MembershipCheck::Fetched(fetch())
 }
 
 fn write_focus(
@@ -269,7 +279,8 @@ enum ActivitySample {
         json: String,
         marker: Option<Marker>,
     },
-    Revalidated(Option<launch::Pane>),
+    Focus,
+    Membership(MembershipCheck),
 }
 
 fn sample_due(last: Option<Instant>, now: Instant, every: Duration) -> bool {
@@ -287,6 +298,8 @@ pub struct SidebarActivity {
     marker_path: Option<PathBuf>,
     move_path: Option<PathBuf>,
     last_move: Option<String>,
+    move_pending: bool,
+    last_membership_attempt: Option<Instant>,
     last_membership: Option<Instant>,
     last_focus_check: Option<Instant>,
     startup_marker: Option<Marker>,
@@ -374,11 +387,9 @@ impl SidebarActivity {
         let mut target = None;
         if let Some(sample) = self.poller.take() {
             match sample {
-                Some(ActivitySample::Revalidated(own)) => {
-                    if let Some(own) = own {
-                        self.fallback_focused = own.focused;
-                        self.update_membership(&own);
-                    }
+                Some(ActivitySample::Focus) => self.read_focus(),
+                Some(ActivitySample::Membership(check)) => {
+                    self.apply_membership_check(now, check);
                     self.read_focus();
                 }
                 Some(ActivitySample::Panes { json, marker }) => {
@@ -414,7 +425,27 @@ impl SidebarActivity {
     }
 
     fn membership_due(&self, now: Instant) -> bool {
-        sample_due(self.last_membership, now, MEMBERSHIP_EVERY)
+        sample_due(self.last_membership_attempt, now, MEMBERSHIP_RETRY_EVERY)
+            && (self.move_pending || sample_due(self.last_membership, now, MEMBERSHIP_EVERY))
+    }
+
+    fn observe_move(&mut self, moved: Option<String>) {
+        if moved.is_some() && moved != self.last_move {
+            self.last_move = moved;
+            self.move_pending = true;
+            self.poller.reset();
+        }
+    }
+
+    fn apply_membership_check(&mut self, now: Instant, check: MembershipCheck) {
+        if let MembershipCheck::Fetched(own) = check {
+            self.last_membership = Some(now);
+            if let Some(own) = own {
+                self.fallback_focused = own.focused;
+                self.update_membership(&own);
+                self.move_pending = false;
+            }
+        }
     }
 
     fn focus_check_due(&self, now: Instant, follow: bool) -> bool {
@@ -432,25 +463,19 @@ impl SidebarActivity {
                 return;
             };
             let dir = dir.to_path_buf();
-            let id = self.original_pane_id.clone();
-            let started = self.poller.maybe_start(now, Duration::ZERO, move || {
-                if focus_due {
-                    let _ = recheck_focus(&dir, SystemTime::now, current_focus);
+            if membership_due {
+                let id = self.original_pane_id.clone();
+                if self.poller.maybe_start(now, Duration::ZERO, move || {
+                    let check = recheck_membership(&dir, || get_pane(&id));
+                    Some(ActivitySample::Membership(check))
+                }) {
+                    self.last_membership_attempt = Some(now);
                 }
-                let own = if membership_due {
-                    recheck_membership(&dir, &id)
-                } else {
-                    None
-                };
-                Some(ActivitySample::Revalidated(own))
-            });
-            if started {
-                if membership_due {
-                    self.last_membership = Some(now);
-                }
-                if focus_due {
-                    self.last_focus_check = Some(now);
-                }
+            } else if self.poller.maybe_start(now, Duration::ZERO, move || {
+                let _ = recheck_focus(&dir, SystemTime::now, current_focus);
+                Some(ActivitySample::Focus)
+            }) {
+                self.last_focus_check = Some(now);
             }
         } else if let Some(every) = self.visibility.cadence(follow, needs_focus) {
             let marker = self.last_marker.clone();
@@ -463,10 +488,7 @@ impl SidebarActivity {
 
     fn read_focus(&mut self) {
         let moved = self.move_path.as_deref().and_then(read_local);
-        if moved.is_some() && moved != self.last_move {
-            self.last_move = moved;
-            self.poller.reset();
-        }
+        self.observe_move(moved);
         let marker = self.marker_path.as_deref().and_then(read_marker);
         self.apply_marker(marker.as_ref());
     }
@@ -701,7 +723,10 @@ mod tests {
         let hook = publish_lock(&dir).unwrap();
         hook.lock().unwrap();
         recheck_focus(&dir, || start, || panic!("focus hook holds the lock")).unwrap();
-        assert!(recheck_membership(&dir, "w1:p2").is_none());
+        assert!(matches!(
+            recheck_membership(&dir, || panic!("focus hook holds the lock")),
+            MembershipCheck::Skipped
+        ));
         drop(hook);
 
         let fetch = || Ok(Some(Focus::new("w1", "w1:t2", "w1:p2").unwrap()));
@@ -739,6 +764,20 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_membership_check_skipped_for_a_busy_lock_retries_soon() {
+        let now = Instant::now();
+        let mut own = SidebarActivity {
+            last_membership: Some(now - MEMBERSHIP_EVERY),
+            ..Default::default()
+        };
+        assert!(own.membership_due(now));
+        own.last_membership_attempt = Some(now);
+        own.apply_membership_check(now, MembershipCheck::Skipped);
+        assert!(!own.membership_due(now));
+        assert!(own.membership_due(now + MEMBERSHIP_RETRY_EVERY));
+    }
+
+    #[test]
     fn moves_are_keyed_by_terminal_across_public_pane_id_changes() {
         let event = json!({"data": {
             "previous_pane_id": "w1:p1",
@@ -770,13 +809,26 @@ mod tests {
         own.last_membership = Some(now);
         assert!(!own.membership_due(now));
         assert!(own.membership_due(now + MEMBERSHIP_EVERY));
-        own.last_move = Some("move".into());
+        own.observe_move(Some("move".into()));
         assert!(
-            !own.membership_due(now),
-            "move events share the lookup limit"
+            own.membership_due(now),
+            "a new move bypasses the idle interval"
         );
 
-        own.update_membership(&panes[0]);
+        own.last_membership_attempt = Some(now);
+        own.apply_membership_check(now, MembershipCheck::Skipped);
+        assert!(!own.membership_due(now), "busy retries are bounded");
+        let retry = now + MEMBERSHIP_RETRY_EVERY;
+        assert!(
+            own.membership_due(retry),
+            "a busy lock does not consume the idle interval"
+        );
+
+        own.last_membership_attempt = Some(retry);
+        own.apply_membership_check(retry, MembershipCheck::Fetched(panes.into_iter().next()));
+        own.observe_move(Some("move".into()));
+        assert!(!own.membership_due(retry + MEMBERSHIP_RETRY_EVERY));
+        assert!(own.membership_due(retry + MEMBERSHIP_EVERY));
         assert_eq!(own.pane_id, "w2:p6");
         assert_eq!(own.workspace_id(), Some("w2"));
         assert_eq!(own.original_pane_id, "w1:p1");
