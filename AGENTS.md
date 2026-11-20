@@ -692,16 +692,17 @@ HACKING.md — budget time for that before promising a patched build.
     launch / refresh / takeover / unified-toggle flows, which all mutate under that lock.
   - Reap uses the exiting pane's tab from the hook context for `pane.exited`. For
     `pane.closed`, Herdr has already removed the pane, so reap is limited to the event's
-    workspace. An event without a usable scope does nothing. Reap re-lists before each
+    workspace. A close can therefore also reap a sidebar-only sibling tab in that workspace,
+    consistent with Close emptied tabs. An event without a usable scope does nothing. Reap re-lists before each
     request to verify the tab is still sidebar-only and the pane's close policy still applies.
     Each remaining pane must be a sidebar: an Explorer / Source Control token, or one of our labels
     without one. Any other pane — shell, agent, preview / editor viewer (token or label),
     an id that is not flag-safe — keeps the tab. Null token values count as absent.
   - Live TUIs get Ctrl+Q only (save drafts, close own pane, no snooze marker); a draft that
     cannot be saved keeps the pane open with its notice, and nothing waits for or kills it.
-    Only panes that cannot hold TUI state are `pane.close`d directly: `herdr-sidebar-starting`,
-    and label-only server-resume corpses with no tokens. A stale or malformed sidebar
-    heartbeat still gets Ctrl+Q. A blocked TUI may have an unsaved draft.
+    Only label-only server-resume corpses with no tokens are closed directly. A starting
+    token may survive the first full metadata report failing after the TUI takes input,
+    so starting panes get Ctrl+Q too, along with stale or malformed sidebar heartbeats.
   - Tabs named by a THIS-session (or session-less legacy) takeover journal — previewed tab
     and parking tab — are skipped (`takeover::journaled_tabs`); the restore owns them. After an
     abandoned restore the journal is gone, so a previewed tab left with only its sidebar is

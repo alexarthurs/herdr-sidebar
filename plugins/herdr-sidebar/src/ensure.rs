@@ -456,8 +456,8 @@ fn reap_with(host: &mut impl ReapHost, scope: &ReapScope) -> Result<usize, Strin
     let mut asked = 0;
     for tab in lonely.iter().filter(|tab| !journaled.contains(&tab.tab)) {
         for (pane, _) in &tab.panes {
-            // A shell could have arrived, or a starting pane could have
-            // become a live TUI since the candidate snapshot.
+            // A shell could have arrived, or the pane could have reported
+            // its first identity token since the candidate snapshot.
             let current = launch::lonely_sidebar_tabs(&host.list()?);
             let Some((_, how)) = current
                 .iter()
@@ -1508,8 +1508,12 @@ mod tests {
             reap_with(&mut host, &ReapScope::Workspace("w1".into())),
             Ok(3)
         );
-        assert_eq!(host.asked, vec!["alone"], "a live TUI only gets Ctrl+Q");
-        assert_eq!(host.closed, vec!["young", "corpse"], "no TUI state yet");
+        assert_eq!(
+            host.asked,
+            vec!["alone", "young"],
+            "token-bearing panes get Ctrl+Q"
+        );
+        assert_eq!(host.closed, vec!["corpse"], "only the token-less corpse");
         for kept in ["busy", "shell", "previewing", "viewer", "parked"] {
             assert!(host.has(kept), "{kept} must survive");
         }
@@ -1557,6 +1561,23 @@ mod tests {
             Ok(1)
         );
         assert!(host.has("git"), "an unsaved draft is never hard-closed");
+        assert!(host.closed.is_empty());
+    }
+
+    #[test]
+    fn reap_preserves_a_starting_pane_that_does_not_close() {
+        let mut host = FakeReap::default();
+        host.pane(
+            "starting",
+            "w1:t1",
+            "Source Control",
+            serde_json::json!({ launch::STARTING_TOKEN: "1" }),
+        );
+        host.keeps.push("starting".into());
+
+        assert_eq!(reap_with(&mut host, &ReapScope::Tab("w1:t1".into())), Ok(1));
+        assert_eq!(host.asked, vec!["starting"]);
+        assert!(host.has("starting"));
         assert!(host.closed.is_empty());
     }
 
