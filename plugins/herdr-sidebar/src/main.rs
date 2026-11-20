@@ -273,6 +273,8 @@ fn main() -> std::io::Result<()> {
             .then_some(false)
     };
     let mut quick_open_on_open = initial_activity == Some(ensure::Target::QuickOpen);
+    // The pane outlives its apps when switching between views.
+    let mut shortcut_notice_shown = false;
     let result = loop {
         let exit = match view {
             View::Explorer => run_explorer(
@@ -281,8 +283,14 @@ fn main() -> std::io::Result<()> {
                 &mut roots,
                 std::mem::take(&mut search_on_open),
                 std::mem::take(&mut quick_open_on_open),
+                &mut shortcut_notice_shown,
             ),
-            View::SourceControl => run_scm(&mut terminal, Rc::clone(&cwd_follower), &mut roots),
+            View::SourceControl => run_scm(
+                &mut terminal,
+                Rc::clone(&cwd_follower),
+                &mut roots,
+                &mut shortcut_notice_shown,
+            ),
         };
         match exit {
             Ok(Exit::Quit) => {
@@ -512,6 +520,7 @@ fn run_explorer(
     roots: &mut RootMemory,
     search_on_open: Option<bool>,
     quick_open_on_open: bool,
+    shortcut_notice_shown: &mut bool,
 ) -> std::io::Result<Exit> {
     let mut app = explorer_app::App::new(roots.root.clone(), cwd_follower);
     if let Some(focus_query) = search_on_open {
@@ -531,7 +540,7 @@ fn run_explorer(
         };
         if event::poll(timeout)? {
             let exit = match event::read()? {
-                Event::Key(key) => app.on_key(key),
+                Event::Key(key) => app.on_key(key, shortcut_notice_shown),
                 Event::Mouse(mouse) => app.on_mouse(mouse),
                 Event::Resize(width, _) => {
                     app.on_resize(width);
@@ -559,6 +568,7 @@ fn run_scm(
     terminal: &mut ratatui::DefaultTerminal,
     cwd_follower: Rc<RefCell<launch::CwdFollower>>,
     roots: &mut RootMemory,
+    shortcut_notice_shown: &mut bool,
 ) -> std::io::Result<Exit> {
     let mut app = scm_app::App::new(roots.root.clone(), cwd_follower);
     let mut last_tick = std::time::Instant::now();
@@ -574,7 +584,7 @@ fn run_scm(
         }
         if event::poll(timeout)? {
             let exit = match event::read()? {
-                Event::Key(key) => app.on_key(key),
+                Event::Key(key) => app.on_key(key, shortcut_notice_shown),
                 Event::Mouse(mouse) => app.on_mouse(mouse),
                 Event::Resize(width, _) => {
                     app.on_resize(width);

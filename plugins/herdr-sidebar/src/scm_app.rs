@@ -32,12 +32,12 @@ use herdr_sidebar::state::Exit;
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::suggest;
 use herdr_sidebar::ui::{
-    TitleAction, activity_button_style, activity_icons, branch_icon, chrome_button_style,
-    draw_activity_caps, draw_scrollbar, fit_menu_hint, gear_icon, hits, hits_activity_button,
-    hits_collapse_button, hover_style, icon_style as ui_icon_style, keep_visible_scroll, palette,
-    selection_style, set_color_theme, sibling_panes_of, sparkle_icon, status_color,
-    title_action_spans, title_actions_visible, title_actions_width, truncate_to, within,
-    wrap_footer_message, wrap_hints,
+    LETTER_HOTKEYS_NOTICE, SETTINGS_KEY, TitleAction, activity_button_style, activity_icons,
+    branch_icon, chrome_button_style, draw_activity_caps, draw_scrollbar, fit_menu_hint, gear_icon,
+    hits, hits_activity_button, hits_collapse_button, hover_style, icon_style as ui_icon_style,
+    ignore_letter_hotkey, keep_visible_scroll, palette, selection_style, set_color_theme,
+    sibling_panes_of, sparkle_icon, status_color, title_action_spans, title_actions_visible,
+    title_actions_width, truncate_to, within, wrap_footer_message, wrap_hints,
 };
 
 /// How many log lines the history-ish drawers fetch.
@@ -1011,6 +1011,7 @@ enum Setting {
     GitFooter,
     ConfirmGitOps,
     Hotkeys,
+    LetterHotkeys,
     Folder,
     ScmViewMode,
 }
@@ -1180,6 +1181,7 @@ pub struct App {
     history_target: Option<String>,
     /// One-shot footer notice: (text, is_error). Cleared on the next key press.
     flash: Option<(String, bool)>,
+    shortcut_notice: bool,
     /// Pending ✧ commit-message generation, polled from tick().
     suggesting: Option<Receiver<String>>,
     /// Pending Sync Changes run, polled from tick().
@@ -1331,6 +1333,7 @@ impl App {
             drawers,
             history_target,
             flash: None,
+            shortcut_notice: false,
             suggesting: None,
             syncing: None,
             overlay: None,
@@ -1668,6 +1671,7 @@ impl App {
         self.sidebar_state.auto_hide_below = shared.auto_hide_below;
         self.sidebar_state.confirm_git_ops = shared.confirm_git_ops;
         self.sidebar_state.close_lonely_tab = shared.close_lonely_tab;
+        self.sidebar_state.letter_hotkeys = shared.letter_hotkeys;
         if shared.scm_tree_view != self.tree_view {
             // Toggled from another pane (separated view, a preview tab).
             self.tree_view = shared.scm_tree_view;
@@ -1961,10 +1965,21 @@ impl App {
     }
 
     /// Handle one key press; `Some(exit)` ends the event loop.
-    pub fn on_key(&mut self, key: KeyEvent) -> Option<Exit> {
+    pub fn on_key(&mut self, key: KeyEvent, shortcut_notice_shown: &mut bool) -> Option<Exit> {
         if key.kind != KeyEventKind::Press {
             return None;
         }
+        if self.overlay.is_none()
+            && self.focus == Focus::List
+            && ignore_letter_hotkey(key, self.sidebar_state.letter_hotkeys)
+        {
+            if !std::mem::replace(shortcut_notice_shown, true) {
+                self.flash = None;
+                self.shortcut_notice = true;
+            }
+            return None;
+        }
+        self.shortcut_notice = false;
         if key.code == KeyCode::Char('q')
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
@@ -2014,6 +2029,10 @@ impl App {
         }
         if self.overlay.is_some() {
             self.overlay_key(key);
+            return None;
+        }
+        if key.code == SETTINGS_KEY && key.modifiers.is_empty() {
+            self.open_settings();
             return None;
         }
         if matches!(key.code, KeyCode::Char('f' | 'F'))
@@ -2146,6 +2165,7 @@ impl App {
                 // Reaches us only as Ctrl+right-click (herdr's passthrough
                 // modifier); plain right-click opens herdr's own pane menu.
                 self.flash = None;
+                self.shortcut_notice = false;
                 self.open_context_menu(mouse.column, mouse.row);
             }
             _ => {}
@@ -2155,6 +2175,7 @@ impl App {
 
     fn left_click(&mut self, mouse: MouseEvent) -> Option<Exit> {
         self.flash = None;
+        self.shortcut_notice = false;
         if hits_collapse_button(mouse.column, mouse.row, self.last_width, self.last_height) {
             self.hide();
             return None;
@@ -2934,6 +2955,17 @@ impl App {
                 true,
             ),
             (
+                Setting::LetterHotkeys,
+                sidebar::LETTER_HOTKEYS_LABEL,
+                if self.sidebar_state.letter_hotkeys {
+                    "on"
+                } else {
+                    "off"
+                }
+                .into(),
+                true,
+            ),
+            (
                 Setting::AutoOpen,
                 "Auto-open sidebar",
                 if self.sidebar_state.auto_open {
@@ -3080,6 +3112,10 @@ impl App {
             Setting::Hotkeys => {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.show_hotkeys = !state.show_hotkeys);
+            }
+            Setting::LetterHotkeys => {
+                self.sidebar_state =
+                    sidebar::update_state(|state| state.letter_hotkeys = !state.letter_hotkeys);
             }
             Setting::AutoOpen => {
                 self.sidebar_state =
@@ -4592,9 +4628,12 @@ impl App {
         frame.render_widget(Paragraph::new(footer_lines), footer_content);
         if menu_hint {
             frame.render_widget(
-                Paragraph::new(action_hint.unwrap_or(fit_menu_hint(footer_content.width)))
-                    .style(Style::default().fg(Color::DarkGray))
-                    .alignment(Alignment::Right),
+                Paragraph::new(action_hint.unwrap_or(fit_menu_hint(
+                    footer_content.width,
+                    self.sidebar_state.letter_hotkeys,
+                )))
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Right),
                 footer_content,
             );
         }
@@ -4622,9 +4661,12 @@ impl App {
             }
         } else if footer_empty {
             frame.render_widget(
-                Paragraph::new(action_hint.unwrap_or(fit_menu_hint(footer_status.width)))
-                    .style(Style::default().fg(Color::DarkGray))
-                    .alignment(Alignment::Right),
+                Paragraph::new(action_hint.unwrap_or(fit_menu_hint(
+                    footer_status.width,
+                    self.sidebar_state.letter_hotkeys,
+                )))
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Right),
                 footer_status,
             );
         }
@@ -5255,6 +5297,7 @@ impl App {
                 let prefix = if *is_error { "" } else { "✓ " };
                 Some((format!("{prefix}{text}"), color))
             }
+            _ if self.shortcut_notice => Some((LETTER_HOTKEYS_NOTICE.into(), palette().modified)),
             _ => None,
         };
         if let Some((msg, color)) = message {
@@ -5271,6 +5314,26 @@ impl App {
 
     /// The hotkey hints, shown in Settings (and optionally the footer).
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        if !self.sidebar_state.letter_hotkeys {
+            let mut hints = vec![
+                ("↑↓", "move"),
+                ("←→", "fold"),
+                ("⏎", "stage"),
+                ("tab", "message"),
+                ("F8", "settings"),
+                ("ctrl+q", "close"),
+            ];
+            if self.merged() {
+                hints.extend([
+                    ("ctrl+p", "files"),
+                    ("ctrl+f", "text"),
+                    ("ctrl+1", "files"),
+                    ("ctrl+2", "search"),
+                    ("ctrl+3", "git"),
+                ]);
+            }
+            return hints;
+        }
         let mut hints: Vec<(&'static str, &'static str)> = vec![
             ("⏎", "stage"),
             ("t", if self.tree_view { "list" } else { "tree" }),
@@ -5282,7 +5345,7 @@ impl App {
             ("m", "menu"),
             ("b", "hide"),
             ("S", "sync"),
-            ("s", "settings"),
+            ("s/F8", "settings"),
             ("r", "refresh"),
             ("q", "quit"),
         ];
