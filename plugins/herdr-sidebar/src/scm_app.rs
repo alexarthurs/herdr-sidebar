@@ -26,6 +26,7 @@ use herdr_sidebar::branch_ui::{
     BranchPicker, FooterZones, PickerAction, draw_git_footer, sync_glyph,
 };
 use herdr_sidebar::git::{DeleteRefused, FileEntry, Git, Status};
+use herdr_sidebar::gitconfirm::{self, GitOp};
 use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::state::Exit;
 use herdr_sidebar::state::{self as sidebar, View};
@@ -347,6 +348,10 @@ fn drawer_checkout_args(dref: &DrawerRef, spec: &str, git_spec: &str) -> Option<
         ]),
         _ => None,
     }
+}
+
+fn git_args(args: &[&str]) -> Vec<String> {
+    args.iter().map(|arg| (*arg).to_string()).collect()
 }
 
 fn drawer_reset_args(git_spec: &str) -> Vec<String> {
@@ -970,6 +975,12 @@ enum Overlay {
         prompt: String,
         args: Vec<String>,
     },
+    /// The opt-in y/N before Sync (`confirm_git_ops`). Sync runs on a
+    /// background worker rather than through `run_git`, so it is not an argv.
+    ConfirmSync {
+        repo: usize,
+        prompt: String,
+    },
     /// The ⚙ settings modal: mouse-toggleable panel settings.
     Settings {
         selected: usize,
@@ -997,6 +1008,7 @@ enum Setting {
     FollowCwd,
     GitDecorations,
     GitFooter,
+    ConfirmGitOps,
     Hotkeys,
     Folder,
     ScmViewMode,
@@ -1653,6 +1665,7 @@ impl App {
         self.sidebar_state.strict_toggle = shared.strict_toggle;
         self.sidebar_state.focus_on_open = shared.focus_on_open;
         self.sidebar_state.auto_hide_below = shared.auto_hide_below;
+        self.sidebar_state.confirm_git_ops = shared.confirm_git_ops;
         if shared.scm_tree_view != self.tree_view {
             // Toggled from another pane (separated view, a preview tab).
             self.tree_view = shared.scm_tree_view;
@@ -2566,6 +2579,7 @@ impl App {
             DiscardConfirmed(usize, FileEntry),
             DiscardAllConfirmed(usize),
             GitConfirmed(usize, Vec<String>),
+            SyncConfirmed(usize),
             Picker(PickerAction),
         }
         let settings = self.settings_rows();
@@ -2634,6 +2648,10 @@ impl App {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Cmd::GitConfirmed(*repo, args.clone()),
                 _ => Cmd::Close,
             },
+            Some(Overlay::ConfirmSync { repo, .. }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => Cmd::SyncConfirmed(*repo),
+                _ => Cmd::Close,
+            },
             None => Cmd::Nothing,
         };
         match cmd {
@@ -2652,6 +2670,10 @@ impl App {
                         self.run_git(repo, &strs);
                     }
                 }
+            }
+            Cmd::SyncConfirmed(repo) => {
+                self.overlay = None;
+                self.start_sync(repo);
             }
             Cmd::DiscardConfirmed(repo, entry) => {
                 self.overlay = None;
@@ -2971,6 +2993,17 @@ impl App {
                 true,
             ),
             (
+                Setting::ConfirmGitOps,
+                gitconfirm::SETTING_LABEL,
+                if self.sidebar_state.confirm_git_ops {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
                 Setting::ScmViewMode,
                 "View as",
                 if self.tree_view { "tree" } else { "list" }.to_string(),
@@ -3059,6 +3092,11 @@ impl App {
             Setting::GitFooter => {
                 self.sidebar_state = sidebar::update_state(|state| {
                     state.show_git_footer = !state.show_git_footer;
+                });
+            }
+            Setting::ConfirmGitOps => {
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.confirm_git_ops = !state.confirm_git_ops;
                 });
             }
             Setting::Folder => {
@@ -3400,6 +3438,11 @@ impl App {
             DrawerRef::None => return,
         };
         let git_spec = drawer_git_spec(&dref).unwrap_or_else(|| spec.clone());
+        let current = self
+            .repos
+            .get(repo)
+            .map(|r| r.status.branch.clone())
+            .unwrap_or_default();
         match action {
             MenuAction::ShowRef => self.open_drawer_ref(kind, index),
             MenuAction::Reveal => reveal(std::path::Path::new(&spec), true),
@@ -3423,20 +3466,50 @@ impl App {
             }
             MenuAction::Checkout => {
                 if let Some(args) = drawer_checkout_args(&dref, &spec, &git_spec) {
-                    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-                    self.run_git(repo, &args);
+                    let detached = matches!(dref, DrawerRef::Commit(_) | DrawerRef::Tag(_));
+                    let op = GitOp::Checkout {
+                        target: &spec,
+                        detached,
+                    };
+                    self.run_git_guarded(repo, op, args);
                 }
             }
             MenuAction::MergeInto => {
-                self.run_git(repo, &["merge", "--no-edit", "--", &git_spec]);
+                let op = GitOp::Merge {
+                    source: &spec,
+                    into: &current,
+                };
+                self.run_git_guarded(repo, op, git_args(&["merge", "--no-edit", "--", &git_spec]));
             }
-            MenuAction::CherryPick => self.run_git(repo, &["cherry-pick", "--", &git_spec]),
+            MenuAction::CherryPick => {
+                let op = GitOp::CherryPick {
+                    commit: &spec,
+                    onto: &current,
+                };
+                self.run_git_guarded(repo, op, git_args(&["cherry-pick", "--", &git_spec]));
+            }
             MenuAction::Revert => {
-                self.run_git(repo, &["revert", "--no-edit", "--", &git_spec]);
+                let op = GitOp::Revert { commit: &spec };
+                self.run_git_guarded(
+                    repo,
+                    op,
+                    git_args(&["revert", "--no-edit", "--", &git_spec]),
+                );
             }
-            MenuAction::StashApply => self.run_git(repo, &["stash", "apply", "--", &spec]),
-            MenuAction::StashPop => self.run_git(repo, &["stash", "pop", "--", &spec]),
-            MenuAction::FetchRemote => self.run_git(repo, &["fetch", "--", &spec]),
+            MenuAction::StashApply => {
+                self.run_git_guarded(
+                    repo,
+                    GitOp::StashApply,
+                    git_args(&["stash", "apply", "--", &spec]),
+                );
+            }
+            MenuAction::StashPop => {
+                let op = GitOp::StashPop { stash: &spec };
+                self.run_git_guarded(repo, op, git_args(&["stash", "pop", "--", &spec]));
+            }
+            MenuAction::FetchRemote => {
+                self.run_git_guarded(repo, GitOp::Fetch, git_args(&["fetch", "--", &spec]));
+            }
             MenuAction::ResetHere => self.confirm_git(
                 repo,
                 format!("Reset current branch to {spec} (mixed)? (y/N)"),
@@ -3477,6 +3550,18 @@ impl App {
 
     fn confirm_git(&mut self, repo: usize, prompt: String, args: Vec<String>) {
         self.overlay = Some(Overlay::ConfirmGit { repo, prompt, args });
+    }
+
+    /// Run a one-click git op now, or behind the opt-in y/N
+    /// (`confirm_git_ops`) when `op` is one it guards.
+    fn run_git_guarded(&mut self, repo: usize, op: GitOp<'_>, args: Vec<String>) {
+        if op.needs_confirm(self.sidebar_state.confirm_git_ops) {
+            self.flash = None;
+            self.confirm_git(repo, op.prompt(), args);
+        } else {
+            let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+            self.run_git(repo, &strs);
+        }
     }
 
     /// The confirmed non-forcing delete. Unmerged commits are the one refusal
@@ -4196,6 +4281,9 @@ impl App {
         self.sync_repo(self.active);
     }
 
+    /// Every Sync entry point (`S`, ⇅, the Git footer, the multi-repo
+    /// header, the primary button) lands here, so the opt-in confirmation
+    /// covers them all.
     fn sync_repo(&mut self, index: usize) {
         if self.syncing.is_some() {
             return;
@@ -4207,6 +4295,31 @@ impl App {
             self.flash = Some(("no upstream to sync with".into(), true));
             return;
         }
+        let op = GitOp::Sync {
+            branch: &repo.status.branch,
+            ahead: repo.status.ahead,
+            behind: repo.status.behind,
+        };
+        if op.needs_confirm(self.sidebar_state.confirm_git_ops) {
+            let prompt = op.prompt();
+            self.flash = None;
+            self.overlay = Some(Overlay::ConfirmSync {
+                repo: index,
+                prompt,
+            });
+            return;
+        }
+        self.start_sync(index);
+    }
+
+    fn start_sync(&mut self, index: usize) {
+        if self.syncing.is_some() {
+            return;
+        }
+        let Some(repo) = self.repos.get(index) else {
+            self.flash = Some(("repository is gone".to_string(), true));
+            return;
+        };
         let git = repo.git.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -5112,7 +5225,7 @@ impl App {
                 "Discard all unstaged changes? (y/N)".to_string(),
                 palette().deleted,
             )),
-            (Some(Overlay::ConfirmGit { prompt, .. }), _) => {
+            (Some(Overlay::ConfirmGit { prompt, .. } | Overlay::ConfirmSync { prompt, .. }), _) => {
                 Some((prompt.clone(), palette().deleted))
             }
             (_, Some((text, is_error))) => {

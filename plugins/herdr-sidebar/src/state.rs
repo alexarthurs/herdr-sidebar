@@ -463,6 +463,10 @@ pub struct State {
     /// Diff previews show old and new side by side instead of one unified
     /// column (`v` in the preview toggles it).
     pub diff_side_by_side: bool,
+    /// Ask y/N before Git actions that rewrite history or touch the remote
+    /// (Sync, merge, cherry-pick, revert, stash pop, drawer checkout). Off
+    /// keeps the historical one-click behavior (issue #118).
+    pub confirm_git_ops: bool,
 }
 
 impl State {
@@ -514,6 +518,7 @@ impl Default for State {
             custom_editor_on_click: false,
             scm_tree_view: false,
             diff_side_by_side: false,
+            confirm_git_ops: false,
         }
     }
 }
@@ -679,7 +684,7 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"auto_hide_below\":{},\"colors\":\"{}\",\"syntax_dark\":\"{}\",\"syntax_light\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{},\"diff_side_by_side\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"auto_hide_below\":{},\"colors\":\"{}\",\"syntax_dark\":\"{}\",\"syntax_light\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{},\"diff_side_by_side\":{},\"confirm_git_ops\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.search_active,
@@ -700,7 +705,8 @@ fn write_state(path: &Path, state: State) {
         state.preview_placement.label(),
         state.custom_editor_on_click,
         state.scm_tree_view,
-        state.diff_side_by_side
+        state.diff_side_by_side,
+        state.confirm_git_ops
     );
     let _ = std::fs::write(path, json);
 }
@@ -1168,6 +1174,10 @@ pub fn parse_state(json: &str) -> State {
             .get("diff_side_by_side")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.diff_side_by_side),
+        confirm_git_ops: value
+            .get("confirm_git_ops")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.confirm_git_ops),
     }
 }
 
@@ -1378,11 +1388,14 @@ mod tests {
             custom_editor_on_click: true,
             scm_tree_view: true,
             diff_side_by_side: true,
+            confirm_git_ops: true,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"auto_hide_below\":96,\"colors\":\"terminal\",\"syntax_dark\":\"base16-mocha.dark\",\"syntax_light\":\"Solarized (light)\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"diff_side_by_side\":true,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"auto_hide_below\":96,\"colors\":\"terminal\",\"syntax_dark\":\"base16-mocha.dark\",\"syntax_light\":\"Solarized (light)\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"diff_side_by_side\":true,\"confirm_git_ops\":true,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         // Diffs stay unified unless the user switched them.
         assert!(!parse_state("{\"merged\":true}").diff_side_by_side);
+        // Files written before the setting existed keep one-click Git actions.
+        assert!(!parse_state("{\"merged\":true}").confirm_git_ops);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
         // decorations on.
