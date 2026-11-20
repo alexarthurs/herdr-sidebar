@@ -529,23 +529,21 @@ HACKING.md — budget time for that before promising a patched build.
   obsolete event data. Publication runs before auto-open and the launch lock.
 - `focus.rs` atomically replaces a small workspace/tab/pane JSON marker in the private
   `rundir`, keyed by socket hash like snooze. A sidebar resolves its membership with
-  `pane.get` at startup and checks a pre-existing marker against `pane.current` once.
-  Missing, unreadable, malformed, or startup-mismatched markers use one shared slow
-  sample every 5 s when cwd or focus is needed. A startup mismatch also retries
-  publication on the worker, which clears the fallback after the host responds.
-  A valid marker has no time expiry
-  because the focused tab may sit idle indefinitely. Visibility follows Herdr's
+  `pane.get` at startup. A pre-existing marker is provisionally ignored until a
+  new publication or a coalesced worker check validates it. Missing, unreadable,
+  malformed, or unvalidated startup markers use a slow sample every 5 s when
+  cwd or focus is needed. Validated markers have no expiry while the tab sits idle. Visibility follows Herdr's
   session-wide default pane. Herdr 0.9.5 tracks displayed tabs privately in
   `src/server/headless/client_views.rs`. Its public API schema offers no per-client
   visibility list, and `session.snapshot` exposes one focused tab. A second client's
   tab catches up on its next focus event.
-- `pane.moved` writes an invalidation for the sidebar's stable terminal id. The
-  sidebar resolves its new tab and canonical pane id with one `pane.get` using its
-  original environment id, which Herdr 0.9.5 aliases after a cross-workspace move.
-  The existing single-flight worker handles the lookup. One fallback `pane.get`
-  per 30 s recovers missed or failed move invalidations, including when cwd follow
-  is off. Move markers are small per-terminal files and are reused on subsequent
-  moves. Marker writes, including move invalidations, retry once on failure.
+- `pane.moved` writes an invalidation for the sidebar's stable terminal id and
+  discards in-flight cwd samples. Membership is resolved by the next good cwd
+  list or a worker `pane.get` using the original environment id, which Herdr
+  0.9.5 aliases across workspace moves. Each sidebar attempts at most one
+  membership recheck per 60 s, including after a move, and skips if the publish
+  lock is busy. The same fallback recovers missed invalidations. Marker writes,
+  including move invalidations, retry once on failure.
 - With a usable marker, hidden sidebars issue zero periodic `pane.list` calls.
   Visible sidebars issue at most one full list every 300 ms while following
   (first request due when the tab becomes visible). Explorer keeps its 2 s
@@ -556,11 +554,13 @@ HACKING.md — budget time for that before promising a patched build.
   or 5 s hidden, plus separate global lists about every 2 s for Explorer
   decorations or on due SCM status reads. Herdr supports workspace-scoped lists,
   but the follow sample stays session-wide for the #119 capability check.
-- Hidden sidebars revalidate with at most one `pane.current` per 10 s on the
-  same worker. The publish lock covers the read and conditional replacement, so
-  a missed focus hook is repaired without rewriting an agreeing marker. The
-  other steady-state calls are the ~5 s identity heartbeat and the 30 s
-  membership fallback above. The 20 s stale rule is unchanged. Root-label retries
+- Opportunistic focus checks use at most one `pane.current` per 10 s across the
+  entire session, shared by hidden panes, startup validation and visible panes
+  with cwd follow off. The worker try-locks publication and skips if busy. Under
+  the lock, a sibling timestamp reserves the interval before IPC, even on failed
+  reads, and a changed focus is published before unlock. Only real focus hooks
+  wait for the lock. Each sidebar still sends its ~5 s identity heartbeat and may
+  use the 60 s membership fallback. The 20 s stale rule is unchanged. Root-label retries
   wait while the tab is hidden. On each ~5 s heartbeat, a dedicated preview sends
   its metadata stamp and uses one `pane.get` to detect a move even when the document
   is unchanged. The applied tab label is cached by (tab id, label), so a move
