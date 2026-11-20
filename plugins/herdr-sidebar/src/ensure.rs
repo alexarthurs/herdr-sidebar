@@ -1504,7 +1504,10 @@ mod tests {
         host.pane("young", "w1:t5", "Source Control", young);
         host.pane("corpse", "w1:t6", "Explorer", serde_json::json!({}));
 
-        assert_eq!(reap_with(&mut host, &ReapScope::Workspace("w1".into())), Ok(3));
+        assert_eq!(
+            reap_with(&mut host, &ReapScope::Workspace("w1".into())),
+            Ok(3)
+        );
         assert_eq!(host.asked, vec!["alone"], "a live TUI only gets Ctrl+Q");
         assert_eq!(host.closed, vec!["young", "corpse"], "no TUI state yet");
         for kept in ["busy", "shell", "previewing", "viewer", "parked"] {
@@ -1515,7 +1518,10 @@ mod tests {
         // nothing lonely left it does nothing, so it can never loop.
         host.asked.clear();
         host.closed.clear();
-        assert_eq!(reap_with(&mut host, &ReapScope::Workspace("w1".into())), Ok(0));
+        assert_eq!(
+            reap_with(&mut host, &ReapScope::Workspace("w1".into())),
+            Ok(0)
+        );
         assert!(host.asked.is_empty() && host.closed.is_empty());
     }
 
@@ -1539,11 +1545,17 @@ mod tests {
             serde_json::json!({ launch::SC_METADATA_SOURCE: now }),
         );
         host.keeps.push("git".into());
-        assert_eq!(reap_with(&mut host, &ReapScope::Workspace("w1".into())), Ok(2));
+        assert_eq!(
+            reap_with(&mut host, &ReapScope::Workspace("w1".into())),
+            Ok(2)
+        );
         assert_eq!(host.asked, vec!["explorer", "git"]);
         assert!(host.closed.is_empty());
         assert!(host.has("git") && !host.has("explorer"));
-        assert_eq!(reap_with(&mut host, &ReapScope::Workspace("w1".into())), Ok(1));
+        assert_eq!(
+            reap_with(&mut host, &ReapScope::Workspace("w1".into())),
+            Ok(1)
+        );
         assert!(host.has("git"), "an unsaved draft is never hard-closed");
         assert!(host.closed.is_empty());
     }
@@ -1635,8 +1647,13 @@ mod tests {
             {"pane_id":"w2:p3","tab_id":"w2:t1","workspace_id":"w2","focused":false}
         ]}}"#;
         assert_eq!(
-            creation_focus_repair(&focused_pane_id(same_tab_before), sidebar_stole_focus, "w2:p2", Some("w2:p1"))
-                .as_deref(),
+            creation_focus_repair(
+                &focused_pane_id(same_tab_before),
+                sidebar_stole_focus,
+                "w2:p2",
+                Some("w2:p1")
+            )
+            .as_deref(),
             Some("w2:p1"),
             "a dock in the focused tab restores its original pane"
         );
@@ -1644,8 +1661,13 @@ mod tests {
             {"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","focused":false}
         ]}}"#;
         assert_eq!(
-            creation_focus_repair(&focused_pane_id(no_prior_focus), sidebar_stole_focus, "w2:p2", Some("w2:p1"))
-                .as_deref(),
+            creation_focus_repair(
+                &focused_pane_id(no_prior_focus),
+                sidebar_stole_focus,
+                "w2:p2",
+                Some("w2:p1")
+            )
+            .as_deref(),
             Some("w2:p1"),
             "without a recorded prior focus, restore the displaced pane"
         );

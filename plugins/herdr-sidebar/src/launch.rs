@@ -96,27 +96,37 @@ pub const FOLLOW_CWD_IDLE: std::time::Duration = std::time::Duration::from_secs(
 /// agree. Fast sampling otherwise catches transient `foreground_cwd` values
 /// (a tool that briefly runs elsewhere), and each one would re-root the view
 /// and release a manual folder choice that 5 s sampling used to miss.
-#[derive(Debug, Default)]
-pub(crate) struct FollowPoller {
-    inflight: Option<std::sync::mpsc::Receiver<Option<String>>>,
+#[derive(Debug)]
+pub(crate) struct FollowPoller<T> {
+    inflight: Option<std::sync::mpsc::Receiver<Option<T>>>,
     last_start: Option<std::time::Instant>,
     last_sample: Option<Vec<SiblingCwd>>,
 }
 
-impl FollowPoller {
+impl<T> Default for FollowPoller<T> {
+    fn default() -> Self {
+        Self {
+            inflight: None,
+            last_start: None,
+            last_sample: None,
+        }
+    }
+}
+
+impl<T: Send + 'static> FollowPoller<T> {
     /// Start a background sample when one is due and none is running.
     pub fn maybe_start(
         &mut self,
         now: std::time::Instant,
         every: std::time::Duration,
-        fetch: impl FnOnce() -> Option<String> + Send + 'static,
-    ) {
+        fetch: impl FnOnce() -> Option<T> + Send + 'static,
+    ) -> bool {
         if self.inflight.is_some()
             || self
                 .last_start
                 .is_some_and(|started| now.saturating_duration_since(started) < every)
         {
-            return;
+            return false;
         }
         self.last_start = Some(now);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -128,11 +138,14 @@ impl FollowPoller {
             .is_ok()
         {
             self.inflight = Some(rx);
+            true
+        } else {
+            false
         }
     }
 
     /// A finished sample, without blocking: `Some(None)` is a failed one.
-    pub fn take(&mut self) -> Option<Option<String>> {
+    pub fn take(&mut self) -> Option<Option<T>> {
         let rx = self.inflight.as_ref()?;
         let sample = match rx.try_recv() {
             Ok(sample) => sample.filter(|_| self.last_start.is_some()),
@@ -555,8 +568,7 @@ impl Pane {
             self.label.as_deref(),
             Some(PANE_LABEL | SIDEBAR_LABEL | SC_PANE_LABEL)
         );
-        (ours && self.tokens.values().all(serde_json::Value::is_null))
-            .then_some(ReapClose::Direct)
+        (ours && self.tokens.values().all(serde_json::Value::is_null)).then_some(ReapClose::Direct)
     }
 }
 
@@ -1569,7 +1581,7 @@ mod tests {
             .unwrap()
         };
         let mut follower = CwdFollower::default();
-        let mut poll = FollowPoller::default();
+        let mut poll = FollowPoller::<String>::default();
         assert_eq!(poll.accept(&at("/one"), "w1:p3", &mut follower), None);
         assert_eq!(
             poll.accept(&at("/one"), "w1:p3", &mut follower).as_deref(),
@@ -1592,7 +1604,7 @@ mod tests {
     #[test]
     fn the_poller_discards_an_inflight_sample_on_visibility_transition() {
         let now = std::time::Instant::now();
-        let mut poll = FollowPoller::default();
+        let mut poll = FollowPoller::<String>::default();
         let (tx, rx) = std::sync::mpsc::channel();
         poll.inflight = Some(rx);
         poll.last_start = Some(now);
@@ -1611,7 +1623,7 @@ mod tests {
                {"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"/one"},
                {"pane_id":"w1:p4","tab_id":"w1:t2","focused":true}"#,
         );
-        let mut poll = FollowPoller::default();
+        let mut poll = FollowPoller::<String>::default();
         let now = std::time::Instant::now();
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let json = unfocused.clone();
