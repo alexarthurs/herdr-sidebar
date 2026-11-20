@@ -25,7 +25,7 @@ use herdr_sidebar::actions::{ClipboardWrite, copy_to_clipboard, open_external, r
 use herdr_sidebar::branch_ui::{
     BranchPicker, FooterZones, PickerAction, draw_git_footer, sync_glyph,
 };
-use herdr_sidebar::git::{DeleteRefused, FileEntry, Git, Status};
+use herdr_sidebar::git::{DeleteRefused, FileEntry, Git, Status, SyncTarget};
 use herdr_sidebar::gitconfirm::{self, GitOp};
 use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::state::Exit;
@@ -979,6 +979,7 @@ enum Overlay {
     /// background worker rather than through `run_git`, so it is not an argv.
     ConfirmSync {
         repo: usize,
+        target: SyncTarget,
         prompt: String,
     },
     /// The ⚙ settings modal: mouse-toggleable panel settings.
@@ -2582,7 +2583,7 @@ impl App {
             DiscardConfirmed(usize, FileEntry),
             DiscardAllConfirmed(usize),
             GitConfirmed(usize, Vec<String>),
-            SyncConfirmed(usize),
+            SyncConfirmed(usize, SyncTarget),
             Picker(PickerAction),
         }
         let settings = self.settings_rows();
@@ -2651,8 +2652,10 @@ impl App {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Cmd::GitConfirmed(*repo, args.clone()),
                 _ => Cmd::Close,
             },
-            Some(Overlay::ConfirmSync { repo, .. }) => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => Cmd::SyncConfirmed(*repo),
+            Some(Overlay::ConfirmSync { repo, target, .. }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    Cmd::SyncConfirmed(*repo, target.clone())
+                }
                 _ => Cmd::Close,
             },
             None => Cmd::Nothing,
@@ -2674,9 +2677,9 @@ impl App {
                     }
                 }
             }
-            Cmd::SyncConfirmed(repo) => {
+            Cmd::SyncConfirmed(repo, target) => {
                 self.overlay = None;
-                self.start_sync(repo);
+                self.start_sync(repo, Some(target));
             }
             Cmd::DiscardConfirmed(repo, entry) => {
                 self.overlay = None;
@@ -4307,28 +4310,29 @@ impl App {
         let Some(repo) = self.repos.get(index) else {
             return;
         };
-        if !repo.status.has_upstream {
-            self.flash = Some(("no upstream to sync with".into(), true));
-            return;
-        }
-        let op = GitOp::Sync {
-            branch: &repo.status.branch,
-            ahead: repo.status.ahead,
-            behind: repo.status.behind,
-        };
-        if op.needs_confirm(self.sidebar_state.confirm_git_ops) {
-            let prompt = op.prompt();
+        if self.sidebar_state.confirm_git_ops {
+            let target = match repo.git.sync_target() {
+                Ok(target) => target,
+                Err(error) => {
+                    self.flash = Some((error, true));
+                    return;
+                }
+            };
+            let prompt = target.prompt(&repo.status);
             self.flash = None;
             self.overlay = Some(Overlay::ConfirmSync {
                 repo: index,
+                target,
                 prompt,
             });
-            return;
+        } else if repo.status.has_upstream {
+            self.start_sync(index, None);
+        } else {
+            self.flash = Some(("no upstream to sync with".into(), true));
         }
-        self.start_sync(index);
     }
 
-    fn start_sync(&mut self, index: usize) {
+    fn start_sync(&mut self, index: usize, target: Option<SyncTarget>) {
         if self.syncing.is_some() {
             return;
         }
@@ -4339,7 +4343,11 @@ impl App {
         let git = repo.git.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(git.sync());
+            let result = match target {
+                Some(target) => git.sync_confirmed(&target),
+                None => git.sync(),
+            };
+            let _ = tx.send(result);
         });
         self.syncing = Some((index, rx));
     }
