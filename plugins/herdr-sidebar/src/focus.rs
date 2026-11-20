@@ -101,9 +101,13 @@ fn pane_reply(response: &str) -> Option<launch::Pane> {
     Some(reply.result.pane)
 }
 
-fn current_focus() -> std::io::Result<Option<Focus>> {
+pub(crate) fn current_pane() -> std::io::Result<Option<launch::Pane>> {
     let reply = ipc::call_text("pane.current", json!({}))?;
-    Ok(pane_reply(&reply).as_ref().and_then(Focus::from_pane))
+    Ok(pane_reply(&reply))
+}
+
+fn current_focus() -> std::io::Result<Option<Focus>> {
+    Ok(current_pane()?.as_ref().and_then(Focus::from_pane))
 }
 
 /// Herdr starts hooks on separate threads and provides no event sequence, so

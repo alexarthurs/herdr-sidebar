@@ -413,26 +413,63 @@ trait ReapHost {
     fn close(&mut self, pane: &str) -> Result<(), String>;
 }
 
-/// Close every tab left holding only sidebars (issue #108). Closing a tab's
-/// last pane closes the tab, so each sidebar is simply asked to close
-/// itself; nothing waits for that, and the `pane.closed` its own close emits
-/// re-runs this cheaply over a snapshot that no longer has the tab. Returns
-/// how many sidebars were asked.
-fn reap_with(host: &mut impl ReapHost, now: u64) -> Result<usize, String> {
-    let lonely = launch::lonely_sidebar_tabs(&host.list()?, now);
+#[derive(Debug, PartialEq, Eq)]
+enum ReapScope {
+    Tab(String),
+    Workspace(String),
+}
+
+impl ReapScope {
+    fn from_event(event: &str, context_tab: &str) -> Option<Self> {
+        let scope = launch::event_scope(event);
+        match launch::event_kind(event).as_str() {
+            "pane_exited" => {
+                let tab = launch::event_scope_with_tab_context(event, "", context_tab);
+                tab.contains(':').then_some(Self::Tab(tab))
+            }
+            "pane_closed" if !scope.is_empty() && !scope.contains(':') => {
+                Some(Self::Workspace(scope))
+            }
+            _ => None,
+        }
+    }
+
+    fn contains(&self, tab: &str) -> bool {
+        match self {
+            Self::Tab(id) => tab == id,
+            Self::Workspace(id) => tab.split_once(':').is_some_and(|(ws, _)| ws == id),
+        }
+    }
+}
+
+/// Ask sidebars in the removal scope to close. Closing the last pane closes
+/// the tab; nothing waits for a running sidebar to acknowledge Ctrl+Q.
+fn reap_with(host: &mut impl ReapHost, scope: &ReapScope) -> Result<usize, String> {
+    let lonely: Vec<_> = launch::lonely_sidebar_tabs(&host.list()?)
+        .into_iter()
+        .filter(|tab| scope.contains(&tab.tab))
+        .collect();
     if lonely.is_empty() {
         return Ok(0);
     }
     let journaled = host.journaled_tabs();
     let mut asked = 0;
     for tab in lonely.iter().filter(|tab| !journaled.contains(&tab.tab)) {
-        for (pane, how) in &tab.panes {
+        for (pane, _) in &tab.panes {
+            // A shell could have arrived, or a starting pane could have
+            // become a live TUI since the candidate snapshot.
+            let current = launch::lonely_sidebar_tabs(&host.list()?);
+            let Some((_, how)) = current
+                .iter()
+                .find(|candidate| candidate.tab == tab.tab)
+                .and_then(|candidate| candidate.panes.iter().find(|(id, _)| id == pane))
+            else {
+                continue;
+            };
             let result = match how {
                 launch::ReapClose::Graceful => host.request_close(pane),
                 launch::ReapClose::Direct => host.close(pane),
             };
-            // A pane that vanished in the meantime (it closed itself after
-            // an earlier event) is not an error worth reporting.
             if result.is_ok() {
                 asked += 1;
             }
@@ -469,13 +506,18 @@ impl ReapHost for LiveReap {
 /// Holding the lock also means it never sees a tab our own launch, refresh
 /// or takeover is in the middle of rearranging.
 fn reap() -> std::io::Result<()> {
+    let event = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
+    let context_tab = std::env::var("HERDR_TAB_ID").unwrap_or_default();
+    let Some(scope) = ReapScope::from_event(&event, &context_tab) else {
+        return Ok(());
+    };
     if !crate::state::load_state().close_lonely_tab {
         return Ok(());
     }
     let Some(_lock) = LaunchLock::acquire(true) else {
         return Ok(());
     };
-    reap_with(&mut LiveReap, crate::state::unix_now())
+    reap_with(&mut LiveReap, &scope)
         .map(drop)
         .map_err(std::io::Error::other)
 }
@@ -881,19 +923,18 @@ fn focused_pane_id(panes_json: &str) -> String {
 }
 
 fn creation_focus_repair(
-    panes_before: &str,
-    panes_after: &str,
+    before: &str,
+    current_pane: Option<&str>,
     new_sidebar: &str,
     displaced_by_swap: Option<&str>,
 ) -> Option<String> {
-    if focused_pane_id(panes_after) != new_sidebar {
+    if current_pane != Some(new_sidebar) {
         return None;
     }
-    let before = focused_pane_id(panes_before);
     let previous = if before.is_empty() {
         displaced_by_swap.unwrap_or_default().to_string()
     } else {
-        before
+        before.to_string()
     };
     (!previous.is_empty() && previous != new_sidebar).then_some(previous)
 }
@@ -1052,14 +1093,17 @@ fn open(
         // land while this hook is docking (notably a preview tab's explicit
         // focus transition). Re-read and repair only when the layout operation
         // itself left focus on the new sidebar pane; otherwise do nothing.
-        if let Ok(after) = ipc::call_text("pane.list", serde_json::json!({}))
-            && let Some(previous) = creation_focus_repair(
-                focus_before_layout.as_deref().unwrap_or(panes_json),
-                &after,
-                &new_pane,
-                needs_swap.then_some(target.as_str()),
-            )
-        {
+        let before = focus_before_layout.as_deref().unwrap_or(panes_json);
+        let previous = focused_pane_id(before);
+        let current = crate::focus::current_pane().ok().flatten();
+        if let Some(previous) = creation_focus_repair(
+            &previous,
+            current.as_ref().and_then(|pane| pane.pane_id.as_deref()),
+            &new_pane,
+            needs_swap.then_some(target.as_str()),
+        ) {
+            // Herdr has no conditional focus request. Navigation between
+            // pane.current and pane.focus can still win the check and lose focus.
             focus(&previous)?;
         }
     } else {
@@ -1460,7 +1504,7 @@ mod tests {
         host.pane("young", "w1:t5", "Source Control", young);
         host.pane("corpse", "w1:t6", "Explorer", serde_json::json!({}));
 
-        assert_eq!(reap_with(&mut host, REAP_NOW), Ok(3));
+        assert_eq!(reap_with(&mut host, &ReapScope::Workspace("w1".into())), Ok(3));
         assert_eq!(host.asked, vec!["alone"], "a live TUI only gets Ctrl+Q");
         assert_eq!(host.closed, vec!["young", "corpse"], "no TUI state yet");
         for kept in ["busy", "shell", "previewing", "viewer", "parked"] {
@@ -1471,7 +1515,7 @@ mod tests {
         // nothing lonely left it does nothing, so it can never loop.
         host.asked.clear();
         host.closed.clear();
-        assert_eq!(reap_with(&mut host, REAP_NOW), Ok(0));
+        assert_eq!(reap_with(&mut host, &ReapScope::Workspace("w1".into())), Ok(0));
         assert!(host.asked.is_empty() && host.closed.is_empty());
     }
 
@@ -1481,7 +1525,7 @@ mod tests {
     #[test]
     fn reap_asks_every_sidebar_of_a_separated_pair_and_never_kills_a_draft() {
         let mut host = FakeReap::default();
-        let now = REAP_NOW.to_string();
+        let now = "1";
         host.pane(
             "explorer",
             "w1:t1",
@@ -1495,13 +1539,32 @@ mod tests {
             serde_json::json!({ launch::SC_METADATA_SOURCE: now }),
         );
         host.keeps.push("git".into());
-        assert_eq!(reap_with(&mut host, REAP_NOW), Ok(2));
+        assert_eq!(reap_with(&mut host, &ReapScope::Workspace("w1".into())), Ok(2));
         assert_eq!(host.asked, vec!["explorer", "git"]);
         assert!(host.closed.is_empty());
         assert!(host.has("git") && !host.has("explorer"));
-        assert_eq!(reap_with(&mut host, REAP_NOW), Ok(1));
+        assert_eq!(reap_with(&mut host, &ReapScope::Workspace("w1".into())), Ok(1));
         assert!(host.has("git"), "an unsaved draft is never hard-closed");
         assert!(host.closed.is_empty());
+    }
+
+    #[test]
+    fn reap_uses_exit_tab_and_close_workspace_without_global_fallback() {
+        let exit = r#"{"event":"pane.exited","data":{"pane_id":"w1:p9","workspace_id":"w1"}}"#;
+        let close = r#"{"event":"pane.closed","data":{"pane_id":"w1:p9","workspace_id":"w1"}}"#;
+        let mut host = FakeReap::default();
+        host.pane("exit", "w1:t1", "Explorer", live_sidebar());
+        host.pane("other-tab", "w1:t2", "Explorer", live_sidebar());
+        host.pane("other-workspace", "w2:t1", "Explorer", live_sidebar());
+
+        assert_eq!(ReapScope::from_event(exit, "w2:t1"), None);
+        assert_eq!(ReapScope::from_event("", "w1:t1"), None);
+        let scope = ReapScope::from_event(exit, "w1:t1").unwrap();
+        assert_eq!(reap_with(&mut host, &scope), Ok(1));
+        assert!(host.has("other-tab") && host.has("other-workspace"));
+        let scope = ReapScope::from_event(close, "w2:t1").unwrap();
+        assert_eq!(reap_with(&mut host, &scope), Ok(1));
+        assert!(host.has("other-workspace"));
     }
 
     #[test]
@@ -1547,29 +1610,22 @@ mod tests {
         let (scoped_pane, _) = scoped.split_once('\t').unwrap();
         assert_eq!(scoped_pane, "w2:p1", "the dock still roots in the new tab");
 
-        let sidebar_stole_focus = r#"{"result":{"panes":[
-            {"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","focused":false},
-            {"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","focused":false},
-            {"pane_id":"w2:p2","tab_id":"w2:t1","workspace_id":"w2","focused":true}
-        ]}}"#;
+        let before = focused_pane_id(before);
+        let sidebar_stole_focus = Some("w2:p2");
         assert_eq!(
-            creation_focus_repair(before, sidebar_stole_focus, "w2:p2", None).as_deref(),
+            creation_focus_repair(&before, sidebar_stole_focus, "w2:p2", None).as_deref(),
             Some("w1:p1")
         );
 
-        let intended_preview_focus = r#"{"result":{"panes":[
-            {"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","focused":false},
-            {"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","focused":true},
-            {"pane_id":"w2:p2","tab_id":"w2:t1","workspace_id":"w2","focused":false}
-        ]}}"#;
+        let intended_preview_focus = Some("w2:p1");
         assert_eq!(
-            creation_focus_repair(before, intended_preview_focus, "w2:p2", Some("w2:p1")),
+            creation_focus_repair(&before, intended_preview_focus, "w2:p2", Some("w2:p1")),
             None,
             "a concurrent intended focus must never be snapped back"
         );
 
         assert_eq!(
-            creation_focus_repair(before, sidebar_stole_focus, "w2:p2", Some("w2:p1")).as_deref(),
+            creation_focus_repair(&before, sidebar_stole_focus, "w2:p2", Some("w2:p1")).as_deref(),
             Some("w1:p1"),
             "a background worktree's sidebar must not switch away from the original workspace"
         );
@@ -1579,7 +1635,7 @@ mod tests {
             {"pane_id":"w2:p3","tab_id":"w2:t1","workspace_id":"w2","focused":false}
         ]}}"#;
         assert_eq!(
-            creation_focus_repair(same_tab_before, sidebar_stole_focus, "w2:p2", Some("w2:p1"))
+            creation_focus_repair(&focused_pane_id(same_tab_before), sidebar_stole_focus, "w2:p2", Some("w2:p1"))
                 .as_deref(),
             Some("w2:p1"),
             "a dock in the focused tab restores its original pane"
@@ -1588,7 +1644,7 @@ mod tests {
             {"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","focused":false}
         ]}}"#;
         assert_eq!(
-            creation_focus_repair(no_prior_focus, sidebar_stole_focus, "w2:p2", Some("w2:p1"))
+            creation_focus_repair(&focused_pane_id(no_prior_focus), sidebar_stole_focus, "w2:p2", Some("w2:p1"))
                 .as_deref(),
             Some("w2:p1"),
             "without a recorded prior focus, restore the displaced pane"

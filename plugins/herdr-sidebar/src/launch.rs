@@ -486,7 +486,7 @@ pub enum ReapClose {
     /// A live TUI: Ctrl+Q, so it saves its drafts and closes its own pane.
     Graceful,
     /// No TUI state can exist (still starting, a label-only server-resume
-    /// corpse, or a stale heartbeat the launcher would REPLACE anyway):
+    /// corpse):
     /// `pane.close` directly, since nothing would answer Ctrl+Q.
     Direct,
 }
@@ -504,7 +504,7 @@ pub struct LonelyTab {
 /// server-resume corpse). Anything else in the tab — a shell, an agent, a
 /// preview / editor viewer (which may hold unsaved edits), an unidentifiable
 /// pane — keeps the whole tab. Unparsable input yields nothing.
-pub fn lonely_sidebar_tabs(pane_list_json: &str, now: u64) -> Vec<LonelyTab> {
+pub fn lonely_sidebar_tabs(pane_list_json: &str) -> Vec<LonelyTab> {
     let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
         return Vec::new();
     };
@@ -517,7 +517,7 @@ pub fn lonely_sidebar_tabs(pane_list_json: &str, now: u64) -> Vec<LonelyTab> {
         let entry = tabs
             .entry(tab.to_string())
             .or_insert_with(|| Some(Vec::new()));
-        match (pane.reap_close(now), pane.pane_id.as_deref()) {
+        match (pane.reap_close(), pane.pane_id.as_deref()) {
             (Some(how), Some(id)) if is_flag_safe(id) => {
                 if let Some(sidebars) = entry {
                     sidebars.push((id.to_string(), how));
@@ -536,7 +536,7 @@ pub fn lonely_sidebar_tabs(pane_list_json: &str, now: u64) -> Vec<LonelyTab> {
 
 impl Pane {
     /// `Some` when this pane is one of our sidebars, saying how to close it.
-    fn reap_close(&self, now: u64) -> Option<ReapClose> {
+    fn reap_close(&self) -> Option<ReapClose> {
         // A cleared token is reported as null; never read one as present,
         // or a cleared starting marker would hard-close a live draft.
         let has = |key: &str| self.tokens.get(key).is_some_and(|value| !value.is_null());
@@ -545,22 +545,18 @@ impl Pane {
         if viewer {
             return None;
         }
-        let explorer = has(METADATA_SOURCE);
-        let git = has(SC_METADATA_SOURCE);
-        if !explorer && !git {
-            let ours = matches!(
-                self.label.as_deref(),
-                Some(PANE_LABEL | SIDEBAR_LABEL | SC_PANE_LABEL)
-            );
-            return ours.then_some(ReapClose::Direct);
+        if has(STARTING_TOKEN) {
+            return Some(ReapClose::Direct);
         }
-        let stale = (explorer && token_stale(&self.tokens, METADATA_SOURCE, now))
-            || (git && token_stale(&self.tokens, SC_METADATA_SOURCE, now));
-        if has(STARTING_TOKEN) || stale {
-            Some(ReapClose::Direct)
-        } else {
-            Some(ReapClose::Graceful)
+        if has(METADATA_SOURCE) || has(SC_METADATA_SOURCE) {
+            return Some(ReapClose::Graceful);
         }
+        let ours = matches!(
+            self.label.as_deref(),
+            Some(PANE_LABEL | SIDEBAR_LABEL | SC_PANE_LABEL)
+        );
+        (ours && self.tokens.values().all(serde_json::Value::is_null))
+            .then_some(ReapClose::Direct)
     }
 }
 
@@ -2079,10 +2075,11 @@ mod tests {
             {{"pane_id":"w1:pg","tab_id":"w1:custom-editor","label":"vim","tokens":{{"hs-editor-path":"abc"}}}},
             {{"pane_id":"--x","tab_id":"w1:unsafe","tokens":{{"herdr-sidebar-explorer":"{live}"}}}},
             {{"pane_id":"w1:ph","tab_id":"w1:unsafe","tokens":{{"herdr-sidebar-explorer":"{live}"}}}},
-            {{"pane_id":"w1:pi","label":"Sidebar"}}
+            {{"pane_id":"w1:pi","label":"Sidebar"}},
+            {{"pane_id":"w1:pj","tab_id":"w1:foreign","label":"Sidebar","tokens":{{"foreign":"1"}}}}
         ]}}}}"#
         );
-        let lonely = lonely_sidebar_tabs(&json, now);
+        let lonely = lonely_sidebar_tabs(&json);
         let tab = |id: &str, panes: &[(&str, ReapClose)]| LonelyTab {
             tab: id.into(),
             panes: panes.iter().map(|(p, how)| (p.to_string(), *how)).collect(),
@@ -2092,12 +2089,12 @@ mod tests {
             lonely,
             vec![
                 tab("w1:alone", &[("w1:p3", Graceful)]),
-                tab("w1:corpses", &[("w1:pb", Direct), ("w1:pc", Direct)]),
+                tab("w1:corpses", &[("w1:pb", Direct), ("w1:pc", Graceful)]),
                 tab("w1:pair", &[("w1:p8", Graceful), ("w1:p9", Graceful)]),
                 tab("w1:young", &[("w1:pa", Direct)]),
             ]
         );
-        assert!(lonely_sidebar_tabs("not json", now).is_empty());
-        assert!(lonely_sidebar_tabs(r#"{"error":{"code":"x"}}"#, now).is_empty());
+        assert!(lonely_sidebar_tabs("not json").is_empty());
+        assert!(lonely_sidebar_tabs(r#"{"error":{"code":"x"}}"#).is_empty());
     }
 }

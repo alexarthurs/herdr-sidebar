@@ -222,9 +222,11 @@ executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launch
   persisted session — all workspaces and panes respawn. Handy for exercising plugin hooks
   from a script; test in throwaway workspaces and close them after.
 - Creation hooks dock into their event scope even when `workspace create --no-focus` or
-  `tab create --no-focus` targets the background. After docking they re-read `pane.list` and
-  restore the previously focused pane only if the split/swap itself focused the new sidebar;
-  a concurrent intended focus transition must win.
+  `tab create --no-focus` targets the background. After docking they recheck focus and
+  restore the previously focused pane only if the split/swap itself focused the new sidebar.
+  Creation repair reads the cheap `pane.current` after layout changes and immediately before
+  `pane.focus`. Herdr has no conditional focus operation, so navigation between those two
+  requests can still be overwritten (#121).
 - Drive the live TUI for verification with `pane send-keys <id> s` (⚙ Settings) etc., then
   `pane read <id> --source visible` to assert on the rendered modal.
 
@@ -679,21 +681,24 @@ HACKING.md — budget time for that before promising a patched build.
   - It takes the shared `LaunchLock` BLOCKING (a discrete event; a skipped reap would wait for
     some unrelated pane to close). Holding it also hides every transient layout of our own
     launch / refresh / takeover / unified-toggle flows, which all mutate under that lock.
-  - `launch::lonely_sidebar_tabs` scans EVERY tab (`pane.closed` has no tab) and picks tabs
-    whose every pane is a sidebar: an Explorer / Source Control token, or one of our labels
+  - Reap uses the exiting pane's tab from the hook context for `pane.exited`. For
+    `pane.closed`, Herdr has already removed the pane, so reap is limited to the event's
+    workspace. An event without a usable scope does nothing. Reap re-lists before each
+    request to verify the tab is still sidebar-only and the pane's close policy still applies.
+    Each remaining pane must be a sidebar: an Explorer / Source Control token, or one of our labels
     without one. Any other pane — shell, agent, preview / editor viewer (token or label),
     an id that is not flag-safe — keeps the tab. Null token values count as absent.
   - Live TUIs get Ctrl+Q only (save drafts, close own pane, no snooze marker); a draft that
     cannot be saved keeps the pane open with its notice, and nothing waits for or kills it.
     Only panes that cannot hold TUI state are `pane.close`d directly: `herdr-sidebar-starting`,
-    label-only server-resume corpses, and stale heartbeats (the same corpses ensure REPLACEs).
+    and label-only server-resume corpses with no tokens. A stale or malformed sidebar
+    heartbeat still gets Ctrl+Q. A blocked TUI may have an unsaved draft.
   - Tabs named by a THIS-session (or session-less legacy) takeover journal — previewed tab
     and parking tab — are skipped (`takeover::journaled_tabs`); the restore owns them. After an
     abandoned restore the journal is gone, so a previewed tab left with only its sidebar is
     reaped like any other.
   - Idempotent and cheap: each self-close emits `pane.closed`, which re-runs the reap over a
-    snapshot without that tab (one `pane.list`, plus a journal-dir read only when something is
-    lonely). Refresh / redeploy close sidebars only in tabs that keep other panes, so they never
+    snapshot without that pane (a journal-dir read is needed only when a scoped tab is lonely). Refresh / redeploy close sidebars only in tabs that keep other panes, so they never
     create a lonely tab; refresh's "sidebar is the tab's only pane" report now mostly concerns
     users who turned the setting off.
 - Every Settings action uses `state::update_state`, a lock-protected read-modify-write.
