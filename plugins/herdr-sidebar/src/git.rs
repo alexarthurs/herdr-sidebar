@@ -466,7 +466,13 @@ impl Git {
         let n = format!("-{limit}");
         lines(run_drawer(
             &self.root,
-            &["log", "--graph", "--oneline", "--decorate=short", &n],
+            &[
+                "log",
+                "--graph",
+                "--format=%H%x09%h%d %s",
+                "--decorate=short",
+                &n,
+            ],
         )?)
     }
 
@@ -474,7 +480,13 @@ impl Git {
         let n = format!("-{limit}");
         lines(run_drawer(
             &self.root,
-            &["log", "--oneline", "--decorate=short", "--date=short", &n],
+            &[
+                "log",
+                "--format=%H%x09%h%d %s",
+                "--decorate=short",
+                "--date=short",
+                &n,
+            ],
         )?)
     }
 
@@ -482,7 +494,7 @@ impl Git {
         let n = format!("-{limit}");
         lines(run_drawer(
             &self.root,
-            &["log", "--oneline", "--follow", &n, "--", path],
+            &["log", "--format=%H%x09%h %s", "--follow", &n, "--", path],
         )?)
     }
 
@@ -639,7 +651,17 @@ impl Git {
     }
 
     pub fn stashes(&self) -> Result<Vec<String>, String> {
-        lines(run_drawer(&self.root, &["stash", "list"])?)
+        lines(run_drawer(
+            &self.root,
+            &["stash", "list", "--format=%gd%x09%H%x09%gs"],
+        )?)
+    }
+
+    pub fn stash_selector(&self, object: &str) -> Result<String, String> {
+        let list = run_drawer(&self.root, &["stash", "list", "--format=%gd%x09%H"])?;
+        stash_selector(&list, object)
+            .map(str::to_owned)
+            .ok_or_else(|| "The selected stash no longer exists.".to_string())
     }
 
     pub fn tags(&self) -> Result<Vec<String>, String> {
@@ -657,6 +679,13 @@ impl Git {
     pub fn raw(&self, args: &[&str]) -> Result<String, String> {
         run_in(&self.root, args)
     }
+}
+
+fn stash_selector<'a>(list: &'a str, object: &str) -> Option<&'a str> {
+    list.lines().find_map(|line| {
+        let (selector, id) = line.split_once('\t')?;
+        (id == object).then_some(selector)
+    })
 }
 
 fn lines(out: String) -> Result<Vec<String>, String> {
@@ -1240,6 +1269,14 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn stash_selector_follows_the_object_after_insertion_and_refuses_removed_objects() {
+        let list = "stash@{0}\tnew\nstash@{1}\tselected\nstash@{2}\tolder\n";
+        assert_eq!(stash_selector(list, "selected"), Some("stash@{1}"));
+        assert_eq!(stash_selector(list, "removed"), None);
+        assert_eq!(stash_selector(list, "select"), None);
     }
 
     #[test]

@@ -929,8 +929,12 @@ HACKING.md — budget time for that before promising a patched build.
   rows (`Row::selectable()`). The ✧ suggest / S sync keys act on the ACTIVE repo — the one
   the selection is in (named in the panel header).
 - **Git drawers** (title-case names, incl. Worktrees): drawer lines carry parsed
-  refs (`DrawerRef` — commit hash / stash index / branch / remote / tag / worktree path,
-  see `parse_drawer_ref`). Click or ⏎ shows the ref
+  refs (`DrawerRef` — full commit or stash object ID / branch / remote / tag / worktree
+  path, see `parse_drawer_ref`). An open menu keeps its repository root, ref and
+  file-history path even when status replaces the rows. Confirmation keeps the same
+  root. Stash apply/pop/drop look up the current selector by object ID immediately
+  before invoking Git, including after y/N, and refuse a missing stash. Git has no
+  atomic selector check and mutation. Click or ⏎ shows the ref
   via colored `git show --stat --patch` in the SAME preview pane (`show/<root>/<spec>[/<path>]`
   control requests; FILE HISTORY narrows to the followed file). Ctrl+right-click opens
   per-type menus (checkout / merge / cherry-pick / revert / reset / stash apply-pop-drop /

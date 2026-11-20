@@ -145,6 +145,10 @@ impl DrawerPanel {
         let lines: Vec<String> = match kind {
             Drawer::Worktrees => raw.iter().map(|l| pretty_worktree_line(l)).collect(),
             Drawer::Remotes => raw.iter().map(|l| pretty_remote_line(l)).collect(),
+            Drawer::Graph | Drawer::Commits | Drawer::FileHistory | Drawer::Stashes => raw
+                .iter()
+                .map(|line| display_drawer_object(kind, line))
+                .collect(),
             _ => raw,
         };
         if lines == self.lines && refs == self.refs {
@@ -183,10 +187,10 @@ fn load_drawer(
 enum DrawerRef {
     #[default]
     None,
-    /// A short commit hash (GRAPH / COMMITS / FILE HISTORY lines).
+    /// A full commit object ID (GRAPH / COMMITS / FILE HISTORY lines).
     Commit(String),
-    /// `stash@{n}`.
-    Stash(usize),
+    /// A full stash object ID, independent of its reflog position.
+    Stash(String),
     Branch {
         name: String,
         current: bool,
@@ -252,18 +256,33 @@ fn pretty_remote_url(url: &str) -> String {
         .to_string()
 }
 
+fn display_drawer_object(kind: Drawer, line: &str) -> String {
+    let Some((head, rest)) = line.split_once('\t') else {
+        return line.to_owned();
+    };
+    if kind == Drawer::Stashes {
+        return match rest.split_once('\t') {
+            Some((_, subject)) => format!("{head}: {subject}"),
+            None => line.to_owned(),
+        };
+    }
+    let prefix_end = head.rfind(' ').map_or(0, |i| i + 1);
+    format!("{}{rest}", &head[..prefix_end])
+}
+
+fn object_id(text: &str) -> Option<String> {
+    (matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| text.to_owned())
+}
+
 fn parse_drawer_ref(kind: Drawer, line: &str) -> DrawerRef {
     match kind {
         Drawer::Graph | Drawer::Commits | Drawer::FileHistory => line
-            .split_whitespace()
-            .find(|tok| {
-                tok.len() >= 7
-                    && tok
-                        .chars()
-                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-            })
-            .map(|h| DrawerRef::Commit(h.to_string()))
-            .unwrap_or(DrawerRef::None),
+            .split_once('\t')
+            .and_then(|(head, _)| head.split_whitespace().next_back())
+            .and_then(object_id)
+            .map(DrawerRef::Commit)
+            .unwrap_or_default(),
         Drawer::Branches => {
             let current = line.starts_with('*');
             let name = line.trim_start_matches('*').trim().to_string();
@@ -293,10 +312,11 @@ fn parse_drawer_ref(kind: Drawer, line: &str) -> DrawerRef {
         }
         Drawer::Stashes => line
             .strip_prefix("stash@{")
-            .and_then(|rest| rest.split('}').next())
-            .and_then(|n| n.parse::<usize>().ok())
+            .and_then(|rest| rest.split_once("}\t"))
+            .and_then(|(_, rest)| rest.split_once('\t'))
+            .and_then(|(object, _)| object_id(object))
             .map(DrawerRef::Stash)
-            .unwrap_or(DrawerRef::None),
+            .unwrap_or_default(),
         Drawer::Tags => {
             let name = line.trim().to_string();
             if name.is_empty() || name.starts_with('(') {
@@ -312,8 +332,7 @@ fn parse_drawer_ref(kind: Drawer, line: &str) -> DrawerRef {
 /// a selection across tabs. `None` for blank graph-edge rows.
 fn drawer_spec(dref: &DrawerRef) -> Option<String> {
     match dref {
-        DrawerRef::Commit(h) => Some(h.clone()),
-        DrawerRef::Stash(n) => Some(format!("stash@{{{n}}}")),
+        DrawerRef::Commit(h) | DrawerRef::Stash(h) => Some(h.clone()),
         DrawerRef::Branch { name, .. } => Some(name.clone()),
         DrawerRef::Tag(t) => Some(t.clone()),
         DrawerRef::Remote { name, .. } => Some(name.clone()),
@@ -867,10 +886,25 @@ enum MenuTarget {
         entry: FileEntry,
         staged: bool,
     },
-    Drawer {
-        kind: Drawer,
-        index: usize,
-    },
+    Drawer(DrawerTarget),
+}
+
+#[derive(Clone)]
+struct DrawerTarget {
+    root: PathBuf,
+    reference: DrawerRef,
+    path: Option<String>,
+}
+
+impl DrawerTarget {
+    fn capture(root: &Path, panel: &DrawerPanel, index: usize, path: Option<&str>) -> Option<Self> {
+        let reference = panel.refs.get(index)?;
+        (*reference != DrawerRef::None).then(|| Self {
+            root: root.to_path_buf(),
+            reference: reference.clone(),
+            path: path.map(str::to_owned),
+        })
+    }
 }
 
 /// Context-menu actions for file rows and drawer lines.
@@ -951,6 +985,15 @@ enum MenuEntry {
     Separator,
 }
 
+#[derive(Clone)]
+enum ConfirmedGit {
+    Args(Vec<String>),
+    Stash {
+        subcommand: &'static str,
+        object: String,
+    },
+}
+
 /// A modal layered over the list; while open it owns keyboard and mouse input.
 enum Overlay {
     BranchPicker(BranchPicker),
@@ -971,9 +1014,9 @@ enum Overlay {
     },
     /// A y/N prompt guarding a destructive git command (reset, delete, drop).
     ConfirmGit {
-        repo: usize,
+        root: PathBuf,
         prompt: String,
-        args: Vec<String>,
+        command: ConfirmedGit,
     },
     /// The opt-in y/N before Sync (`confirm_git_ops`). Sync runs on a
     /// background worker rather than through `run_git`, so it is not an argv.
@@ -2508,10 +2551,10 @@ impl App {
 
     /// The context menu for a commit / branch / stash / remote / tag.
     fn open_drawer_menu(&mut self, x: u16, y: u16, kind: Drawer, index: usize) {
-        let Some(dref) = self.drawers[kind.index()].refs.get(index) else {
+        let Some(target) = self.drawer_target(kind, index) else {
             return;
         };
-        let entries: Vec<MenuEntry> = match dref {
+        let entries: Vec<MenuEntry> = match &target.reference {
             DrawerRef::Commit(_) => vec![
                 MenuEntry::Action(MenuAction::ShowRef, "Show Changes"),
                 MenuEntry::Separator,
@@ -2565,7 +2608,7 @@ impl App {
         self.overlay = Some(Overlay::Menu {
             x,
             y,
-            target: MenuTarget::Drawer { kind, index },
+            target: MenuTarget::Drawer(target),
             entries,
             selected: 0,
             rect: Rect::default(),
@@ -2582,7 +2625,7 @@ impl App {
             AdjustAutoHide(bool),
             DiscardConfirmed(usize, FileEntry),
             DiscardAllConfirmed(usize),
-            GitConfirmed(usize, Vec<String>),
+            GitConfirmed(PathBuf, ConfirmedGit),
             SyncConfirmed(usize, SyncTarget),
             Picker(PickerAction),
         }
@@ -2648,8 +2691,10 @@ impl App {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Cmd::DiscardAllConfirmed(*repo),
                 _ => Cmd::Close,
             },
-            Some(Overlay::ConfirmGit { repo, args, .. }) => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => Cmd::GitConfirmed(*repo, args.clone()),
+            Some(Overlay::ConfirmGit { root, command, .. }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    Cmd::GitConfirmed(root.clone(), command.clone())
+                }
                 _ => Cmd::Close,
             },
             Some(Overlay::ConfirmSync { repo, target, .. }) => match key.code {
@@ -2667,13 +2712,21 @@ impl App {
             Cmd::ToggleSetting(index) => self.toggle_setting(index),
             Cmd::AdjustWidth(wider) => self.adjust_sidebar_width(wider),
             Cmd::AdjustAutoHide(wider) => self.adjust_auto_hide_below(wider),
-            Cmd::GitConfirmed(repo, args) => {
+            Cmd::GitConfirmed(root, command) => {
                 self.overlay = None;
-                match safe_branch_delete(&args) {
-                    Some(branch) => self.delete_branch(repo, branch.to_string()),
-                    None => {
-                        let strs: Vec<&str> = args.iter().map(String::as_str).collect();
-                        self.run_git(repo, &strs);
+                let Some(repo) = self.repo_index(&root) else {
+                    return;
+                };
+                match command {
+                    ConfirmedGit::Args(args) => match safe_branch_delete(&args) {
+                        Some(branch) => self.delete_branch(repo, branch.to_string()),
+                        None => {
+                            let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+                            self.run_git(repo, &strs);
+                        }
+                    },
+                    ConfirmedGit::Stash { subcommand, object } => {
+                        self.run_stash(repo, subcommand, &object);
                     }
                 }
             }
@@ -3300,7 +3353,7 @@ impl App {
                 entry,
                 staged,
             } => self.file_menu_action(action, repo, entry, staged),
-            MenuTarget::Drawer { kind, index } => self.drawer_menu_action(action, kind, index),
+            MenuTarget::Drawer(target) => self.drawer_menu_action(action, target),
             MenuTarget::Dir { repo, path, staged } => {
                 self.dir_menu_action(action, repo, path, staged)
             }
@@ -3460,19 +3513,17 @@ impl App {
         }
     }
 
-    fn drawer_menu_action(&mut self, action: MenuAction, kind: Drawer, index: usize) {
-        let Some(dref) = self.drawers[kind.index()].refs.get(index).cloned() else {
+    fn drawer_menu_action(&mut self, action: MenuAction, target: DrawerTarget) {
+        if action == MenuAction::ShowRef {
+            self.show_drawer_target(&target);
+            return;
+        }
+        let Some(repo) = self.repo_index(&target.root) else {
             return;
         };
-        let repo = self.active;
-        let spec = match &dref {
-            DrawerRef::Commit(h) => h.clone(),
-            DrawerRef::Stash(n) => format!("stash@{{{n}}}"),
-            DrawerRef::Branch { name, .. } => name.clone(),
-            DrawerRef::Remote { name, .. } => name.clone(),
-            DrawerRef::Tag(t) => t.clone(),
-            DrawerRef::Worktree(p) => p.clone(),
-            DrawerRef::None => return,
+        let dref = target.reference;
+        let Some(spec) = drawer_spec(&dref) else {
+            return;
         };
         let git_spec = drawer_git_spec(&dref).unwrap_or_else(|| spec.clone());
         let current = self
@@ -3481,7 +3532,6 @@ impl App {
             .map(|r| r.status.branch.clone())
             .unwrap_or_default();
         match action {
-            MenuAction::ShowRef => self.open_drawer_ref(kind, index),
             MenuAction::Reveal => reveal(std::path::Path::new(&spec), true),
             MenuAction::RemoveWorktree => self.confirm_git(
                 repo,
@@ -3533,16 +3583,16 @@ impl App {
                     git_args(&["revert", "--no-edit", "--", &git_spec]),
                 );
             }
-            MenuAction::StashApply => {
-                self.run_git_guarded(
-                    repo,
-                    GitOp::StashApply,
-                    git_args(&["stash", "apply", "--", &spec]),
-                );
-            }
+            MenuAction::StashApply => self.run_stash(repo, "apply", &spec),
             MenuAction::StashPop => {
-                let op = GitOp::StashPop { stash: &spec };
-                self.run_git_guarded(repo, op, git_args(&["stash", "pop", "--", &spec]));
+                let stash = format!("stash {}", &spec[..7]);
+                let op = GitOp::StashPop { stash: &stash };
+                if op.needs_confirm(self.sidebar_state.confirm_git_ops) {
+                    self.flash = None;
+                    self.confirm_stash(target.root, op.prompt(), "pop", spec);
+                } else {
+                    self.run_stash(repo, "pop", &spec);
+                }
             }
             MenuAction::FetchRemote => {
                 self.run_git_guarded(repo, GitOp::Fetch, git_args(&["fetch", "--", &spec]));
@@ -3557,10 +3607,11 @@ impl App {
                 format!("Delete branch '{spec}'? (y/N)"),
                 vec!["branch".into(), "-d".into(), "--".into(), spec],
             ),
-            MenuAction::StashDrop => self.confirm_git(
-                repo,
-                format!("Drop {spec}? (y/N)"),
-                vec!["stash".into(), "drop".into(), "--".into(), spec],
+            MenuAction::StashDrop => self.confirm_stash(
+                target.root,
+                format!("Drop stash {}? (y/N)", &spec[..7]),
+                "drop",
+                spec,
             ),
             MenuAction::DeleteTag => self.confirm_git(
                 repo,
@@ -3585,8 +3636,44 @@ impl App {
         self.request_refresh();
     }
 
+    fn repo_index(&mut self, root: &Path) -> Option<usize> {
+        let index = self.repos.iter().position(|repo| repo.git.root() == root);
+        if index.is_none() {
+            self.flash = Some(("repository is gone".into(), true));
+        }
+        index
+    }
+
+    fn run_stash(&mut self, repo: usize, subcommand: &str, object: &str) {
+        match self.repos[repo].git.stash_selector(object) {
+            Ok(selector) => self.run_git(repo, &["stash", subcommand, "--", &selector]),
+            Err(error) => {
+                self.flash = Some((error, true));
+                self.request_refresh();
+            }
+        }
+    }
+
     fn confirm_git(&mut self, repo: usize, prompt: String, args: Vec<String>) {
-        self.overlay = Some(Overlay::ConfirmGit { repo, prompt, args });
+        self.overlay = Some(Overlay::ConfirmGit {
+            root: self.repos[repo].git.root().to_path_buf(),
+            prompt,
+            command: ConfirmedGit::Args(args),
+        });
+    }
+
+    fn confirm_stash(
+        &mut self,
+        root: PathBuf,
+        prompt: String,
+        subcommand: &'static str,
+        object: String,
+    ) {
+        self.overlay = Some(Overlay::ConfirmGit {
+            root,
+            prompt,
+            command: ConfirmedGit::Stash { subcommand, object },
+        });
     }
 
     /// Run a one-click git op now, or behind the opt-in y/N
@@ -3670,30 +3757,35 @@ impl App {
         self.request_refresh();
     }
 
-    /// Click/⏎ on a drawer line: show the commit / stash / tag / branch tip
-    /// in the preview pane (scrollable colored `git show`).
+    fn drawer_target(&self, kind: Drawer, index: usize) -> Option<DrawerTarget> {
+        let repo = self.active_repo()?;
+        let path = if kind == Drawer::FileHistory {
+            self.history_target.as_deref()
+        } else {
+            None
+        };
+        DrawerTarget::capture(repo.git.root(), &self.drawers[kind.index()], index, path)
+    }
+
+    /// Click/⏎ on a drawer line: show the captured ref in the preview pane.
     fn open_drawer_ref(&mut self, kind: Drawer, index: usize) {
+        if let Some(target) = self.drawer_target(kind, index) {
+            self.show_drawer_target(&target);
+        }
+    }
+
+    fn show_drawer_target(&mut self, target: &DrawerTarget) {
         let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) else {
             self.flash = Some(("preview needs a herdr pane".into(), true));
             return;
         };
-        let Some(repo) = self.repos.get(self.active) else {
+        let Some(spec) = drawer_git_spec(&target.reference) else {
             return;
         };
-        let Some(spec) = self.drawers[kind.index()]
-            .refs
-            .get(index)
-            .and_then(drawer_git_spec)
-        else {
-            return;
-        };
-        let path = (kind == Drawer::FileHistory)
-            .then(|| self.history_target.clone())
-            .flatten();
-        let payload = herdr_sidebar::viewer::show_request(repo.git.root(), &spec, path.as_deref());
-        let doc_key =
-            herdr_sidebar::viewer::doc_key_for_show(repo.git.root(), &spec, path.as_deref());
-        match herdr_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &doc_key, &payload) {
+        let path = target.path.as_deref();
+        let payload = herdr_sidebar::viewer::show_request(&target.root, &spec, path);
+        let doc_key = herdr_sidebar::viewer::doc_key_for_show(&target.root, &spec, path);
+        match herdr_sidebar::viewer::open_in_pane(&pane_id, &target.root, &doc_key, &payload) {
             Ok(target) => {
                 self.last_preview = Some((doc_key, target));
             }
@@ -6313,8 +6405,11 @@ mod tests {
     #[test]
     fn drawer_lines_parse_into_actionable_refs() {
         assert_eq!(
-            parse_drawer_ref(Drawer::Commits, "a1b2c3d Add telemetry module"),
-            DrawerRef::Commit("a1b2c3d".into())
+            parse_drawer_ref(
+                Drawer::Commits,
+                "a1b2c3d000000000000000000000000000000000\ta1b2c3d Add telemetry module"
+            ),
+            DrawerRef::Commit("a1b2c3d000000000000000000000000000000000".into())
         );
         // Graph edge-only lines carry no commit; subject words never match
         // (uppercase or non-hex letters, or too short).
@@ -6322,9 +6417,9 @@ mod tests {
         assert_eq!(
             parse_drawer_ref(
                 Drawer::Graph,
-                "* deadbee (HEAD -> main) Added decoded fallback"
+                "* deadbee000000000000000000000000000000000\tdeadbee (HEAD -> main) Added decoded fallback"
             ),
-            DrawerRef::Commit("deadbee".into())
+            DrawerRef::Commit("deadbee000000000000000000000000000000000".into())
         );
         assert_eq!(
             parse_drawer_ref(Drawer::Branches, "* main"),
@@ -6341,8 +6436,11 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_drawer_ref(Drawer::Stashes, "stash@{2}: WIP on main: 1a2b3c4 x"),
-            DrawerRef::Stash(2)
+            parse_drawer_ref(
+                Drawer::Stashes,
+                "stash@{2}\tdeadbee000000000000000000000000000000000\tWIP on main: 1a2b3c4 x"
+            ),
+            DrawerRef::Stash("deadbee000000000000000000000000000000000".into())
         );
         assert_eq!(
             parse_drawer_ref(Drawer::Remotes, "origin  https://github.com/a/b.git"),
@@ -6364,6 +6462,28 @@ mod tests {
             parse_drawer_ref(Drawer::Worktrees, "(none)"),
             DrawerRef::None
         );
+    }
+
+    #[test]
+    fn drawer_target_survives_a_refresh_and_file_history_change() {
+        let mut panel = DrawerPanel::default();
+        let previous = "a1b2c3d000000000000000000000000000000000";
+        let newer = "deadbee000000000000000000000000000000000";
+        panel.fill(
+            Drawer::FileHistory,
+            Ok(vec![format!("{previous}\ta1b2c3d previous")]),
+        );
+        let target =
+            DrawerTarget::capture(Path::new("original"), &panel, 0, Some("old.rs")).unwrap();
+        assert_eq!(panel.lines, vec!["a1b2c3d previous"]);
+        panel.fill(
+            Drawer::FileHistory,
+            Ok(vec![format!("{newer}\tdeadbee newer")]),
+        );
+        assert_eq!(target.reference, DrawerRef::Commit(previous.into()));
+        assert_eq!(target.root, Path::new("original"));
+        assert_eq!(target.path.as_deref(), Some("old.rs"));
+        assert_eq!(panel.refs[0], DrawerRef::Commit(newer.into()));
     }
 
     #[test]
