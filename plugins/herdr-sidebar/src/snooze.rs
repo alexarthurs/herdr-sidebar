@@ -21,9 +21,14 @@ fn session_dir(root: &Path, session: &str) -> PathBuf {
     root.join(crate::viewer::document_token(session))
 }
 
-/// Create the per-session marker directory and its parent, both private.
+/// Create the per-session marker directory private, and its parent private
+/// too when we are the ones creating it. An existing parent is left alone:
+/// callers and tests may hand in a directory under a shared root such as
+/// `/tmp` (owned by root on Linux), which `ensure_private` would reject.
 fn ensure_dir(dir: &Path) -> std::io::Result<()> {
-    if let Some(parent) = dir.parent() {
+    if let Some(parent) = dir.parent()
+        && !parent.exists()
+    {
         crate::rundir::ensure_private(parent)?;
     }
     crate::rundir::ensure_private(dir)
