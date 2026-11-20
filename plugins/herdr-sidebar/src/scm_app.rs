@@ -571,6 +571,32 @@ fn flatten_scm_tree(
     }
 }
 
+#[derive(Default)]
+struct StatusFreshness {
+    generation: Option<u64>,
+    last_error: Option<String>,
+}
+
+impl StatusFreshness {
+    fn stale(&self, generation: u64) -> bool {
+        self.generation != Some(generation)
+    }
+
+    fn succeeded(&mut self, generation: u64) {
+        self.generation = Some(generation);
+        self.last_error = None;
+    }
+
+    fn failed(&mut self, error: String) -> Option<String> {
+        self.generation = None;
+        if self.last_error.as_ref() == Some(&error) {
+            return None;
+        }
+        self.last_error = Some(error.clone());
+        Some(error)
+    }
+}
+
 /// One discovered repository and its per-repo view state — including its own
 /// commit message, so the multi-repo view mirrors VS Code's per-repo inputs.
 struct Repo {
@@ -579,6 +605,7 @@ struct Repo {
     status: Status,
     /// A status read has landed; until then the view shows "loading…".
     loaded: bool,
+    freshness: StatusFreshness,
     collapsed: bool,
     staged_collapsed: bool,
     changes_collapsed: bool,
@@ -601,6 +628,7 @@ impl Repo {
             git,
             status: Status::default(),
             loaded: false,
+            freshness: StatusFreshness::default(),
             collapsed: false,
             staged_collapsed: false,
             changes_collapsed: false,
@@ -670,8 +698,6 @@ struct RefreshGate {
     running: Option<(u64, std::time::Instant)>,
     /// A read is wanted but has not started (one is still running).
     queued: bool,
-    /// The generation the displayed status reflects.
-    applied: Option<u64>,
     /// Earliest next periodic read: max([`STATUS_REFRESH_MIN`], 3x the last
     /// read's duration) after it returned, so a slow repo stays mostly idle.
     next_periodic: std::time::Instant,
@@ -683,7 +709,6 @@ impl RefreshGate {
             generation: 0,
             running: None,
             queued: false,
-            applied: None,
             next_periodic: now,
         }
     }
@@ -720,21 +745,11 @@ impl RefreshGate {
             return false;
         };
         self.next_periodic = now + STATUS_REFRESH_MIN.max(now.duration_since(started) * 3);
-        let current = generation == Some(self.generation);
-        if current {
-            self.applied = generation;
-        }
-        current
+        generation == Some(self.generation)
     }
 
     fn running(&self) -> bool {
         self.running.is_some()
-    }
-
-    /// The displayed status predates the last change (a git action ran and
-    /// its follow-up read has not landed yet).
-    fn stale(&self) -> bool {
-        self.applied != Some(self.generation)
     }
 }
 
@@ -803,6 +818,7 @@ fn reselect(
 /// status changed, and the last error.
 fn apply_repo_statuses(
     repos: &mut [Repo],
+    generation: u64,
     results: Vec<(PathBuf, Result<Status, String>)>,
 ) -> (bool, Option<String>) {
     let mut changed = false;
@@ -813,6 +829,7 @@ fn apply_repo_statuses(
         };
         match result {
             Ok(status) => {
+                repo.freshness.succeeded(generation);
                 if !repo.loaded || repo.status != status {
                     repo.status = status;
                     repo.loaded = true;
@@ -823,7 +840,9 @@ fn apply_repo_statuses(
                 // The read finished; its error is flashed, not "loading…".
                 changed |= !repo.loaded;
                 repo.loaded = true;
-                error = Some(e);
+                if let Some(first) = repo.freshness.failed(e) {
+                    error = Some(first);
+                }
             }
         }
     }
@@ -1569,8 +1588,14 @@ impl App {
             result.as_ref().map(|r| r.generation),
             std::time::Instant::now(),
         );
-        if let Some(result) = result.filter(|_| current) {
-            self.apply_status(result);
+        match result {
+            Some(result) if current => self.apply_status(result),
+            None => {
+                for repo in &mut self.repos {
+                    repo.freshness.generation = None;
+                }
+            }
+            _ => {}
         }
         self.start_status_read();
     }
@@ -1582,7 +1607,8 @@ impl App {
             Some(i) => self.row_stable_id(i),
             None => self.pending_restore.as_ref().and_then(|(id, _)| id.clone()),
         };
-        let (mut changed, error) = apply_repo_statuses(&mut self.repos, result.repos);
+        let (mut changed, error) =
+            apply_repo_statuses(&mut self.repos, result.generation, result.repos);
         if let Some(e) = error {
             self.flash = Some((e, true));
         }
@@ -4462,7 +4488,6 @@ impl App {
     fn commit_repo(&mut self, index: usize) {
         // Right after a stage the displayed status still predates it (the
         // follow-up read is in flight); let git decide instead of refusing.
-        let status_current = !self.status_gate.stale();
         let Some(repo) = self.repos.get_mut(index) else {
             return;
         };
@@ -4473,7 +4498,7 @@ impl App {
             self.focus = Focus::Message;
             return;
         }
-        if status_current && repo.status.staged.is_empty() {
+        if !repo.freshness.stale(self.status_gate.generation) && repo.status.staged.is_empty() {
             self.flash = Some(("No staged changes to commit.".to_string(), true));
             return;
         }
@@ -6110,7 +6135,6 @@ mod tests {
         let first = gate.start(t0).unwrap();
         // A git action lands while that read is in flight.
         gate.invalidate();
-        assert!(gate.stale());
         assert!(
             !gate.finish(Some(first), t0),
             "pre-action result must be dropped"
@@ -6118,7 +6142,6 @@ mod tests {
         let second = gate.start(t0).expect("the queued read starts next");
         assert_ne!(first, second);
         assert!(gate.finish(Some(second), t0));
-        assert!(!gate.stale());
     }
 
     #[test]
@@ -6188,6 +6211,27 @@ mod tests {
     }
 
     #[test]
+    fn failed_status_is_stale_only_for_that_repo_and_reports_once_until_recovery() {
+        let mut failed = StatusFreshness::default();
+        let mut healthy = StatusFreshness::default();
+        failed.succeeded(1);
+        healthy.succeeded(1);
+        assert!(failed.stale(2));
+
+        assert_eq!(failed.failed("timeout".into()).as_deref(), Some("timeout"));
+        assert!(
+            failed.stale(1),
+            "even a periodic read can invalidate old data"
+        );
+        assert!(!healthy.stale(1));
+        assert_eq!(failed.failed("timeout".into()), None);
+
+        failed.succeeded(2);
+        assert!(!failed.stale(2));
+        assert_eq!(failed.failed("timeout".into()).as_deref(), Some("timeout"));
+    }
+
+    #[test]
     fn applying_status_replaces_only_status_data() {
         let root = std::env::temp_dir().join(format!(
             "herdr-scm-apply-{}-{}",
@@ -6228,7 +6272,7 @@ mod tests {
             ),
             (repo_root.clone(), Ok(fresh.clone())),
         ];
-        let (changed, error) = apply_repo_statuses(&mut repos, results);
+        let (changed, error) = apply_repo_statuses(&mut repos, 1, results);
         assert!(changed);
         assert_eq!(error, None, "a result for an unknown root is ignored");
         let repo = &repos[0];
@@ -6240,7 +6284,7 @@ mod tests {
         assert!(repo.staged_collapsed);
 
         // An identical periodic read is not a change (no rebuild churn).
-        let (changed, _) = apply_repo_statuses(&mut repos, vec![(repo_root, Ok(fresh))]);
+        let (changed, _) = apply_repo_statuses(&mut repos, 1, vec![(repo_root, Ok(fresh))]);
         assert!(!changed);
         let _ = std::fs::remove_dir_all(&root);
     }

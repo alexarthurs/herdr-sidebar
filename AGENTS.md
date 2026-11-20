@@ -987,6 +987,10 @@ HACKING.md — budget time for that before promising a patched build.
     `request_refresh()`, which bumps the generation: an in-flight read predates the change, so
     its result is DROPPED and one coalesced follow-up read starts when it returns (never a
     second concurrent worker). An App rebuild (re-root/cwd-follow) gets a fresh channel.
+    A repo is current only after its own successful read in the current generation.
+    A failed or timed-out read keeps its old rows, marks them stale, and flashes the error
+    once per consecutive identical failure. The next read retries on the existing schedule.
+    The empty-staged-list commit guard trusts only current status and otherwise lets Git decide.
   - Periodic reads come from `tick()` only when nothing is running or queued and
     max(1.5s, 3x the last read's duration) has passed since it returned; the focus backoff and
     the `HERDR_SIDEBAR_BACKGROUND_REFRESH` bypass still gate them.
