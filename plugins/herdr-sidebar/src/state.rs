@@ -268,7 +268,8 @@ impl ColorTheme {
 }
 
 /// The preview's syntax-highlighting theme: one of syntect's bundled themes
-/// (no extra dependencies). Dark and light color themes each keep their own
+/// or a JetBrains palette compiled in by `crate::themes` (no extra
+/// dependencies). Dark and light color themes each keep their own
 /// choice, and each only cycles through the themes drawn for that background
 /// — syntect colors foregrounds only, so a dark theme on a light terminal is
 /// the washed-out case the light palette exists to avoid.
@@ -278,26 +279,32 @@ pub enum SyntaxTheme {
     EightiesDark,
     MochaDark,
     SolarizedDark,
+    Darcula,
+    IntelliJDark,
     InspiredGitHub,
     OceanLight,
     SolarizedLight,
 }
 
 impl SyntaxTheme {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::OceanDark,
         Self::EightiesDark,
         Self::MochaDark,
         Self::SolarizedDark,
+        Self::Darcula,
+        Self::IntelliJDark,
         Self::InspiredGitHub,
         Self::OceanLight,
         Self::SolarizedLight,
     ];
-    const DARK: [Self; 4] = [
+    const DARK: [Self; 6] = [
         Self::OceanDark,
         Self::EightiesDark,
         Self::MochaDark,
         Self::SolarizedDark,
+        Self::Darcula,
+        Self::IntelliJDark,
     ];
     const LIGHT: [Self; 3] = [Self::InspiredGitHub, Self::OceanLight, Self::SolarizedLight];
 
@@ -310,14 +317,17 @@ impl SyntaxTheme {
         }
     }
 
-    /// The key in syntect's `ThemeSet::load_defaults()`; also the persisted
-    /// value, so `state.json` names a theme the user can look up.
+    /// The key in syntect's `ThemeSet::load_defaults()` (or the compiled-in
+    /// theme's name); also the persisted value, so `state.json` names a theme
+    /// the user can look up.
     pub fn syntect_name(self) -> &'static str {
         match self {
             Self::OceanDark => "base16-ocean.dark",
             Self::EightiesDark => "base16-eighties.dark",
             Self::MochaDark => "base16-mocha.dark",
             Self::SolarizedDark => "Solarized (dark)",
+            Self::Darcula => "Darcula",
+            Self::IntelliJDark => "IntelliJ Dark",
             Self::InspiredGitHub => "InspiredGitHub",
             Self::OceanLight => "base16-ocean.light",
             Self::SolarizedLight => "Solarized (light)",
@@ -332,6 +342,8 @@ impl SyntaxTheme {
             Self::MochaDark => "mocha",
             Self::SolarizedDark | Self::SolarizedLight => "solarized",
             Self::InspiredGitHub => "github",
+            Self::Darcula => "darcula",
+            Self::IntelliJDark => "intellij",
         }
     }
 
@@ -1344,7 +1356,7 @@ mod tests {
                     break;
                 }
             }
-            assert_eq!(seen.len(), if light { 3 } else { 4 });
+            assert_eq!(seen.len(), if light { 3 } else { 6 });
         }
         // Files written before the setting existed keep the historical
         // themes; a name saved under the other mode, or unknown, is ignored.
