@@ -1,12 +1,13 @@
 //! Syntax highlighting for the file preview: syntect with bat's extended
 //! grammar set via `two-face` (syntect's own defaults lack TypeScript, TOML,
 //! Dockerfile, …), on the pure-Rust `regex-fancy` engine — no oniguruma C
-//! build on Windows. Foreground colors only: the terminal keeps its own
-//! background, and unknown file types fall back to plain lines.
+//! build on Windows. Foreground colors only by default: the terminal keeps its
+//! own background unless the user opts into the theme's (`syntax_background`),
+//! and unknown file types fall back to plain lines.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -15,7 +16,7 @@ use syntect::highlighting::{FontStyle, Highlighter, Style as SyntectStyle, Theme
 use syntect::parsing::{Scope, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
-use crate::state::SyntaxTheme;
+use crate::state::{State, SyntaxTheme};
 
 /// Lines longer than this skip highlighting entirely. syntect's `regex-fancy`
 /// backtracking engine is roughly quadratic in line length on pathological
@@ -43,10 +44,12 @@ fn assets() -> &'static (SyntaxSet, BTreeMap<String, Theme>) {
 /// startup and on its heartbeat.
 static DARK_THEME: AtomicU8 = AtomicU8::new(SyntaxTheme::OceanDark as u8);
 static LIGHT_THEME: AtomicU8 = AtomicU8::new(SyntaxTheme::InspiredGitHub as u8);
+static THEMED_BACKGROUND: AtomicBool = AtomicBool::new(false);
 
-pub fn set_themes(dark: SyntaxTheme, light: SyntaxTheme) {
-    DARK_THEME.store(dark as u8, Ordering::Relaxed);
-    LIGHT_THEME.store(light as u8, Ordering::Relaxed);
+pub fn apply_settings(state: &State) {
+    DARK_THEME.store(state.syntax_dark as u8, Ordering::Relaxed);
+    LIGHT_THEME.store(state.syntax_light as u8, Ordering::Relaxed);
+    THEMED_BACKGROUND.store(state.syntax_background, Ordering::Relaxed);
 }
 
 fn configured_theme(light: bool) -> SyntaxTheme {
@@ -76,6 +79,33 @@ fn theme_for(theme: SyntaxTheme) -> &'static Theme {
 fn syntaxes_and_theme() -> (&'static SyntaxSet, &'static Theme) {
     let (syntaxes, _) = assets();
     (syntaxes, theme_for(configured_theme(crate::ui::is_light())))
+}
+
+/// Editor-style colors for the preview pane, present only when the user
+/// opted in (`syntax_background`) and the theme declares a background.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreviewColors {
+    pub background: Color,
+    /// Text without a highlight of its own (plain files, header, footer).
+    pub foreground: Option<Color>,
+    /// Line-number color (`gutterForeground`); `None` keeps the dim default.
+    pub gutter: Option<Color>,
+}
+
+pub fn preview_colors() -> Option<PreviewColors> {
+    if !THEMED_BACKGROUND.load(Ordering::Relaxed) {
+        return None;
+    }
+    theme_preview_colors(syntaxes_and_theme().1)
+}
+
+fn theme_preview_colors(theme: &Theme) -> Option<PreviewColors> {
+    let rgb = |c: syntect::highlighting::Color| Color::Rgb(c.r, c.g, c.b);
+    Some(PreviewColors {
+        background: rgb(theme.settings.background?),
+        foreground: theme.settings.foreground.map(rgb),
+        gutter: theme.settings.gutter_foreground.map(rgb),
+    })
 }
 
 /// Byte ranges of `[LABEL]` shortcut references in a Markdown line — text the
@@ -426,5 +456,13 @@ name = \"x\"
     fn themes_without_the_shortcut_rule_leave_labels_untouched() {
         let lines = themed_markdown(SyntaxTheme::OceanDark, "Plain [BUG] text\n");
         assert_eq!(lines[0].spans.len(), 1, "{:?}", lines[0].spans);
+    }
+
+    #[test]
+    fn jetbrains_themes_expose_editor_background_and_gutter() {
+        let colors = theme_preview_colors(theme_for(SyntaxTheme::IntelliJDark)).unwrap();
+        assert_eq!(colors.background, Color::Rgb(0x1E, 0x1F, 0x22));
+        assert_eq!(colors.foreground, Some(Color::Rgb(0xBC, 0xBE, 0xC4)));
+        assert_eq!(colors.gutter, Some(Color::Rgb(0x4B, 0x50, 0x59)));
     }
 }

@@ -439,6 +439,10 @@ pub struct State {
     pub syntax_dark: SyntaxTheme,
     /// Preview syntax theme while the `light` color theme is active.
     pub syntax_light: SyntaxTheme,
+    /// Paint the preview with its syntax theme's own background, text and
+    /// line-number colors, like an editor. Off leaves the terminal's
+    /// background showing (foreground colors only).
+    pub syntax_background: bool,
     /// The first-run "install a Nerd Font?" prompt was answered (either
     /// way) — never show it again.
     pub font_prompt_done: bool,
@@ -530,6 +534,7 @@ impl Default for State {
             color_theme: ColorTheme::VsCode,
             syntax_dark: SyntaxTheme::default_for(false),
             syntax_light: SyntaxTheme::default_for(true),
+            syntax_background: false,
             font_prompt_done: false,
             auto_open: true,
             strict_toggle: false,
@@ -710,7 +715,7 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"letter_hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"auto_hide_below\":{},\"colors\":\"{}\",\"syntax_dark\":\"{}\",\"syntax_light\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{},\"diff_side_by_side\":{},\"confirm_git_ops\":{},\"close_lonely_tab\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"letter_hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"auto_hide_below\":{},\"colors\":\"{}\",\"syntax_dark\":\"{}\",\"syntax_light\":\"{}\",\"syntax_background\":{},\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{},\"diff_side_by_side\":{},\"confirm_git_ops\":{},\"close_lonely_tab\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.search_active,
@@ -729,6 +734,7 @@ fn write_state(path: &Path, state: State) {
         state.color_theme.label(),
         state.syntax_dark.syntect_name(),
         state.syntax_light.syntect_name(),
+        state.syntax_background,
         state.preview_placement.label(),
         state.custom_editor_on_click,
         state.scm_tree_view,
@@ -1150,6 +1156,10 @@ pub fn parse_state(json: &str) -> State {
             .and_then(|v| v.as_str())
             .and_then(|name| SyntaxTheme::from_state_name(name, true))
             .unwrap_or(default.syntax_light),
+        syntax_background: value
+            .get("syntax_background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.syntax_background),
         font_prompt_done: value
             .get("font_prompt")
             .and_then(|v| v.as_bool())
@@ -1363,6 +1373,7 @@ mod tests {
         let legacy = parse_state("{\"merged\":true}");
         assert_eq!(legacy.syntax_dark, SyntaxTheme::OceanDark);
         assert_eq!(legacy.syntax_light, SyntaxTheme::InspiredGitHub);
+        assert!(!legacy.syntax_background, "the themed background is opt-in");
         let swapped = parse_state("{\"syntax_dark\":\"InspiredGitHub\",\"syntax_light\":\"nope\"}");
         assert_eq!(swapped.syntax_dark, SyntaxTheme::OceanDark);
         assert_eq!(swapped.syntax_light, SyntaxTheme::InspiredGitHub);
@@ -1414,6 +1425,7 @@ mod tests {
             color_theme: ColorTheme::Terminal,
             syntax_dark: SyntaxTheme::MochaDark,
             syntax_light: SyntaxTheme::SolarizedLight,
+            syntax_background: true,
             font_prompt_done: true,
             auto_open: false,
             strict_toggle: true,

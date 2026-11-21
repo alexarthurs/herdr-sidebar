@@ -3,7 +3,7 @@
 //! Rust tables rather than `.tmTheme` files so loading them needs no plist
 //! parser (syntect's `plist-load`) and the repository carries no binary
 //! theme dumps. The rules color only foregrounds and font styles, like every
-//! other preview theme.
+//! other preview theme; the global colors feed the opt-in themed background.
 //!
 //! Beyond the usual scopes the tables cover Markdown quirks of two-face's
 //! grammar: list/quote MARKERS are colored instead of the whole item, a lone

@@ -1425,6 +1425,11 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   `herdr-sidebar.shortcut-reference.markdown`. That scope must stay under its OWN top-level
   name: base16-ocean.dark's generic `meta.link` rule matched a `meta.link.*` variant and
   silently changed the default theme's output.
+- `syntax_background` (⚙ "Theme background", off by default) paints the viewer
+  (`paint_preview_background`) with the theme's background/foreground and the line numbers
+  with `gutterForeground`. It reaches the viewer through `syntax::apply_settings` with the
+  theme choice. Row layouts are cached per width/wrap, so the gutter color applies on the next
+  relayout or document.
 
 ### Experimental in-pane editor (issue #22)
 

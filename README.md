@@ -104,7 +104,7 @@ Settings persist across tabs and restarts. Configure:
 - Material/emoji icons and VS Code/light/terminal colors
 - Preview syntax theme, kept separately for dark and light color themes (dark: ocean,
   eighties, mocha, solarized, and the JetBrains-style darcula and intellij; light: github,
-  ocean, solarized)
+  ocean, solarized), plus an optional editor-style theme background
 - Tab (default), split-pane, or temporary takeover previews and optional custom editor
 - Source Control list/tree view (shared across sidebars)
 - Hidden files, Git decorations, Git footer, and footer hotkeys
