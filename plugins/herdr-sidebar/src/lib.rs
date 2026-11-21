@@ -24,6 +24,7 @@ pub mod state;
 pub mod suggest;
 pub mod syntax;
 pub mod takeover;
+pub mod themes;
 pub mod tree;
 pub mod ui;
 pub mod updates;

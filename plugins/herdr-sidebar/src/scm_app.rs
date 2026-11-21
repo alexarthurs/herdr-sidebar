@@ -1064,6 +1064,7 @@ enum Setting {
     IconTheme,
     ColorTheme,
     SyntaxTheme,
+    SyntaxBackground,
     PreviewPlacement,
     AutoOpen,
     CloseLonelyTab,
@@ -1730,6 +1731,7 @@ impl App {
         }
         self.sidebar_state.syntax_dark = shared.syntax_dark;
         self.sidebar_state.syntax_light = shared.syntax_light;
+        self.sidebar_state.syntax_background = shared.syntax_background;
         if shared.color_theme != self.sidebar_state.color_theme {
             self.sidebar_state.color_theme = shared.color_theme;
             set_color_theme(shared.color_theme);
@@ -3000,6 +3002,17 @@ impl App {
                 (Setting::SyntaxTheme, label, value, true)
             },
             (
+                Setting::SyntaxBackground,
+                "Theme background",
+                if self.sidebar_state.syntax_background {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
                 Setting::PreviewPlacement,
                 "Preview opens in",
                 self.sidebar_state.preview_placement.label().to_string(),
@@ -3165,6 +3178,11 @@ impl App {
             }
             Setting::SyntaxTheme => {
                 self.sidebar_state = sidebar::update_state(sidebar::State::cycle_syntax_theme);
+            }
+            Setting::SyntaxBackground => {
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.syntax_background = !state.syntax_background;
+                });
             }
             Setting::PreviewPlacement => {
                 self.sidebar_state = sidebar::update_state(|state| {
